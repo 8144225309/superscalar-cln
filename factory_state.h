@@ -99,8 +99,10 @@ typedef struct factory_instance {
 	uint8_t funding_txid[32];
 	uint32_t funding_outnum;
 
-	/* Opaque handle to libsuperscalar factory_t.
-	 * NULL until the library is initialized for this instance. */
+	/* Handle to libsuperscalar factory_t.
+	 * NULL until the library is initialized for this instance.
+	 * Declared as void* to avoid requiring superscalar headers
+	 * in every file that includes factory_state.h. */
 	void *lib_factory;
 
 } factory_instance_t;

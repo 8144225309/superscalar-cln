@@ -14,8 +14,10 @@
 #include "ceremony.h"
 #include "factory_state.h"
 
-/* SuperScalar library — linked at build time.
- * Headers included when ceremony logic is wired up. */
+/* SuperScalar library */
+#include <superscalar/factory.h>
+#include <superscalar/musig.h>
+#include <superscalar/dw_state.h>
 
 static struct plugin *plugin_handle;
 static superscalar_state_t ss_state;
