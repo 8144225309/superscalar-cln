@@ -9,23 +9,21 @@
 #include <common/json_param.h>
 #include <common/json_stream.h>
 #include <plugins/libplugin.h>
+#include <stdio.h>
 
 #include "ceremony.h"
+#include "factory_state.h"
 
 /* SuperScalar library — linked at build time.
- * Uncomment when wiring up ceremony calls:
- * #include <superscalar/factory.h>
- * #include <superscalar/musig.h>
- * #include <superscalar/dw_state.h>
- */
+ * Headers included when ceremony logic is wired up. */
 
 static struct plugin *plugin_handle;
+static superscalar_state_t ss_state;
 
 /* bLIP-56 factory message type */
 #define FACTORY_MSG_TYPE	32800
 
-/* Active ceremony state (single factory for now) */
-static ceremony_state_t ceremony_state = CEREMONY_IDLE;
+/* Ceremony state is now per-factory in ss_state */
 
 /* Send a factory submessage to a peer via factory-send RPC.
  * Used by ceremony handlers when responding to protocol messages. */
@@ -51,21 +49,47 @@ send_factory_submsg(struct command *cmd,
 }
 #endif
 
-/* Dispatch SuperScalar protocol submessages */
+/* Dispatch SuperScalar protocol submessages.
+ * Data format: [32 bytes instance_id][payload] */
 static void dispatch_superscalar_submsg(struct command *cmd,
 					const char *peer_id,
 					u16 submsg_id,
 					const u8 *data, size_t len)
 {
+	factory_instance_t *fi = NULL;
+
+	/* Extract instance_id from submessage (first 32 bytes) */
+	if (len >= 32 && submsg_id != SS_SUBMSG_FACTORY_PROPOSE) {
+		fi = ss_factory_find(&ss_state, data);
+		if (!fi) {
+			plugin_log(plugin_handle, LOG_UNUSUAL,
+				   "Unknown factory instance in submsg 0x%04x from %s",
+				   submsg_id, peer_id);
+			return;
+		}
+		data += 32;
+		len -= 32;
+	}
+
 	switch (submsg_id) {
 	case SS_SUBMSG_FACTORY_PROPOSE:
 		plugin_log(plugin_handle, LOG_INFORM,
 			   "FACTORY_PROPOSE from %s (len=%zu)",
 			   peer_id, len);
 		/* Client side: LSP proposed a factory.
-		 * TODO: parse tree params, initialize factory,
-		 * generate nonces, respond with NONCE_BUNDLE */
-		ceremony_state = CEREMONY_PROPOSED;
+		 * Parse instance_id from payload, create new factory. */
+		if (len >= 32) {
+			fi = ss_factory_new(&ss_state, data);
+			if (fi) {
+				fi->is_lsp = false;
+				fi->ceremony = CEREMONY_PROPOSED;
+				plugin_log(plugin_handle, LOG_INFORM,
+					   "Created factory instance for proposal");
+			}
+			/* TODO: parse tree params, init factory via
+			 * libsuperscalar, generate nonces, respond
+			 * with NONCE_BUNDLE */
+		}
 		break;
 
 	case SS_SUBMSG_NONCE_BUNDLE:
@@ -85,7 +109,7 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 		/* Client side: LSP sent aggregated nonces.
 		 * TODO: parse aggregated nonces, set on all sessions,
 		 * create partial sigs, respond with PSIG_BUNDLE */
-		ceremony_state = CEREMONY_NONCES_COLLECTED;
+		if (fi) fi->ceremony = CEREMONY_NONCES_COLLECTED;
 		break;
 
 	case SS_SUBMSG_PSIG_BUNDLE:
@@ -105,7 +129,7 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 		/* Client side: factory tree is fully signed.
 		 * TODO: verify factory, open channel via CLN with
 		 * channel_in_factory TLV */
-		ceremony_state = CEREMONY_COMPLETE;
+		if (fi) fi->ceremony = CEREMONY_COMPLETE;
 		break;
 
 	case SS_SUBMSG_CLOSE_PROPOSE:
@@ -223,16 +247,63 @@ static struct command_result *handle_openchannel(struct command *cmd,
 	return command_hook_success(cmd);
 }
 
+/* factory-list RPC — show all factory instances */
+static struct command_result *json_factory_list(struct command *cmd,
+					       const char *buf,
+					       const jsmntok_t *params)
+{
+	struct json_stream *js;
+
+	if (!param(cmd, buf, params, NULL))
+		return command_param_failed();
+
+	js = jsonrpc_stream_success(cmd);
+	json_array_start(js, "factories");
+	for (size_t i = 0; i < ss_state.n_factories; i++) {
+		factory_instance_t *fi = ss_state.factories[i];
+		char id_hex[65];
+		for (int j = 0; j < 32; j++)
+			sprintf(id_hex + j*2, "%02x", fi->instance_id[j]);
+
+		json_object_start(js, NULL);
+		json_add_string(js, "instance_id", id_hex);
+		json_add_bool(js, "is_lsp", fi->is_lsp);
+		json_add_u32(js, "n_clients", fi->n_clients);
+		json_add_u32(js, "epoch", fi->epoch);
+		json_add_u32(js, "n_channels", fi->n_channels);
+		json_add_string(js, "lifecycle",
+			fi->lifecycle == FACTORY_LIFECYCLE_INIT ? "init" :
+			fi->lifecycle == FACTORY_LIFECYCLE_ACTIVE ? "active" :
+			fi->lifecycle == FACTORY_LIFECYCLE_DYING ? "dying" :
+			"expired");
+		json_add_string(js, "ceremony",
+			fi->ceremony == CEREMONY_IDLE ? "idle" :
+			fi->ceremony == CEREMONY_PROPOSED ? "proposed" :
+			fi->ceremony == CEREMONY_NONCES_COLLECTED ? "nonces_collected" :
+			fi->ceremony == CEREMONY_PSIGS_COLLECTED ? "psigs_collected" :
+			fi->ceremony == CEREMONY_COMPLETE ? "complete" :
+			"failed");
+		json_add_u32(js, "expiry_block", fi->expiry_block);
+		json_add_u32(js, "n_breach_epochs", fi->n_breach_epochs);
+		json_object_end(js);
+	}
+	json_array_end(js);
+	return command_finished(cmd, js);
+}
+
 /* Plugin init */
 static const char *init(struct command *init_cmd,
 			const char *buf UNUSED,
 			const jsmntok_t *config UNUSED)
 {
 	plugin_handle = init_cmd->plugin;
-	ceremony_state = CEREMONY_IDLE;
+	ss_state_init(&ss_state);
+
+	/* TODO: load factory instances from CLN datastore */
 
 	plugin_log(plugin_handle, LOG_INFORM,
-		   "SuperScalar factory plugin initialized");
+		   "SuperScalar factory plugin initialized (%zu factories)",
+		   ss_state.n_factories);
 	return NULL;
 }
 
@@ -242,6 +313,10 @@ static const struct plugin_hook hooks[] = {
 };
 
 static const struct plugin_command commands[] = {
+	{
+		"factory-list",
+		json_factory_list,
+	},
 };
 
 static const struct plugin_notification notifs[] = {
