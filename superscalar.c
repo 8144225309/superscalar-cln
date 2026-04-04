@@ -306,19 +306,66 @@ static struct command_result *json_factory_create(struct command *cmd,
 		   "factory-create: %zu clients, %"PRIu64" sats",
 		   fi->n_clients, *funding_sats);
 
-	/* Initialize the factory via libsuperscalar.
-	 * For now, set up the factory_t but defer tree building
-	 * until we have all pubkeys from clients. */
+	/* Initialize the factory via libsuperscalar */
 	secp_ctx = secp256k1_context_create(
 		SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
 
-	/* TODO: Full ceremony flow:
-	 * 1. factory_init() with LSP + client pubkeys
-	 * 2. factory_build_tree()
-	 * 3. factory_sessions_init()
-	 * 4. Send FACTORY_PROPOSE to each client
-	 * 5. Wait for NONCE_BUNDLE responses
-	 * For now, return the instance_id so the test can continue. */
+	/* Build pubkey array: [LSP, client0, client1, ...] */
+	{
+		factory_t *factory = tal(cmd, factory_t);
+		size_t n_total = 1 + fi->n_clients;
+		secp256k1_pubkey *pubkeys = tal_arr(cmd, secp256k1_pubkey,
+						    n_total);
+
+		/* LSP pubkey from our node ID */
+		/* TODO: get our actual node pubkey from getinfo.
+		 * For now use a placeholder — the real ceremony
+		 * needs proper key derivation. */
+
+		/* Initialize factory */
+		factory_init_from_pubkeys(factory, secp_ctx,
+					  pubkeys, n_total,
+					  144, /* step_blocks: 1 day */
+					  16); /* states_per_layer */
+
+		/* Set funding */
+		uint8_t dummy_txid[32] = {0};
+		uint8_t dummy_spk[34] = {0};
+		factory_set_funding(factory, dummy_txid, 0,
+				    *funding_sats, dummy_spk, 34);
+
+		/* Build the DW tree */
+		int rc = factory_build_tree(factory);
+		if (rc != 0) {
+			plugin_log(plugin_handle, LOG_BROKEN,
+				   "factory_build_tree failed: %d", rc);
+			secp256k1_context_destroy(secp_ctx);
+			return command_fail(cmd, LIGHTNINGD,
+					    "Failed to build factory tree");
+		}
+
+		plugin_log(plugin_handle, LOG_INFORM,
+			   "Factory tree built: %zu participants",
+			   n_total);
+
+		/* Store factory handle */
+		fi->lib_factory = factory;
+
+		/* Generate MuSig2 nonces for all tree nodes */
+		rc = factory_sessions_init(factory);
+		if (rc != 0) {
+			plugin_log(plugin_handle, LOG_BROKEN,
+				   "factory_sessions_init failed: %d", rc);
+		} else {
+			plugin_log(plugin_handle, LOG_INFORM,
+				   "MuSig2 nonces generated");
+			fi->ceremony = CEREMONY_PROPOSED;
+		}
+
+		/* TODO: Send FACTORY_PROPOSE to each client via
+		 * sendcustommsg or factory-send (if channel exists).
+		 * Payload = instance_id + tree params + LSP nonces */
+	}
 
 	secp256k1_context_destroy(secp_ctx);
 
