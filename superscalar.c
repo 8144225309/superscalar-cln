@@ -10,6 +10,9 @@
 #include <common/json_stream.h>
 #include <plugins/libplugin.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <inttypes.h>
+#include <secp256k1.h>
 
 #include "ceremony.h"
 #include "factory_state.h"
@@ -249,6 +252,89 @@ static struct command_result *handle_openchannel(struct command *cmd,
 	return command_hook_success(cmd);
 }
 
+/* factory-create RPC — LSP creates a new factory (Phase 1)
+ * Takes client node IDs and creates the DW tree. */
+static struct command_result *json_factory_create(struct command *cmd,
+						  const char *buf,
+						  const jsmntok_t *params)
+{
+	const jsmntok_t *clients_tok;
+	u64 *funding_sats;
+	factory_instance_t *fi;
+	secp256k1_context *secp_ctx;
+	uint8_t instance_id[32];
+
+	if (!param(cmd, buf, params,
+		   p_req("funding_sats", param_u64, &funding_sats),
+		   p_req("clients", param_array, &clients_tok),
+		   NULL))
+		return command_param_failed();
+
+	/* Generate random instance_id */
+	for (int i = 0; i < 32; i++)
+		instance_id[i] = (uint8_t)(random() & 0xFF);
+
+	fi = ss_factory_new(&ss_state, instance_id);
+	if (!fi)
+		return command_fail(cmd, LIGHTNINGD,
+				    "Too many active factories");
+
+	fi->is_lsp = true;
+	fi->lifecycle = FACTORY_LIFECYCLE_INIT;
+	fi->ceremony = CEREMONY_IDLE;
+
+	/* Parse client node IDs */
+	const jsmntok_t *t;
+	size_t i;
+	json_for_each_arr(i, t, clients_tok) {
+		if (fi->n_clients >= MAX_FACTORY_PARTICIPANTS)
+			break;
+		const char *hex = json_strdup(cmd, buf, t);
+		if (hex && strlen(hex) == 66) {
+			client_state_t *c = &fi->clients[fi->n_clients];
+			for (int j = 0; j < 33; j++) {
+				unsigned int byte;
+				sscanf(hex + j*2, "%02x", &byte);
+				c->node_id[j] = (uint8_t)byte;
+			}
+			c->signer_slot = fi->n_clients + 1; /* 0=LSP */
+			fi->n_clients++;
+		}
+	}
+
+	plugin_log(plugin_handle, LOG_INFORM,
+		   "factory-create: %zu clients, %"PRIu64" sats",
+		   fi->n_clients, *funding_sats);
+
+	/* Initialize the factory via libsuperscalar.
+	 * For now, set up the factory_t but defer tree building
+	 * until we have all pubkeys from clients. */
+	secp_ctx = secp256k1_context_create(
+		SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+
+	/* TODO: Full ceremony flow:
+	 * 1. factory_init() with LSP + client pubkeys
+	 * 2. factory_build_tree()
+	 * 3. factory_sessions_init()
+	 * 4. Send FACTORY_PROPOSE to each client
+	 * 5. Wait for NONCE_BUNDLE responses
+	 * For now, return the instance_id so the test can continue. */
+
+	secp256k1_context_destroy(secp_ctx);
+
+	{
+		char id_hex[65];
+		for (int j = 0; j < 32; j++)
+			sprintf(id_hex + j*2, "%02x", instance_id[j]);
+
+		struct json_stream *js = jsonrpc_stream_success(cmd);
+		json_add_string(js, "instance_id", id_hex);
+		json_add_u64(js, "n_clients", fi->n_clients);
+		json_add_string(js, "ceremony", "init");
+		return command_finished(cmd, js);
+	}
+}
+
 /* factory-list RPC — show all factory instances */
 static struct command_result *json_factory_list(struct command *cmd,
 					       const char *buf,
@@ -315,6 +401,10 @@ static const struct plugin_hook hooks[] = {
 };
 
 static const struct plugin_command commands[] = {
+	{
+		"factory-create",
+		json_factory_create,
+	},
 	{
 		"factory-list",
 		json_factory_list,
