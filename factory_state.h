@@ -19,6 +19,11 @@
 /* Max participants in a single factory (LSP + clients) */
 #define MAX_FACTORY_PARTICIPANTS 16
 
+/* Max nonce entries (must match nonce_exchange.h) */
+#ifndef MAX_NONCE_ENTRIES
+#define MAX_NONCE_ENTRIES 256
+#endif
+
 /* Max concurrent factories */
 #define MAX_FACTORIES 32
 
