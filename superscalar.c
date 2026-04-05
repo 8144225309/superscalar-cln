@@ -107,7 +107,8 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 	 * expect the full payload including instance_id. */
 	if (len >= 32 && submsg_id != SS_SUBMSG_FACTORY_PROPOSE
 	    && submsg_id != SS_SUBMSG_ROTATE_PROPOSE
-	    && submsg_id != SS_SUBMSG_REVOKE) {
+	    && submsg_id != SS_SUBMSG_REVOKE
+	    && submsg_id != SS_SUBMSG_CLOSE_PROPOSE) {
 		fi = ss_factory_find(&ss_state, data);
 		if (!fi) {
 			plugin_log(plugin_handle, LOG_UNUSUAL,
@@ -1099,9 +1100,15 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 		plugin_log(plugin_handle, LOG_INFORM,
 			   "CLOSE_PROPOSE from %s (len=%zu)",
 			   peer_id, len);
-		/* Client side: LSP proposes cooperative close.
-		 * Payload: n_outputs(4) + per output: amount(8) + spk_len(2) + spk(var)
-		 * + nonce_bundle */
+		/* fi is NULL (payload starts with output count, not instance_id) */
+		if (!fi) {
+			for (size_t i = 0; i < ss_state.n_factories; i++) {
+				if (!ss_state.factories[i]->is_lsp) {
+					fi = ss_state.factories[i];
+					break;
+				}
+			}
+		}
 		if (fi && len >= 4) {
 			factory_t *factory = (factory_t *)fi->lib_factory;
 			if (!factory) break;
