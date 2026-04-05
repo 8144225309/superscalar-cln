@@ -719,7 +719,8 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 				factory, our_idx);
 
 			secp256k1_pubkey our_pub;
-			secp256k1_ec_pubkey_create(ctx, &our_pub, our_sec);
+			if (!secp256k1_ec_pubkey_create(ctx, &our_pub, our_sec))
+				break;
 
 			if (fi->nonce_pool) {
 				free(fi->nonce_pool);
