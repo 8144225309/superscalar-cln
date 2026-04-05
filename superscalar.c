@@ -1947,7 +1947,7 @@ static struct command_result *json_factory_create(struct command *cmd,
 
 				plugin_log(plugin_handle, LOG_INFORM,
 					   "Sent FACTORY_PROPOSE to client %zu "
-					   "(%zu bytes)", ci, wire_len);
+					   "(%zu bytes)", ci, blen);
 			}
 		}
 	}
