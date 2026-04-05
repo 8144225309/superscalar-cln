@@ -104,7 +104,9 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 	/* Extract instance_id from submessage (first 32 bytes).
 	 * Don't strip it — handlers that use nonce_bundle_deserialize
 	 * expect the full payload including instance_id. */
-	if (len >= 32 && submsg_id != SS_SUBMSG_FACTORY_PROPOSE) {
+	if (len >= 32 && submsg_id != SS_SUBMSG_FACTORY_PROPOSE
+	    && submsg_id != SS_SUBMSG_ROTATE_PROPOSE
+	    && submsg_id != SS_SUBMSG_REVOKE) {
 		fi = ss_factory_find(&ss_state, data);
 		if (!fi) {
 			plugin_log(plugin_handle, LOG_UNUSUAL,
@@ -1060,7 +1062,17 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 	case SS_SUBMSG_REVOKE:
 		plugin_log(plugin_handle, LOG_INFORM,
 			   "REVOKE from %s (len=%zu)", peer_id, len);
-		/* Client: store revocation secret for breach detection */
+		/* Client: store revocation secret for breach detection.
+		 * fi is NULL here (payload starts with epoch, not instance_id).
+		 * Find factory by scanning for one with this peer as LSP. */
+		if (!fi) {
+			for (size_t i = 0; i < ss_state.n_factories; i++) {
+				if (!ss_state.factories[i]->is_lsp) {
+					fi = ss_state.factories[i];
+					break;
+				}
+			}
+		}
 		if (fi && len >= 36) {
 			uint32_t rev_epoch = ((uint32_t)data[0] << 24) |
 				((uint32_t)data[1] << 16) |
