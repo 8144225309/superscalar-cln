@@ -30,6 +30,21 @@ static secp256k1_context *global_secp_ctx;
 /* bLIP-56 factory message type */
 #define FACTORY_MSG_TYPE	32800
 
+/* Derive a deterministic seckey from instance_id + participant index.
+ * Both LSP and client compute identical keys. Demo only — real
+ * protocol uses each participant's actual node key. */
+static void derive_demo_seckey(unsigned char seckey[32],
+			       const uint8_t instance_id[32],
+			       int participant_idx)
+{
+	memcpy(seckey, instance_id, 32);
+	seckey[0] ^= (uint8_t)(participant_idx & 0xFF);
+	seckey[1] ^= (uint8_t)((participant_idx >> 8) & 0xFF);
+	/* Ensure it's a valid seckey (nonzero, < curve order).
+	 * Setting high byte to 0x01 keeps it well below the order. */
+	if (seckey[0] == 0) seckey[0] = 0x01;
+}
+
 /* Ceremony state is now per-factory in ss_state */
 
 /* Generic RPC callback — just log and ignore result */
@@ -148,25 +163,11 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 				}
 			}
 
-			/* We need our secret key for nonce generation.
-			 * Find which participant we are. */
+			/* Derive our keypair deterministically from instance_id.
+			 * We're participant 1 (first client). */
 			unsigned char our_sec[32];
-			int our_idx = -1;
-			FILE *ur = fopen("/dev/urandom", "r");
-			if (ur) {
-				if (fread(our_sec, 1, 32, ur) != 32)
-					memset(our_sec, 0x42, 32);
-				fclose(ur);
-			}
-			/* For now we're participant 1 (first client) */
-			our_idx = 1;
-
-			/* NOTE: The secret key doesn't match the pubkey
-			 * from the bundle. For real operation, the client
-			 * would have sent their pubkey to the LSP during
-			 * a registration step, and the LSP includes it in
-			 * the propose. For the demo, the LSP generated the
-			 * client's key — both sides know it. */
+			int our_idx = 1;
+			derive_demo_seckey(our_sec, nb.instance_id, our_idx);
 
 			/* Init and build tree with LSP's pubkeys */
 			factory_t *factory = calloc(1, sizeof(factory_t));
@@ -827,49 +828,19 @@ static struct command_result *json_factory_create(struct command *cmd,
 		secp256k1_pubkey *pubkeys = calloc(n_total,
 						   sizeof(secp256k1_pubkey));
 
-		/* LSP pubkey: use our node_id from global state.
-		 * If not set yet, generate a temporary keypair. */
-		if (ss_state.our_node_id[0] == 0) {
-			/* Generate a random keypair for the LSP */
-			unsigned char seckey[32];
-			FILE *urand = fopen("/dev/urandom", "r");
-			if (urand) {
-				if (fread(seckey, 1, 32, urand) != 32)
-					memset(seckey, 0x42, 32);
-				fclose(urand);
-			}
+		/* Derive keypairs deterministically from instance_id.
+		 * Both sides compute identical keys. */
+		for (size_t k = 0; k < n_total; k++) {
+			unsigned char sk[32];
+			derive_demo_seckey(sk, fi->instance_id, (int)k);
 			if (!secp256k1_ec_pubkey_create(secp_ctx,
-						        &pubkeys[0], seckey))
-				memset(&pubkeys[0], 0, sizeof(pubkeys[0]));
-			/* Store compressed form */
-			size_t clen = 33;
-			secp256k1_ec_pubkey_serialize(secp_ctx,
-				ss_state.our_node_id, &clen,
-				&pubkeys[0],
-				SECP256K1_EC_COMPRESSED);
-		} else {
-			/* Parse our stored compressed pubkey */
-			if (!secp256k1_ec_pubkey_parse(secp_ctx,
-				&pubkeys[0],
-				ss_state.our_node_id, 33)) {
+							&pubkeys[k], sk)) {
 				return command_fail(cmd, LIGHTNINGD,
-						    "Invalid LSP pubkey");
+						    "Bad derived pubkey");
 			}
 		}
 
-		/* Parse client pubkeys from their node IDs */
-		for (size_t k = 0; k < fi->n_clients; k++) {
-			if (!secp256k1_ec_pubkey_parse(secp_ctx,
-				&pubkeys[k + 1],
-				fi->clients[k].node_id, 33)) {
-				plugin_log(plugin_handle, LOG_BROKEN,
-					   "Invalid pubkey for client %zu", k);
-				return command_fail(cmd, LIGHTNINGD,
-						    "Invalid client pubkey");
-			}
-		}
-
-		/* Initialize factory with real pubkeys */
+		/* Initialize factory with derived pubkeys */
 		factory_init_from_pubkeys(factory, secp_ctx,
 					  pubkeys, n_total,
 					  144, /* step_blocks: 1 day */
@@ -929,13 +900,8 @@ static struct command_result *json_factory_create(struct command *cmd,
 			unsigned char lsp_seckey[32];
 			secp256k1_keypair lsp_keypair;
 
-			/* Get LSP seckey (generated at init) */
-			FILE *urand2 = fopen("/dev/urandom", "r");
-			if (urand2) {
-				if (fread(lsp_seckey, 1, 32, urand2) != 32)
-					memset(lsp_seckey, 0x42, 32);
-				fclose(urand2);
-			}
+			/* Derive LSP seckey deterministically (participant 0) */
+			derive_demo_seckey(lsp_seckey, fi->instance_id, 0);
 			if (!secp256k1_keypair_create(secp_ctx, &lsp_keypair,
 						      lsp_seckey)) {
 				return command_fail(cmd, LIGHTNINGD,
