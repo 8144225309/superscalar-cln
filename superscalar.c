@@ -9,6 +9,7 @@
 #include <common/json_param.h>
 #include <common/json_stream.h>
 #include <plugins/libplugin.h>
+#include <bitcoin/psbt.h>
 #include <common/features.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -183,7 +184,45 @@ static struct command_result *rpc_err(struct command *cmd,
 	return command_still_pending(cmd);
 }
 
-/* Callback after fundchannel_start succeeds — call fundchannel_complete */
+/* Callback after fundchannel_complete succeeds */
+static struct command_result *fundchannel_complete_ok(struct command *cmd,
+						      const char *method,
+						      const char *buf,
+						      const jsmntok_t *result,
+						      void *arg)
+{
+	factory_instance_t *fi = (factory_instance_t *)arg;
+	const jsmntok_t *cid_tok;
+
+	cid_tok = json_get_member(buf, result, "channel_id");
+	if (cid_tok) {
+		const char *cid_hex = json_strdup(cmd, buf, cid_tok);
+		plugin_log(plugin_handle, LOG_INFORM,
+			   "Factory channel opened: channel_id=%s",
+			   cid_hex ? cid_hex : "?");
+
+		/* Map channel to factory */
+		if (cid_hex && strlen(cid_hex) == 64) {
+			uint8_t cid[32];
+			for (int j = 0; j < 32; j++) {
+				unsigned int b;
+				sscanf(cid_hex + j*2, "%02x", &b);
+				cid[j] = (uint8_t)b;
+			}
+			ss_factory_map_channel(fi, cid,
+					       fi->n_channels, 0);
+		}
+	}
+
+	fi->lifecycle = FACTORY_LIFECYCLE_ACTIVE;
+	plugin_log(plugin_handle, LOG_INFORM,
+		   "Factory lifecycle=active, n_channels=%zu",
+		   fi->n_channels);
+
+	return command_still_pending(cmd);
+}
+
+/* Callback after fundchannel_start succeeds — build PSBT, call complete */
 static struct command_result *fundchannel_start_ok(struct command *cmd,
 						   const char *method,
 						   const char *buf,
@@ -200,20 +239,48 @@ static struct command_result *fundchannel_start_ok(struct command *cmd,
 		return command_still_pending(cmd);
 	}
 
+	/* Parse scriptpubkey from hex */
 	const char *spk_hex = json_strdup(cmd, buf, spk_tok);
-	plugin_log(plugin_handle, LOG_INFORM,
-		   "fundchannel_start succeeded, scriptpubkey=%s",
-		   spk_hex ? spk_hex : "?");
+	size_t spk_hex_len = spk_hex ? strlen(spk_hex) : 0;
+	size_t spk_len = spk_hex_len / 2;
+	u8 *spk = tal_arr(cmd, u8, spk_len);
+	for (size_t i = 0; i < spk_len; i++) {
+		unsigned int b;
+		sscanf(spk_hex + i*2, "%02x", &b);
+		spk[i] = (uint8_t)b;
+	}
 
-	/* For factory channels, the funding tx is the DW tree leaf.
-	 * We need a PSBT with an output matching the scriptpubkey.
-	 * Use CLN's txprepare/fundchannel_complete flow.
-	 * For now, log success — full PSBT construction requires
-	 * extracting the leaf tx from the factory. */
-	fi->lifecycle = FACTORY_LIFECYCLE_ACTIVE;
+	/* Funding amount: half of factory total for 2 participants (demo) */
+	struct amount_sat funding_amt;
+	funding_amt.satoshis = 500000; /* raw: .satoshis */
 
 	plugin_log(plugin_handle, LOG_INFORM,
-		   "Factory channel initiated, lifecycle=active");
+		   "fundchannel_start ok, building PSBT (spk=%s, amt=%"PRIu64")",
+		   spk_hex, funding_amt.satoshis);
+
+	/* Build minimal PSBT: 0 inputs, 1 output matching funding script */
+	struct wally_psbt *psbt = create_psbt(cmd, 0, 0, 0);
+	psbt_append_output(psbt, spk, funding_amt);
+
+	/* Get the peer node_id from the first client */
+	char nid[67];
+	if (fi->n_clients > 0) {
+		for (int j = 0; j < 33; j++)
+			sprintf(nid + j*2, "%02x",
+				fi->clients[0].node_id[j]);
+		nid[66] = '\0';
+	}
+
+	/* Call fundchannel_complete with the PSBT */
+	struct out_req *req = jsonrpc_request_start(cmd,
+		"fundchannel_complete",
+		fundchannel_complete_ok, rpc_err, fi);
+	json_add_string(req->js, "id", nid);
+	json_add_psbt(req->js, "psbt", psbt);
+	send_outreq(req);
+
+	plugin_log(plugin_handle, LOG_INFORM,
+		   "Called fundchannel_complete with factory PSBT");
 
 	return command_still_pending(cmd);
 }
