@@ -270,12 +270,25 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 			json_add_string(req->js, "msg", hex);
 			send_outreq(req);
 
+			/* Client can finalize immediately — has all nonces */
+			if (!factory_sessions_finalize(factory)) {
+				plugin_log(plugin_handle, LOG_BROKEN,
+					   "Client: factory_sessions_finalize failed");
+			} else {
+				plugin_log(plugin_handle, LOG_INFORM,
+					   "Client: nonces finalized");
+
+				/* TODO: Create partial sigs for all nodes
+				 * where we're a signer, serialize as
+				 * PSIG_BUNDLE, send to LSP.
+				 * Requires: keypair (our_sec) + finalized session
+				 * → musig_create_partial_sig per node */
+			}
+
 			fi->ceremony = CEREMONY_PROPOSED;
 			plugin_log(plugin_handle, LOG_INFORM,
 				   "Client: sent NONCE_BUNDLE (%zu bytes)",
 				   4 + rlen);
-
-			/* ctx is global */
 		}
 		break;
 
