@@ -32,8 +32,10 @@ static secp256k1_context *global_secp_ctx;
 /* bLIP-56 factory message type */
 #define FACTORY_MSG_TYPE	32800
 
-/* bLIP-56 feature bit */
+/* bLIP-56 feature bit (may already be in common/features.h) */
+#ifndef OPT_PLUGGABLE_CHANNEL_FACTORIES
 #define OPT_PLUGGABLE_CHANNEL_FACTORIES 271
+#endif
 
 /* bLIP-56 standard submessage IDs */
 #define BLIP56_SUBMSG_SUPPORTED_PROTOCOLS	2
@@ -59,6 +61,18 @@ static void derive_demo_seckey(unsigned char seckey[32],
 	 * Setting high byte to 0x01 keeps it well below the order. */
 	if (seckey[0] == 0) seckey[0] = 0x01;
 }
+
+/* Forward declarations for RPC callbacks */
+static struct command_result *rpc_done(struct command *cmd,
+				       const char *method,
+				       const char *buf,
+				       const jsmntok_t *result,
+				       void *arg);
+static struct command_result *rpc_err(struct command *cmd,
+				      const char *method,
+				      const char *buf,
+				      const jsmntok_t *result,
+				      void *arg);
 
 /* Send a SuperScalar message wrapped in factory_piggyback (submsg 4).
  * Wire format: type(2) + submsg_id=4(2) + TLV[0]=protocol_id(34) +
