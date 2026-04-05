@@ -25,6 +25,7 @@
 
 static struct plugin *plugin_handle;
 static superscalar_state_t ss_state;
+static secp256k1_context *global_secp_ctx;
 
 /* bLIP-56 factory message type */
 #define FACTORY_MSG_TYPE	32800
@@ -85,7 +86,9 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 {
 	factory_instance_t *fi = NULL;
 
-	/* Extract instance_id from submessage (first 32 bytes) */
+	/* Extract instance_id from submessage (first 32 bytes).
+	 * Don't strip it — handlers that use nonce_bundle_deserialize
+	 * expect the full payload including instance_id. */
 	if (len >= 32 && submsg_id != SS_SUBMSG_FACTORY_PROPOSE) {
 		fi = ss_factory_find(&ss_state, data);
 		if (!fi) {
@@ -94,8 +97,7 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 				   submsg_id, peer_id);
 			return;
 		}
-		data += 32;
-		len -= 32;
+		/* data and len unchanged — handler gets full payload */
 	}
 
 	switch (submsg_id) {
@@ -132,8 +134,7 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 
 			/* Init factory with same params as LSP.
 			 * We need LSP pubkey + our pubkey. */
-			secp256k1_context *ctx = secp256k1_context_create(
-				SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+			secp256k1_context *ctx = global_secp_ctx;
 			secp256k1_pubkey pubkeys[2];
 
 			/* Parse LSP pubkey from peer_id */
@@ -141,7 +142,7 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 			memcpy(lsp_pk, fi->lsp_node_id, 33);
 			if (!secp256k1_ec_pubkey_parse(ctx, &pubkeys[0], lsp_pk, 33)) {
 				plugin_log(plugin_handle, LOG_BROKEN, "Bad LSP pubkey");
-				secp256k1_context_destroy(ctx);
+				/* ctx is global */
 				break;
 			}
 
@@ -156,7 +157,7 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 			secp256k1_keypair our_kp;
 			if (!secp256k1_keypair_create(ctx, &our_kp, our_sec) ||
 			    !secp256k1_keypair_pub(ctx, &pubkeys[1], &our_kp)) {
-				secp256k1_context_destroy(ctx);
+				/* ctx is global */
 				break;
 			}
 
@@ -186,7 +187,7 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 			if (!factory_build_tree(factory)) {
 				plugin_log(plugin_handle, LOG_BROKEN,
 					   "Client: factory_build_tree failed");
-				secp256k1_context_destroy(ctx);
+				/* ctx is global */
 				free(factory);
 				break;
 			}
@@ -272,7 +273,7 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 				   "Client: sent NONCE_BUNDLE (%zu bytes)",
 				   4 + rlen);
 
-			secp256k1_context_destroy(ctx);
+			/* ctx is global */
 		}
 		break;
 
@@ -280,10 +281,72 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 		plugin_log(plugin_handle, LOG_INFORM,
 			   "NONCE_BUNDLE from %s (len=%zu)",
 			   peer_id, len);
-		/* LSP side: client sent their nonces.
-		 * TODO: call factory_session_set_nonce() for this signer,
-		 * when all collected, call factory_sessions_finalize(),
-		 * send ALL_NONCES to all clients */
+		/* LSP side: deserialize client nonces, set on sessions.
+		 * When all clients responded, finalize and send ALL_NONCES. */
+		if (fi && fi->is_lsp) {
+			nonce_bundle_t cnb;
+			if (!nonce_bundle_deserialize(&cnb, data, len)) {
+				plugin_log(plugin_handle, LOG_UNUSUAL,
+					   "Bad NONCE_BUNDLE");
+				break;
+			}
+
+			factory_t *f = (factory_t *)fi->lib_factory;
+			if (!f) break;
+
+			secp256k1_context *ctx = global_secp_ctx;
+
+			/* Set client nonces on sessions */
+			for (size_t e = 0; e < cnb.n_entries; e++) {
+				secp256k1_musig_pubnonce pn;
+				musig_pubnonce_parse(ctx, &pn,
+					cnb.entries[e].pubnonce);
+				factory_session_set_nonce(f,
+					cnb.entries[e].node_idx,
+					cnb.entries[e].signer_slot,
+					&pn);
+			}
+
+			/* Find which client sent this */
+			client_state_t *cl = NULL;
+			if (strlen(peer_id) == 66) {
+				uint8_t pid[33];
+				for (int j = 0; j < 33; j++) {
+					unsigned int b;
+					sscanf(peer_id + j*2, "%02x", &b);
+					pid[j] = (uint8_t)b;
+				}
+				cl = ss_factory_find_client(fi, pid);
+			}
+			if (cl) cl->nonce_received = true;
+
+			plugin_log(plugin_handle, LOG_INFORM,
+				   "LSP: set %zu client nonces",
+				   cnb.n_entries);
+
+			/* Check if all clients responded */
+			if (ss_factory_all_nonces_received(fi)) {
+				plugin_log(plugin_handle, LOG_INFORM,
+					   "LSP: all nonces collected, finalizing");
+
+				if (!factory_sessions_finalize(f)) {
+					plugin_log(plugin_handle, LOG_BROKEN,
+						   "factory_sessions_finalize failed");
+					/* ctx is global */
+					break;
+				}
+
+				fi->ceremony = CEREMONY_NONCES_COLLECTED;
+				plugin_log(plugin_handle, LOG_INFORM,
+					   "LSP: nonces finalized, ceremony=nonces_collected");
+
+				/* TODO: serialize ALL_NONCES (aggregated)
+				 * and send to all clients.
+				 * Then clients create partial sigs. */
+			}
+
+			/* ctx is global */
+		}
 		break;
 
 	case SS_SUBMSG_ALL_NONCES:
@@ -486,15 +549,14 @@ static struct command_result *json_factory_create(struct command *cmd,
 		   fi->n_clients, *funding_sats);
 
 	/* Initialize the factory via libsuperscalar */
-	secp_ctx = secp256k1_context_create(
-		SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+	secp_ctx = global_secp_ctx;
 
 	/* Build pubkey array: [LSP, client0, client1, ...] */
 	{
-		factory_t *factory = tal(cmd, factory_t);
+		factory_t *factory = calloc(1, sizeof(factory_t));
 		size_t n_total = 1 + fi->n_clients;
-		secp256k1_pubkey *pubkeys = tal_arr(cmd, secp256k1_pubkey,
-						    n_total);
+		secp256k1_pubkey *pubkeys = calloc(n_total,
+						   sizeof(secp256k1_pubkey));
 
 		/* LSP pubkey: use our node_id from global state.
 		 * If not set yet, generate a temporary keypair. */
@@ -521,7 +583,6 @@ static struct command_result *json_factory_create(struct command *cmd,
 			if (!secp256k1_ec_pubkey_parse(secp_ctx,
 				&pubkeys[0],
 				ss_state.our_node_id, 33)) {
-				secp256k1_context_destroy(secp_ctx);
 				return command_fail(cmd, LIGHTNINGD,
 						    "Invalid LSP pubkey");
 			}
@@ -534,7 +595,6 @@ static struct command_result *json_factory_create(struct command *cmd,
 				fi->clients[k].node_id, 33)) {
 				plugin_log(plugin_handle, LOG_BROKEN,
 					   "Invalid pubkey for client %zu", k);
-				secp256k1_context_destroy(secp_ctx);
 				return command_fail(cmd, LIGHTNINGD,
 						    "Invalid client pubkey");
 			}
@@ -572,7 +632,7 @@ static struct command_result *json_factory_create(struct command *cmd,
 		if (rc == 0) {
 			plugin_log(plugin_handle, LOG_BROKEN,
 				   "factory_build_tree failed: %d", rc);
-			secp256k1_context_destroy(secp_ctx);
+			/* secp context is global, not destroyed */
 			return command_fail(cmd, LIGHTNINGD,
 					    "Failed to build factory tree");
 		}
@@ -589,7 +649,7 @@ static struct command_result *json_factory_create(struct command *cmd,
 		if (rc == 0) {
 			plugin_log(plugin_handle, LOG_BROKEN,
 				   "factory_sessions_init failed");
-			secp256k1_context_destroy(secp_ctx);
+			/* secp context is global, not destroyed */
 			return command_fail(cmd, LIGHTNINGD,
 					    "Failed to init signing sessions");
 		}
@@ -610,7 +670,6 @@ static struct command_result *json_factory_create(struct command *cmd,
 			}
 			if (!secp256k1_keypair_create(secp_ctx, &lsp_keypair,
 						      lsp_seckey)) {
-				secp256k1_context_destroy(secp_ctx);
 				return command_fail(cmd, LIGHTNINGD,
 						    "Failed to create LSP keypair");
 			}
@@ -625,7 +684,6 @@ static struct command_result *json_factory_create(struct command *cmd,
 						       lsp_seckey,
 						       &pubkeys[0],
 						       NULL)) {
-				secp256k1_context_destroy(secp_ctx);
 				return command_fail(cmd, LIGHTNINGD,
 						    "Failed to generate nonce pool");
 			}
@@ -724,7 +782,7 @@ static struct command_result *json_factory_create(struct command *cmd,
 		}
 	}
 
-	secp256k1_context_destroy(secp_ctx);
+	/* secp context is global, not destroyed */
 
 	{
 		char id_hex[65];
@@ -792,6 +850,9 @@ static const char *init(struct command *init_cmd,
 	ss_state_init(&ss_state);
 
 	/* TODO: load factory instances from CLN datastore */
+
+	global_secp_ctx = secp256k1_context_create(
+		SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
 
 	plugin_log(plugin_handle, LOG_INFORM,
 		   "SuperScalar factory plugin initialized (%zu factories)",
