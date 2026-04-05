@@ -2846,23 +2846,17 @@ static const struct plugin_notification notifs[] = {
 
 int main(int argc, char *argv[])
 {
-	struct feature_set *features = tal(NULL, struct feature_set);
 	setup_locale();
 
-	for (int i = 0; i < ARRAY_SIZE(features->bits); i++)
-		features->bits[i] = tal_arr(features, u8, 0);
-
-	/* Advertise pluggable_channel_factories (bit 271) */
-	set_feature_bit(&features->bits[INIT_FEATURE],
-			OPT_PLUGGABLE_CHANNEL_FACTORIES);
-	set_feature_bit(&features->bits[NODE_ANNOUNCE_FEATURE],
-			OPT_PLUGGABLE_CHANNEL_FACTORIES);
+	/* Feature bit 271 (pluggable_channel_factories) is advertised
+	 * by the CLN fork's base code in common/features.h.
+	 * No need to set it again from the plugin. */
 
 	plugin_main(argv, init,
 		    take(NULL),
 		    PLUGIN_RESTARTABLE,
 		    true,
-		    take(features),
+		    NULL,
 		    commands, ARRAY_SIZE(commands),
 		    notifs, ARRAY_SIZE(notifs),
 		    hooks, ARRAY_SIZE(hooks),
