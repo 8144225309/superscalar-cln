@@ -649,6 +649,427 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 		if (fi) fi->ceremony = CEREMONY_COMPLETE;
 		break;
 
+	case SS_SUBMSG_ROTATE_PROPOSE:
+		plugin_log(plugin_handle, LOG_INFORM,
+			   "ROTATE_PROPOSE from %s (len=%zu)",
+			   peer_id, len);
+		/* Client side: LSP wants to advance DW epoch.
+		 * Payload: old_epoch(4) + new_epoch(4) + nonce_bundle */
+		if (len < 8) break;
+		{
+			uint32_t old_epoch = ((uint32_t)data[0] << 24) |
+				((uint32_t)data[1] << 16) |
+				((uint32_t)data[2] << 8) | data[3];
+			uint32_t new_epoch = ((uint32_t)data[4] << 24) |
+				((uint32_t)data[5] << 16) |
+				((uint32_t)data[6] << 8) | data[7];
+
+			plugin_log(plugin_handle, LOG_INFORM,
+				   "Client: rotation epoch %u → %u",
+				   old_epoch, new_epoch);
+
+			nonce_bundle_t nb;
+			if (!nonce_bundle_deserialize(&nb, data + 8, len - 8)) {
+				plugin_log(plugin_handle, LOG_UNUSUAL,
+					   "Bad ROTATE_PROPOSE nonce bundle");
+				break;
+			}
+
+			if (!fi) {
+				fi = ss_factory_find(&ss_state, nb.instance_id);
+			}
+			if (!fi || !fi->lib_factory) {
+				plugin_log(plugin_handle, LOG_UNUSUAL,
+					   "No factory for rotation");
+				break;
+			}
+
+			factory_t *factory = (factory_t *)fi->lib_factory;
+			secp256k1_context *ctx = global_secp_ctx;
+
+			/* Advance our DW counter to match */
+			dw_counter_advance(&factory->counter);
+			fi->epoch = new_epoch;
+
+			/* Rebuild node transactions */
+			for (size_t ni = 0; ni < factory->n_nodes; ni++)
+				factory_rebuild_node_tx(factory, ni);
+
+			/* Re-init signing sessions */
+			factory_sessions_init(factory);
+
+			/* Set LSP nonces on sessions */
+			for (size_t e = 0; e < nb.n_entries; e++) {
+				secp256k1_musig_pubnonce pn;
+				musig_pubnonce_parse(ctx, &pn,
+					nb.entries[e].pubnonce);
+				factory_session_set_nonce(factory,
+					nb.entries[e].node_idx,
+					nb.entries[e].signer_slot, &pn);
+			}
+
+			/* Generate our nonces */
+			int our_idx = fi->our_participant_idx;
+			unsigned char our_sec[32];
+			derive_demo_seckey(our_sec, fi->instance_id, our_idx);
+
+			size_t our_count = factory_count_nodes_for_participant(
+				factory, our_idx);
+
+			if (fi->nonce_pool) {
+				free(fi->nonce_pool);
+				fi->nonce_pool = NULL;
+			}
+			musig_nonce_pool_t *pool = calloc(1,
+				sizeof(musig_nonce_pool_t));
+			musig_nonce_pool_generate(ctx, pool, our_count,
+				our_sec, NULL, NULL);
+			fi->nonce_pool = pool;
+			memcpy(fi->our_seckey, our_sec, 32);
+			fi->n_secnonces = 0;
+
+			nonce_bundle_t resp;
+			memcpy(resp.instance_id, fi->instance_id, 32);
+			resp.n_participants = nb.n_participants;
+			resp.n_nodes = factory->n_nodes;
+			resp.n_entries = 0;
+
+			size_t pool_entry = 0;
+			for (size_t ni = 0; ni < factory->n_nodes; ni++) {
+				int slot = factory_find_signer_slot(
+					factory, ni, our_idx);
+				if (slot < 0) continue;
+
+				secp256k1_musig_secnonce *sec;
+				secp256k1_musig_pubnonce pub;
+				if (!musig_nonce_pool_next(pool, &sec, &pub))
+					break;
+
+				fi->secnonce_pool_idx[fi->n_secnonces] = pool_entry;
+				fi->secnonce_node_idx[fi->n_secnonces] = ni;
+				fi->n_secnonces++;
+				pool_entry++;
+
+				factory_session_set_nonce(factory, ni,
+					(size_t)slot, &pub);
+				musig_pubnonce_serialize(ctx,
+					resp.entries[resp.n_entries].pubnonce,
+					&pub);
+				resp.entries[resp.n_entries].node_idx = ni;
+				resp.entries[resp.n_entries].signer_slot = slot;
+				resp.n_entries++;
+			}
+
+			/* Send ROTATE_NONCE */
+			uint8_t rbuf[32768];
+			size_t rlen = nonce_bundle_serialize(&resp,
+				rbuf, sizeof(rbuf));
+			uint8_t wire[4 + 32768];
+			wire[0] = 0x80; wire[1] = 0x20;
+			wire[2] = 0x01; wire[3] = 0x09; /* ROTATE_NONCE */
+			memcpy(wire + 4, rbuf, rlen);
+
+			char *hex = tal_arr(cmd, char, (4+rlen)*2 + 1);
+			for (size_t h = 0; h < 4+rlen; h++)
+				sprintf(hex + h*2, "%02x", wire[h]);
+
+			struct out_req *req = jsonrpc_request_start(cmd,
+				"sendcustommsg", rpc_done, rpc_err, cmd);
+			json_add_string(req->js, "node_id", peer_id);
+			json_add_string(req->js, "msg", hex);
+			send_outreq(req);
+
+			/* Finalize and create partial sigs */
+			if (!factory_sessions_finalize(factory)) {
+				plugin_log(plugin_handle, LOG_BROKEN,
+					   "Client: rotate finalize failed");
+				break;
+			}
+
+			secp256k1_keypair kp;
+			secp256k1_keypair_create(ctx, &kp, our_sec);
+
+			nonce_bundle_t psig_nb;
+			memset(&psig_nb, 0, sizeof(psig_nb));
+			memcpy(psig_nb.instance_id, fi->instance_id, 32);
+			psig_nb.n_participants = nb.n_participants;
+			psig_nb.n_nodes = factory->n_nodes;
+			psig_nb.n_entries = 0;
+
+			musig_nonce_pool_t *sp =
+				(musig_nonce_pool_t *)fi->nonce_pool;
+			for (size_t si = 0; si < fi->n_secnonces; si++) {
+				uint32_t pi = fi->secnonce_pool_idx[si];
+				uint32_t ni = fi->secnonce_node_idx[si];
+				secp256k1_musig_secnonce *sn =
+					&sp->nonces[pi].secnonce;
+
+				int slot = factory_find_signer_slot(
+					factory, ni, our_idx);
+				if (slot < 0) continue;
+
+				secp256k1_musig_partial_sig psig;
+				if (!musig_create_partial_sig(
+					ctx, &psig, sn, &kp,
+					&factory->nodes[ni].signing_session)) {
+					plugin_log(plugin_handle, LOG_BROKEN,
+						   "Client: rotate psig failed node %u", ni);
+					continue;
+				}
+
+				musig_partial_sig_serialize(ctx,
+					psig_nb.entries[psig_nb.n_entries].pubnonce,
+					&psig);
+				psig_nb.entries[psig_nb.n_entries].node_idx = ni;
+				psig_nb.entries[psig_nb.n_entries].signer_slot = slot;
+				psig_nb.n_entries++;
+			}
+
+			/* Send ROTATE_PSIG */
+			uint8_t pbuf[32768];
+			size_t plen = nonce_bundle_serialize(&psig_nb,
+				pbuf, sizeof(pbuf));
+			uint8_t pwire[4 + 32768];
+			pwire[0] = 0x80; pwire[1] = 0x20;
+			pwire[2] = 0x01; pwire[3] = 0x0A; /* ROTATE_PSIG */
+			memcpy(pwire + 4, pbuf, plen);
+
+			char *phex = tal_arr(cmd, char, (4+plen)*2 + 1);
+			for (size_t h = 0; h < 4+plen; h++)
+				sprintf(phex + h*2, "%02x", pwire[h]);
+
+			struct out_req *preq = jsonrpc_request_start(cmd,
+				"sendcustommsg", rpc_done, rpc_err, cmd);
+			json_add_string(preq->js, "node_id", peer_id);
+			json_add_string(preq->js, "msg", phex);
+			send_outreq(preq);
+
+			fi->ceremony = CEREMONY_ROTATING;
+			plugin_log(plugin_handle, LOG_INFORM,
+				   "Client: sent ROTATE_NONCE + ROTATE_PSIG "
+				   "(%zu psigs)", psig_nb.n_entries);
+		}
+		break;
+
+	case SS_SUBMSG_ROTATE_NONCE:
+		plugin_log(plugin_handle, LOG_INFORM,
+			   "ROTATE_NONCE from %s (len=%zu)",
+			   peer_id, len);
+		/* LSP side: client sent rotation nonces */
+		if (fi && fi->is_lsp) {
+			nonce_bundle_t cnb;
+			if (!nonce_bundle_deserialize(&cnb, data, len))
+				break;
+			factory_t *f = (factory_t *)fi->lib_factory;
+			if (!f) break;
+			secp256k1_context *ctx = global_secp_ctx;
+
+			size_t nonces_set = 0;
+			for (size_t e = 0; e < cnb.n_entries; e++) {
+				secp256k1_musig_pubnonce pn;
+				if (!musig_pubnonce_parse(ctx, &pn,
+					cnb.entries[e].pubnonce))
+					continue;
+				if (!factory_session_set_nonce(f,
+					cnb.entries[e].node_idx,
+					cnb.entries[e].signer_slot, &pn))
+					continue;
+				nonces_set++;
+			}
+
+			/* Mark client nonce received */
+			if (fi->n_clients == 1)
+				fi->clients[0].nonce_received = true;
+
+			plugin_log(plugin_handle, LOG_INFORM,
+				   "LSP: rotate nonces set %zu/%zu",
+				   nonces_set, cnb.n_entries);
+
+			if (ss_factory_all_nonces_received(fi)) {
+				if (!factory_sessions_finalize(f)) {
+					plugin_log(plugin_handle, LOG_BROKEN,
+						   "LSP: rotate finalize failed");
+				} else {
+					plugin_log(plugin_handle, LOG_INFORM,
+						   "LSP: rotate nonces finalized");
+				}
+			}
+		}
+		break;
+
+	case SS_SUBMSG_ROTATE_PSIG:
+		plugin_log(plugin_handle, LOG_INFORM,
+			   "ROTATE_PSIG from %s (len=%zu)",
+			   peer_id, len);
+		/* LSP side: client sent rotation partial sigs */
+		if (fi && fi->is_lsp) {
+			nonce_bundle_t pnb;
+			if (!nonce_bundle_deserialize(&pnb, data, len))
+				break;
+			factory_t *f = (factory_t *)fi->lib_factory;
+			if (!f) break;
+
+			/* Set client psigs */
+			size_t psigs_set = 0;
+			for (size_t e = 0; e < pnb.n_entries; e++) {
+				secp256k1_musig_partial_sig ps;
+				if (!musig_partial_sig_parse(global_secp_ctx,
+					&ps, pnb.entries[e].pubnonce))
+					continue;
+				if (!factory_session_set_partial_sig(f,
+					pnb.entries[e].node_idx,
+					pnb.entries[e].signer_slot, &ps))
+					continue;
+				psigs_set++;
+			}
+
+			plugin_log(plugin_handle, LOG_INFORM,
+				   "LSP: rotate client psigs set %zu/%zu",
+				   psigs_set, pnb.n_entries);
+
+			/* Create LSP's own psigs */
+			secp256k1_keypair lsp_kp;
+			secp256k1_keypair_create(global_secp_ctx,
+				&lsp_kp, fi->our_seckey);
+
+			musig_nonce_pool_t *lsp_pool =
+				(musig_nonce_pool_t *)fi->nonce_pool;
+			size_t lsp_psigs = 0;
+			for (size_t si = 0; si < fi->n_secnonces; si++) {
+				uint32_t pi = fi->secnonce_pool_idx[si];
+				uint32_t ni = fi->secnonce_node_idx[si];
+				secp256k1_musig_secnonce *sn =
+					&lsp_pool->nonces[pi].secnonce;
+
+				secp256k1_musig_partial_sig psig;
+				if (!musig_create_partial_sig(
+					global_secp_ctx, &psig, sn, &lsp_kp,
+					&f->nodes[ni].signing_session))
+					continue;
+
+				int slot = factory_find_signer_slot(
+					f, ni, fi->our_participant_idx);
+				if (slot < 0) continue;
+
+				factory_session_set_partial_sig(
+					f, ni, (size_t)slot, &psig);
+				lsp_psigs++;
+			}
+
+			plugin_log(plugin_handle, LOG_INFORM,
+				   "LSP: created %zu own rotate psigs",
+				   lsp_psigs);
+
+			/* Try to complete */
+			if (!factory_sessions_complete(f)) {
+				plugin_log(plugin_handle, LOG_BROKEN,
+					   "LSP: rotate sessions_complete failed");
+			} else {
+				fi->ceremony = CEREMONY_ROTATE_COMPLETE;
+				plugin_log(plugin_handle, LOG_INFORM,
+					   "LSP: ROTATION SIGNED! epoch=%u",
+					   fi->epoch);
+
+				/* Send revocation secret for old epoch */
+				uint32_t old_ep = fi->epoch - 1;
+				unsigned char rev_secret[32];
+				if (factory_get_revocation_secret(f, old_ep,
+								  rev_secret)) {
+					/* Wire: type(2)+submsg(2)+epoch(4)+secret(32) */
+					uint8_t rwire[4 + 4 + 32];
+					rwire[0] = 0x80; rwire[1] = 0x20;
+					rwire[2] = 0x01; rwire[3] = 0x0C;
+					rwire[4] = (old_ep >> 24) & 0xFF;
+					rwire[5] = (old_ep >> 16) & 0xFF;
+					rwire[6] = (old_ep >> 8) & 0xFF;
+					rwire[7] = old_ep & 0xFF;
+					memcpy(rwire + 8, rev_secret, 32);
+
+					for (size_t ci = 0; ci < fi->n_clients; ci++) {
+						char nid[67];
+						for (int j = 0; j < 33; j++)
+							sprintf(nid + j*2, "%02x",
+								fi->clients[ci].node_id[j]);
+						nid[66] = '\0';
+
+						char *rhex = tal_arr(cmd, char, 40*2 + 1);
+						for (size_t h = 0; h < 40; h++)
+							sprintf(rhex + h*2, "%02x", rwire[h]);
+
+						struct out_req *rreq = jsonrpc_request_start(
+							cmd, "sendcustommsg",
+							rpc_done, rpc_err, cmd);
+						json_add_string(rreq->js, "node_id", nid);
+						json_add_string(rreq->js, "msg", rhex);
+						send_outreq(rreq);
+					}
+
+					plugin_log(plugin_handle, LOG_INFORM,
+						   "LSP: sent REVOKE for epoch %u",
+						   old_ep);
+				}
+
+				/* Send ROTATE_COMPLETE to clients */
+				uint8_t cwire[4 + 32];
+				cwire[0] = 0x80; cwire[1] = 0x20;
+				cwire[2] = 0x01; cwire[3] = 0x0B;
+				memcpy(cwire + 4, fi->instance_id, 32);
+
+				for (size_t ci = 0; ci < fi->n_clients; ci++) {
+					char nid[67];
+					for (int j = 0; j < 33; j++)
+						sprintf(nid + j*2, "%02x",
+							fi->clients[ci].node_id[j]);
+					nid[66] = '\0';
+
+					char *chex = tal_arr(cmd, char, 36*2 + 1);
+					for (size_t h = 0; h < 36; h++)
+						sprintf(chex + h*2, "%02x", cwire[h]);
+
+					struct out_req *creq = jsonrpc_request_start(
+						cmd, "sendcustommsg",
+						rpc_done, rpc_err, cmd);
+					json_add_string(creq->js, "node_id", nid);
+					json_add_string(creq->js, "msg", chex);
+					send_outreq(creq);
+				}
+			}
+		}
+		break;
+
+	case SS_SUBMSG_ROTATE_COMPLETE:
+		plugin_log(plugin_handle, LOG_INFORM,
+			   "ROTATE_COMPLETE from %s (len=%zu)",
+			   peer_id, len);
+		if (fi) {
+			fi->ceremony = CEREMONY_ROTATE_COMPLETE;
+			plugin_log(plugin_handle, LOG_INFORM,
+				   "Client: rotation complete, epoch=%u",
+				   fi->epoch);
+		}
+		break;
+
+	case SS_SUBMSG_REVOKE:
+		plugin_log(plugin_handle, LOG_INFORM,
+			   "REVOKE from %s (len=%zu)", peer_id, len);
+		/* Client: store revocation secret for breach detection */
+		if (fi && len >= 36) {
+			uint32_t rev_epoch = ((uint32_t)data[0] << 24) |
+				((uint32_t)data[1] << 16) |
+				((uint32_t)data[2] << 8) | data[3];
+			const uint8_t *rev_secret = data + 4;
+
+			ss_factory_add_breach_data(fi, rev_epoch,
+						   rev_secret, NULL, 0);
+
+			fi->ceremony = CEREMONY_REVOKED;
+			plugin_log(plugin_handle, LOG_INFORM,
+				   "Client: stored revocation for epoch %u, "
+				   "n_breach=%zu",
+				   rev_epoch, fi->n_breach_epochs);
+		}
+		break;
+
 	case SS_SUBMSG_CLOSE_PROPOSE:
 	case SS_SUBMSG_CLOSE_NONCE:
 	case SS_SUBMSG_CLOSE_ALL_NONCES:
@@ -1091,12 +1512,217 @@ static struct command_result *json_factory_list(struct command *cmd,
 			fi->ceremony == CEREMONY_NONCES_COLLECTED ? "nonces_collected" :
 			fi->ceremony == CEREMONY_PSIGS_COLLECTED ? "psigs_collected" :
 			fi->ceremony == CEREMONY_COMPLETE ? "complete" :
+			fi->ceremony == CEREMONY_ROTATING ? "rotating" :
+			fi->ceremony == CEREMONY_ROTATE_COMPLETE ? "rotate_complete" :
+			fi->ceremony == CEREMONY_REVOKED ? "revoked" :
 			"failed");
 		json_add_u32(js, "expiry_block", fi->expiry_block);
 		json_add_u32(js, "n_breach_epochs", fi->n_breach_epochs);
 		json_object_end(js);
 	}
 	json_array_end(js);
+	return command_finished(cmd, js);
+}
+
+/* factory-rotate RPC — LSP advances DW epoch and re-signs.
+ * Takes instance_id of an existing factory. */
+static struct command_result *json_factory_rotate(struct command *cmd,
+						  const char *buf,
+						  const jsmntok_t *params)
+{
+	const char *id_hex;
+	factory_instance_t *fi;
+	uint8_t instance_id[32];
+
+	if (!param(cmd, buf, params,
+		   p_req("instance_id", param_string, &id_hex),
+		   NULL))
+		return command_param_failed();
+
+	if (strlen(id_hex) != 64)
+		return command_fail(cmd, LIGHTNINGD, "Bad instance_id length");
+
+	for (int j = 0; j < 32; j++) {
+		unsigned int b;
+		sscanf(id_hex + j*2, "%02x", &b);
+		instance_id[j] = (uint8_t)b;
+	}
+
+	fi = ss_factory_find(&ss_state, instance_id);
+	if (!fi)
+		return command_fail(cmd, LIGHTNINGD, "Factory not found");
+	if (!fi->is_lsp)
+		return command_fail(cmd, LIGHTNINGD, "Only LSP can rotate");
+	if (fi->ceremony != CEREMONY_COMPLETE &&
+	    fi->ceremony != CEREMONY_ROTATE_COMPLETE &&
+	    fi->ceremony != CEREMONY_REVOKED)
+		return command_fail(cmd, LIGHTNINGD,
+				    "Factory not in signed state");
+
+	factory_t *factory = (factory_t *)fi->lib_factory;
+	if (!factory)
+		return command_fail(cmd, LIGHTNINGD, "No lib_factory handle");
+
+	secp256k1_context *ctx = global_secp_ctx;
+	uint32_t old_epoch = fi->epoch;
+
+	/* Generate revocation secret for current epoch before advancing */
+	if (factory->n_revocation_secrets == 0)
+		factory_generate_flat_secrets(factory, 256);
+
+	/* Advance the DW counter */
+	if (!dw_counter_advance(&factory->counter)) {
+		return command_fail(cmd, LIGHTNINGD,
+				    "DW counter exhausted, cannot rotate");
+	}
+	fi->epoch = dw_counter_epoch(&factory->counter);
+
+	plugin_log(plugin_handle, LOG_INFORM,
+		   "factory-rotate: epoch %u → %u",
+		   old_epoch, fi->epoch);
+
+	/* Rebuild all node transactions for new epoch */
+	for (size_t ni = 0; ni < factory->n_nodes; ni++) {
+		if (!factory_rebuild_node_tx(factory, ni)) {
+			plugin_log(plugin_handle, LOG_BROKEN,
+				   "factory-rotate: rebuild node %zu failed", ni);
+			return command_fail(cmd, LIGHTNINGD,
+					    "Failed to rebuild tree");
+		}
+	}
+
+	/* Re-initialize signing sessions */
+	if (!factory_sessions_init(factory))
+		return command_fail(cmd, LIGHTNINGD,
+				    "Failed to reinit signing sessions");
+
+	/* Generate new nonces (same flow as factory-create) */
+	unsigned char lsp_seckey[32];
+	derive_demo_seckey(lsp_seckey, fi->instance_id, 0);
+
+	size_t n_participants = 1 + fi->n_clients;
+	secp256k1_pubkey *pubkeys = calloc(n_participants,
+					   sizeof(secp256k1_pubkey));
+	for (size_t k = 0; k < n_participants; k++) {
+		unsigned char sk[32];
+		derive_demo_seckey(sk, fi->instance_id, (int)k);
+		secp256k1_ec_pubkey_create(ctx, &pubkeys[k], sk);
+	}
+
+	/* Store seckey for signing */
+	memcpy(fi->our_seckey, lsp_seckey, 32);
+	fi->our_participant_idx = 0;
+	fi->n_secnonces = 0;
+
+	/* Free old nonce pool if any */
+	if (fi->nonce_pool) {
+		free(fi->nonce_pool);
+		fi->nonce_pool = NULL;
+	}
+
+	size_t lsp_node_count = factory_count_nodes_for_participant(factory, 0);
+	musig_nonce_pool_t *pool = calloc(1, sizeof(musig_nonce_pool_t));
+	if (!musig_nonce_pool_generate(ctx, pool, lsp_node_count,
+				       lsp_seckey, &pubkeys[0], NULL)) {
+		free(pool);
+		free(pubkeys);
+		return command_fail(cmd, LIGHTNINGD,
+				    "Failed to generate nonce pool");
+	}
+	fi->nonce_pool = pool;
+
+	/* Build nonce bundle for rotation */
+	nonce_bundle_t nb;
+	memset(&nb, 0, sizeof(nb));
+	memcpy(nb.instance_id, fi->instance_id, 32);
+	nb.n_participants = n_participants;
+	nb.n_nodes = factory->n_nodes;
+	nb.n_entries = 0;
+
+	for (size_t pk = 0; pk < n_participants && pk < MAX_PARTICIPANTS; pk++) {
+		size_t pklen = 33;
+		secp256k1_ec_pubkey_serialize(ctx,
+			nb.pubkeys[pk], &pklen,
+			&pubkeys[pk], SECP256K1_EC_COMPRESSED);
+	}
+
+	size_t pool_entry = 0;
+	for (size_t ni = 0; ni < factory->n_nodes; ni++) {
+		int slot = factory_find_signer_slot(factory, ni, 0);
+		if (slot < 0) continue;
+
+		secp256k1_musig_secnonce *secnonce;
+		secp256k1_musig_pubnonce pubnonce;
+		if (!musig_nonce_pool_next(pool, &secnonce, &pubnonce))
+			break;
+
+		fi->secnonce_pool_idx[fi->n_secnonces] = pool_entry;
+		fi->secnonce_node_idx[fi->n_secnonces] = ni;
+		fi->n_secnonces++;
+		pool_entry++;
+
+		factory_session_set_nonce(factory, ni, (size_t)slot, &pubnonce);
+		musig_pubnonce_serialize(ctx,
+			nb.entries[nb.n_entries].pubnonce, &pubnonce);
+		nb.entries[nb.n_entries].node_idx = ni;
+		nb.entries[nb.n_entries].signer_slot = slot;
+		nb.n_entries++;
+	}
+
+	/* Serialize and send ROTATE_PROPOSE to all clients.
+	 * Payload: [4 bytes: old_epoch] [4 bytes: new_epoch] + nonce_bundle */
+	uint8_t nbuf[32768];
+	size_t nlen = nonce_bundle_serialize(&nb, nbuf, sizeof(nbuf));
+
+	/* Prepend epoch info: old(4) + new(4) + bundle */
+	uint8_t payload[8 + 32768];
+	payload[0] = (old_epoch >> 24) & 0xFF;
+	payload[1] = (old_epoch >> 16) & 0xFF;
+	payload[2] = (old_epoch >> 8) & 0xFF;
+	payload[3] = old_epoch & 0xFF;
+	payload[4] = (fi->epoch >> 24) & 0xFF;
+	payload[5] = (fi->epoch >> 16) & 0xFF;
+	payload[6] = (fi->epoch >> 8) & 0xFF;
+	payload[7] = fi->epoch & 0xFF;
+	memcpy(payload + 8, nbuf, nlen);
+	size_t plen = 8 + nlen;
+
+	/* Wire: type(2) + submsg(2) + payload */
+	uint8_t wire[4 + 8 + 32768];
+	wire[0] = 0x80; wire[1] = 0x20;
+	wire[2] = 0x01; wire[3] = 0x08; /* ROTATE_PROPOSE */
+	memcpy(wire + 4, payload, plen);
+	size_t wire_len = 4 + plen;
+
+	for (size_t ci = 0; ci < fi->n_clients; ci++) {
+		char client_hex[67];
+		for (int j = 0; j < 33; j++)
+			sprintf(client_hex + j*2, "%02x",
+				fi->clients[ci].node_id[j]);
+		client_hex[66] = '\0';
+
+		char *hex = tal_arr(cmd, char, wire_len*2 + 1);
+		for (size_t h = 0; h < wire_len; h++)
+			sprintf(hex + h*2, "%02x", wire[h]);
+
+		struct out_req *req = jsonrpc_request_start(cmd,
+			"sendcustommsg", rpc_done, rpc_err, cmd);
+		json_add_string(req->js, "node_id", client_hex);
+		json_add_string(req->js, "msg", hex);
+		send_outreq(req);
+	}
+
+	/* Reset ceremony tracking for rotation */
+	ss_factory_reset_ceremony(fi);
+	fi->ceremony = CEREMONY_ROTATING;
+
+	free(pubkeys);
+
+	struct json_stream *js = jsonrpc_stream_success(cmd);
+	json_add_string(js, "instance_id", id_hex);
+	json_add_u32(js, "old_epoch", old_epoch);
+	json_add_u32(js, "new_epoch", fi->epoch);
+	json_add_string(js, "ceremony", "rotating");
 	return command_finished(cmd, js);
 }
 
@@ -1132,6 +1758,10 @@ static const struct plugin_command commands[] = {
 	{
 		"factory-list",
 		json_factory_list,
+	},
+	{
+		"factory-rotate",
+		json_factory_rotate,
 	},
 };
 

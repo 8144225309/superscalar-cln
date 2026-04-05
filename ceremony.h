@@ -14,6 +14,11 @@
  *   0x0102 = ALL_NONCES (aggregated nonces for all nodes)
  *   0x0103 = PSIG_BUNDLE (per-signer partial sig set)
  *   0x0104 = FACTORY_READY (signed tree, channel params)
+ *   0x0108 = ROTATE_PROPOSE (LSP proposes new epoch)
+ *   0x0109 = ROTATE_NONCE (nonce bundle for new epoch)
+ *   0x010A = ROTATE_PSIG (partial sigs for new epoch)
+ *   0x010B = ROTATE_COMPLETE (new epoch signed)
+ *   0x010C = REVOKE (revocation secret for old epoch)
  *   0x0110 = CLOSE_PROPOSE
  *   0x0111 = CLOSE_NONCE
  *   0x0112 = CLOSE_ALL_NONCES
@@ -33,13 +38,21 @@
 #define SS_SUBMSG_ALL_NONCES		0x0102
 #define SS_SUBMSG_PSIG_BUNDLE		0x0103
 #define SS_SUBMSG_FACTORY_READY		0x0104
+/* Rotation ceremony */
+#define SS_SUBMSG_ROTATE_PROPOSE	0x0108
+#define SS_SUBMSG_ROTATE_NONCE		0x0109
+#define SS_SUBMSG_ROTATE_PSIG		0x010A
+#define SS_SUBMSG_ROTATE_COMPLETE	0x010B
+#define SS_SUBMSG_REVOKE		0x010C
+
+/* Close ceremony */
 #define SS_SUBMSG_CLOSE_PROPOSE		0x0110
 #define SS_SUBMSG_CLOSE_NONCE		0x0111
 #define SS_SUBMSG_CLOSE_ALL_NONCES	0x0112
 #define SS_SUBMSG_CLOSE_PSIG		0x0113
 #define SS_SUBMSG_CLOSE_DONE		0x0114
 
-/* Ceremony state for a factory creation in progress */
+/* Ceremony state */
 typedef enum {
 	CEREMONY_IDLE,
 	CEREMONY_PROPOSED,	/* Sent FACTORY_PROPOSE, waiting for nonces */
@@ -47,6 +60,10 @@ typedef enum {
 	CEREMONY_PSIGS_COLLECTED,   /* All partial sigs received */
 	CEREMONY_COMPLETE,	/* Factory tree fully signed */
 	CEREMONY_FAILED,
+	/* Rotation states */
+	CEREMONY_ROTATING,	/* DW advanced, re-signing in progress */
+	CEREMONY_ROTATE_COMPLETE,  /* New epoch signed, awaiting revocation */
+	CEREMONY_REVOKED,	/* Old epoch revoked */
 } ceremony_state_t;
 
 #endif /* SUPERSCALAR_CEREMONY_H */
