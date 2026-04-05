@@ -82,11 +82,12 @@ static void send_factory_msg(struct command *cmd, const char *peer_id,
 			     size_t data_len)
 {
 	/* Build factory_piggyback TLV payload:
-	 * TLV type 0: protocol_id (1+1+32 = 34 bytes: type(1)+len(1)+value(32))
-	 * TLV type 1024: piggyback_payload (3+2+data_len bytes) */
+	 * TLV type 0: protocol_id (1+1+32 = 34 bytes)
+	 * TLV type 1024: header(3) + varint_len(1 or 3) + ss_submsg(2) + data */
 	size_t inner_len = 2 + data_len; /* ss_submsg(2) + data */
-	size_t tlv_len = 34 + 4 + inner_len; /* TLV[0](34) + TLV[1024](4+inner) */
-	size_t wire_len = 4 + tlv_len; /* type(2)+submsg(2) + tlvs */
+	size_t varint_size = (inner_len < 253) ? 1 : 3;
+	size_t tlv1024_len = 3 + varint_size + inner_len;
+	size_t wire_len = 4 + 34 + tlv1024_len;
 
 	uint8_t *wire = calloc(1, wire_len);
 	wire[0] = 0x80; wire[1] = 0x20; /* type 32800 */
