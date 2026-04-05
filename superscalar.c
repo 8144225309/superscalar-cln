@@ -77,7 +77,7 @@ static struct command_result *rpc_err(struct command *cmd,
 /* Send a SuperScalar message wrapped in factory_piggyback (submsg 4).
  * Wire format: type(2) + submsg_id=4(2) + TLV[0]=protocol_id(34) +
  *              TLV[1024]=payload(4+len) where payload = ss_submsg(2)+data */
-static void UNUSED send_factory_msg(struct command *cmd, const char *peer_id,
+static void send_factory_msg(struct command *cmd, const char *peer_id,
 			     uint16_t ss_submsg, const uint8_t *data,
 			     size_t data_len)
 {
@@ -385,22 +385,9 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 			uint8_t rbuf[32768];
 			size_t rlen = nonce_bundle_serialize(&resp,
 				rbuf, sizeof(rbuf));
-
-			/* Build wire message: type(2) + submsg(2) + payload */
-			uint8_t wire[4 + 32768];
-			wire[0] = 0x80; wire[1] = 0x20;
-			wire[2] = 0x01; wire[3] = 0x01; /* NONCE_BUNDLE */
-			memcpy(wire + 4, rbuf, rlen);
-
-			char *hex = tal_arr(cmd, char, (4+rlen)*2 + 1);
-			for (size_t h = 0; h < 4+rlen; h++)
-				sprintf(hex + h*2, "%02x", wire[h]);
-
-			struct out_req *req = jsonrpc_request_start(cmd,
-				"sendcustommsg", rpc_done, rpc_err, cmd);
-			json_add_string(req->js, "node_id", peer_id);
-			json_add_string(req->js, "msg", hex);
-			send_outreq(req);
+			send_factory_msg(cmd, peer_id,
+					 SS_SUBMSG_NONCE_BUNDLE,
+					 rbuf, rlen);
 
 			/* Client can finalize immediately — has all nonces */
 			if (!factory_sessions_finalize(factory)) {
@@ -462,22 +449,9 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 					uint8_t pbuf[32768];
 					size_t plen = nonce_bundle_serialize(
 						&psig_nb, pbuf, sizeof(pbuf));
-
-					uint8_t pwire[4 + 32768];
-					pwire[0] = 0x80; pwire[1] = 0x20;
-					pwire[2] = 0x01; pwire[3] = 0x03; /* PSIG_BUNDLE */
-					memcpy(pwire + 4, pbuf, plen);
-
-					char *phex = tal_arr(cmd, char, (4+plen)*2 + 1);
-					for (size_t h = 0; h < 4+plen; h++)
-						sprintf(phex + h*2, "%02x", pwire[h]);
-
-					struct out_req *preq = jsonrpc_request_start(
-						cmd, "sendcustommsg",
-						rpc_done, rpc_err, cmd);
-					json_add_string(preq->js, "node_id", peer_id);
-					json_add_string(preq->js, "msg", phex);
-					send_outreq(preq);
+					send_factory_msg(cmd, peer_id,
+						SS_SUBMSG_PSIG_BUNDLE,
+						pbuf, plen);
 
 					plugin_log(plugin_handle, LOG_INFORM,
 						   "Client: sent PSIG_BUNDLE (%zu bytes)",
