@@ -1910,7 +1910,8 @@ static struct command_result *json_factory_close(struct command *cmd,
 		if (!secp256k1_ec_pubkey_create(ctx, &pk, sk))
 			return command_fail(cmd, LIGHTNINGD, "Bad close pubkey");
 		secp256k1_xonly_pubkey xpk;
-		secp256k1_xonly_pubkey_from_pubkey(ctx, &xpk, NULL, &pk);
+		if (!secp256k1_xonly_pubkey_from_pubkey(ctx, &xpk, NULL, &pk))
+			return command_fail(cmd, LIGHTNINGD, "Bad xonly key");
 		unsigned char xpk_ser[32];
 		secp256k1_xonly_pubkey_serialize(ctx, xpk_ser, &xpk);
 		outputs[k].script_pubkey[0] = 0x51; /* OP_1 */
@@ -1918,11 +1919,6 @@ static struct command_result *json_factory_close(struct command *cmd,
 		memcpy(outputs[k].script_pubkey + 2, xpk_ser, 32);
 		outputs[k].script_pubkey_len = 34;
 	}
-
-	/* Build unsigned close tx */
-	tx_buf_t close_tx;
-	unsigned char sighash[32];
-	tx_buf_init(&close_tx, 512);
 
 	/* Re-init sessions for close signing */
 	factory_sessions_init(factory);
@@ -1987,7 +1983,8 @@ static struct command_result *json_factory_close(struct command *cmd,
 		unsigned char sk2[32];
 		derive_demo_seckey(sk2, fi->instance_id, (int)pk);
 		secp256k1_pubkey ppk;
-		secp256k1_ec_pubkey_create(ctx, &ppk, sk2);
+		if (!secp256k1_ec_pubkey_create(ctx, &ppk, sk2))
+			continue;
 		size_t pklen = 33;
 		secp256k1_ec_pubkey_serialize(ctx, nb.pubkeys[pk], &pklen,
 			&ppk, SECP256K1_EC_COMPRESSED);
@@ -2024,7 +2021,6 @@ static struct command_result *json_factory_close(struct command *cmd,
 	}
 
 	fi->lifecycle = FACTORY_LIFECYCLE_DYING;
-	tx_buf_free(&close_tx);
 
 	plugin_log(plugin_handle, LOG_INFORM,
 		   "factory-close: sent CLOSE_PROPOSE to %zu clients",
