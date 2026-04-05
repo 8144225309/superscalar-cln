@@ -787,7 +787,11 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 			}
 
 			secp256k1_keypair kp;
-			secp256k1_keypair_create(ctx, &kp, our_sec);
+			if (!secp256k1_keypair_create(ctx, &kp, our_sec)) {
+				plugin_log(plugin_handle, LOG_BROKEN,
+					   "Client: rotate keypair failed");
+				break;
+			}
 
 			nonce_bundle_t psig_nb;
 			memset(&psig_nb, 0, sizeof(psig_nb));
@@ -929,8 +933,12 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 
 			/* Create LSP's own psigs */
 			secp256k1_keypair lsp_kp;
-			secp256k1_keypair_create(global_secp_ctx,
-				&lsp_kp, fi->our_seckey);
+			if (!secp256k1_keypair_create(global_secp_ctx,
+				&lsp_kp, fi->our_seckey)) {
+				plugin_log(plugin_handle, LOG_BROKEN,
+					   "LSP: rotate keypair failed");
+				break;
+			}
 
 			musig_nonce_pool_t *lsp_pool =
 				(musig_nonce_pool_t *)fi->nonce_pool;
@@ -1606,7 +1614,11 @@ static struct command_result *json_factory_rotate(struct command *cmd,
 	for (size_t k = 0; k < n_participants; k++) {
 		unsigned char sk[32];
 		derive_demo_seckey(sk, fi->instance_id, (int)k);
-		secp256k1_ec_pubkey_create(ctx, &pubkeys[k], sk);
+		if (!secp256k1_ec_pubkey_create(ctx, &pubkeys[k], sk)) {
+			free(pubkeys);
+			return command_fail(cmd, LIGHTNINGD,
+					    "Bad rotate pubkey");
+		}
 	}
 
 	/* Store seckey for signing */
