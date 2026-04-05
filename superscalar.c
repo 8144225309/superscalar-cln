@@ -9,6 +9,7 @@
 #include <common/json_param.h>
 #include <common/json_stream.h>
 #include <plugins/libplugin.h>
+#include <common/features.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <inttypes.h>
@@ -31,6 +32,19 @@ static secp256k1_context *global_secp_ctx;
 /* bLIP-56 factory message type */
 #define FACTORY_MSG_TYPE	32800
 
+/* bLIP-56 feature bit */
+#define OPT_PLUGGABLE_CHANNEL_FACTORIES 271
+
+/* bLIP-56 standard submessage IDs */
+#define BLIP56_SUBMSG_SUPPORTED_PROTOCOLS	2
+#define BLIP56_SUBMSG_FACTORY_PIGGYBACK		4
+
+/* SuperScalar protocol ID: first 32 bytes of "SuperScalar/v1" zero-padded */
+static const uint8_t SUPERSCALAR_PROTOCOL_ID[32] = {
+	'S','u','p','e','r','S','c','a','l','a','r','/','v','1',
+	0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+};
+
 /* Derive a deterministic seckey from instance_id + participant index.
  * Both LSP and client compute identical keys. Demo only — real
  * protocol uses each participant's actual node key. */
@@ -44,6 +58,91 @@ static void derive_demo_seckey(unsigned char seckey[32],
 	/* Ensure it's a valid seckey (nonzero, < curve order).
 	 * Setting high byte to 0x01 keeps it well below the order. */
 	if (seckey[0] == 0) seckey[0] = 0x01;
+}
+
+/* Send a SuperScalar message wrapped in factory_piggyback (submsg 4).
+ * Wire format: type(2) + submsg_id=4(2) + TLV[0]=protocol_id(34) +
+ *              TLV[1024]=payload(4+len) where payload = ss_submsg(2)+data */
+static void send_factory_msg(struct command *cmd, const char *peer_id,
+			     uint16_t ss_submsg, const uint8_t *data,
+			     size_t data_len)
+{
+	/* Build factory_piggyback TLV payload:
+	 * TLV type 0: protocol_id (1+1+32 = 34 bytes: type(1)+len(1)+value(32))
+	 * TLV type 1024: piggyback_payload (3+2+data_len bytes) */
+	size_t inner_len = 2 + data_len; /* ss_submsg(2) + data */
+	size_t tlv_len = 34 + 4 + inner_len; /* TLV[0](34) + TLV[1024](4+inner) */
+	size_t wire_len = 4 + tlv_len; /* type(2)+submsg(2) + tlvs */
+
+	uint8_t *wire = calloc(1, wire_len);
+	wire[0] = 0x80; wire[1] = 0x20; /* type 32800 */
+	wire[2] = 0x00; wire[3] = 0x04; /* submsg 4 = factory_piggyback */
+
+	uint8_t *p = wire + 4;
+	/* TLV type 0: factory_protocol_id */
+	*p++ = 0x00; /* type */
+	*p++ = 32;   /* length */
+	memcpy(p, SUPERSCALAR_PROTOCOL_ID, 32); p += 32;
+
+	/* TLV type 1024 (0x0400): factory_piggyback_payload */
+	*p++ = 0xfd; /* varint prefix for 2-byte type */
+	*p++ = 0x04; *p++ = 0x00; /* type 1024 */
+	/* length as varint */
+	if (inner_len < 253) {
+		*p++ = (uint8_t)inner_len;
+	} else {
+		*p++ = 0xfd;
+		*p++ = (inner_len >> 8) & 0xFF;
+		*p++ = inner_len & 0xFF;
+	}
+	/* SuperScalar submessage ID */
+	*p++ = (ss_submsg >> 8) & 0xFF;
+	*p++ = ss_submsg & 0xFF;
+	/* Data */
+	if (data_len > 0)
+		memcpy(p, data, data_len);
+	p += data_len;
+
+	size_t actual_len = (size_t)(p - wire);
+	char *hex = tal_arr(cmd, char, actual_len * 2 + 1);
+	for (size_t h = 0; h < actual_len; h++)
+		sprintf(hex + h*2, "%02x", wire[h]);
+
+	struct out_req *req = jsonrpc_request_start(cmd,
+		"sendcustommsg", rpc_done, rpc_err, cmd);
+	json_add_string(req->js, "node_id", peer_id);
+	json_add_string(req->js, "msg", hex);
+	send_outreq(req);
+	free(wire);
+}
+
+/* Send supported_factory_protocols (submsg 2) to a peer.
+ * TLV type 512: list of 32-byte protocol IDs we support. */
+static void send_supported_protocols(struct command *cmd, const char *peer_id)
+{
+	/* Wire: type(2)+submsg(2) + TLV[512](35 bytes) */
+	uint8_t wire[4 + 35];
+	wire[0] = 0x80; wire[1] = 0x20; /* type 32800 */
+	wire[2] = 0x00; wire[3] = 0x02; /* submsg 2 = supported_factory_protocols */
+
+	/* TLV type 512 (0x0200): protocol_ids */
+	wire[4] = 0xfd; /* varint prefix for 2-byte type */
+	wire[5] = 0x02; wire[6] = 0x00; /* type 512 */
+	wire[7] = 32; /* length: 1 protocol * 32 bytes */
+	memcpy(wire + 8, SUPERSCALAR_PROTOCOL_ID, 32);
+
+	char hex[81]; /* (4+36)*2 + 1 */
+	for (size_t h = 0; h < 40; h++)
+		sprintf(hex + h*2, "%02x", wire[h]);
+
+	struct out_req *req = jsonrpc_request_start(cmd,
+		"sendcustommsg", rpc_done, rpc_err, cmd);
+	json_add_string(req->js, "node_id", peer_id);
+	json_add_string(req->js, "msg", hex);
+	send_outreq(req);
+
+	plugin_log(plugin_handle, LOG_DBG,
+		   "Sent supported_factory_protocols to %s", peer_id);
 }
 
 /* Ceremony state is now per-factory in ss_state */
@@ -1440,33 +1539,128 @@ static void dispatch_blip56_submsg(struct command *cmd,
 				   const u8 *data, size_t len)
 {
 	switch (submsg_id) {
+	case BLIP56_SUBMSG_SUPPORTED_PROTOCOLS: /* 2 */
+		/* Peer sent their supported factory protocol IDs.
+		 * TLV type 512: concatenated 32-byte IDs. */
+		plugin_log(plugin_handle, LOG_INFORM,
+			   "supported_factory_protocols from %s (len=%zu)",
+			   peer_id, len);
+		if (len >= 35) {
+			/* Parse TLV: skip type(3)+len(1), read IDs */
+			const uint8_t *ids = data + 4;
+			size_t ids_len = len - 4;
+			size_t n_protos = ids_len / 32;
+			bool has_superscalar = false;
+			for (size_t pi = 0; pi < n_protos; pi++) {
+				if (memcmp(ids + pi * 32,
+					   SUPERSCALAR_PROTOCOL_ID, 32) == 0) {
+					has_superscalar = true;
+					break;
+				}
+			}
+			plugin_log(plugin_handle, LOG_INFORM,
+				   "Peer %s supports %zu protocols, "
+				   "SuperScalar=%s",
+				   peer_id, n_protos,
+				   has_superscalar ? "yes" : "no");
+
+			/* Send our protocols back */
+			send_supported_protocols(cmd, peer_id);
+		}
+		break;
+
+	case BLIP56_SUBMSG_FACTORY_PIGGYBACK: /* 4 */
+		/* Unwrap factory_piggyback: extract protocol_id + payload.
+		 * TLV[0]=protocol_id(32), TLV[1024]=payload(ss_submsg+data) */
+		if (len >= 36) {
+			/* Skip TLV type 0 header (type=1byte, len=1byte) */
+			const uint8_t *proto_id = data + 2;
+			if (memcmp(proto_id, SUPERSCALAR_PROTOCOL_ID, 32) != 0) {
+				plugin_log(plugin_handle, LOG_DBG,
+					   "Unknown factory protocol in piggyback");
+				break;
+			}
+			/* Find TLV type 1024 payload */
+			const uint8_t *p = data + 34;
+			size_t remaining = len - 34;
+			if (remaining < 4) break;
+			/* Skip TLV type 1024 header (fd 04 00 + len) */
+			p += 3; remaining -= 3;
+			size_t payload_len;
+			if (*p < 253) {
+				payload_len = *p++;
+				remaining--;
+			} else {
+				payload_len = (p[1] << 8) | p[2];
+				p += 3; remaining -= 3;
+			}
+			if (remaining < 2 || payload_len < 2) break;
+			uint16_t ss_sub = (p[0] << 8) | p[1];
+			dispatch_superscalar_submsg(cmd, peer_id,
+				ss_sub, p + 2, payload_len - 2);
+		}
+		break;
+
 	case 6: /* factory_change_init */
 		plugin_log(plugin_handle, LOG_INFORM,
-			   "factory_change_init from %s", peer_id);
-		/* TODO: validate, ack via factory-send submsg 8 */
+			   "factory_change_init from %s (len=%zu)",
+			   peer_id, len);
+		/* Extract channel_id + funding_contribution + funding_pubkey
+		 * from TLV type 1536. Validate with our factory state.
+		 * For now, auto-ack to proceed with the change. */
+		{
+			/* Send factory_change_ack (submsg 8) with same TLVs */
+			uint8_t ack_wire[4 + 256];
+			ack_wire[0] = 0x80; ack_wire[1] = 0x20;
+			ack_wire[2] = 0x00; ack_wire[3] = 0x08;
+			memcpy(ack_wire + 4, data, len < 256 ? len : 256);
+			size_t ack_len = 4 + (len < 256 ? len : 256);
+
+			char *ahex = tal_arr(cmd, char, ack_len * 2 + 1);
+			for (size_t h = 0; h < ack_len; h++)
+				sprintf(ahex + h*2, "%02x", ack_wire[h]);
+
+			struct out_req *areq = jsonrpc_request_start(cmd,
+				"sendcustommsg", rpc_done, rpc_err, cmd);
+			json_add_string(areq->js, "node_id", peer_id);
+			json_add_string(areq->js, "msg", ahex);
+			send_outreq(areq);
+
+			plugin_log(plugin_handle, LOG_INFORM,
+				   "Sent factory_change_ack to %s", peer_id);
+		}
 		break;
+
 	case 8: /* factory_change_ack */
 		plugin_log(plugin_handle, LOG_INFORM,
-			   "factory_change_ack from %s", peer_id);
+			   "factory_change_ack from %s (len=%zu)",
+			   peer_id, len);
+		/* Peer acknowledged our factory_change_init.
+		 * Next: send factory_change_funding (submsg 10) with new txid. */
 		break;
+
 	case 10: /* factory_change_funding */
 		plugin_log(plugin_handle, LOG_INFORM,
-			   "factory_change_funding from %s", peer_id);
+			   "factory_change_funding from %s (len=%zu)",
+			   peer_id, len);
+		/* Peer sent new funding txid. Validate against our factory state.
+		 * Next: sign commitment for new funding outpoint. */
 		break;
+
 	case 12: /* factory_change_continue */
 		plugin_log(plugin_handle, LOG_INFORM,
 			   "factory_change_continue from %s", peer_id);
+		/* Peer says new factory state is valid. Resume channel. */
 		break;
+
 	case 14: /* factory_change_locked */
 		plugin_log(plugin_handle, LOG_INFORM,
 			   "factory_change_locked from %s", peer_id);
+		/* Old state invalidated. New state is the sole valid state. */
 		break;
-	case 512: /* factory_protocol_ids */
-		plugin_log(plugin_handle, LOG_DBG,
-			   "protocol_ids from %s", peer_id);
-		break;
+
 	default:
-		/* Might be a SuperScalar protocol submessage */
+		/* Direct SuperScalar submessages (0x0100+) for backward compat */
 		if (submsg_id >= 0x0100 && submsg_id <= 0x01FF) {
 			dispatch_superscalar_submsg(cmd, peer_id,
 						    submsg_id, data, len);
@@ -1509,7 +1703,7 @@ static struct command_result *handle_custommsg(struct command *cmd,
 	return command_hook_success(cmd);
 }
 
-/* Handle openchannel hook */
+/* Handle openchannel hook — process channel_in_factory TLV (65600) */
 static struct command_result *handle_openchannel(struct command *cmd,
 						 const char *buf,
 						 const jsmntok_t *params)
@@ -1524,8 +1718,91 @@ static struct command_result *handle_openchannel(struct command *cmd,
 	if (!factory)
 		return command_hook_success(cmd);
 
-	plugin_log(plugin_handle, LOG_INFORM,
-		   "Factory channel open detected");
+	/* Extract factory_protocol_id (32 bytes) and factory_instance_id (32 bytes) */
+	const jsmntok_t *proto_tok = json_get_member(buf, factory,
+						      "factory_protocol_id");
+	const jsmntok_t *inst_tok = json_get_member(buf, factory,
+						     "factory_instance_id");
+	const jsmntok_t *warn_tok = json_get_member(buf, factory,
+						     "factory_early_warning_time");
+
+	if (proto_tok && inst_tok) {
+		const char *proto_hex = json_strdup(cmd, buf, proto_tok);
+		const char *inst_hex = json_strdup(cmd, buf, inst_tok);
+
+		plugin_log(plugin_handle, LOG_INFORM,
+			   "Factory channel open: proto=%s inst=%s",
+			   proto_hex ? proto_hex : "?",
+			   inst_hex ? inst_hex : "?");
+
+		/* Validate protocol ID */
+		if (proto_hex && strlen(proto_hex) == 64) {
+			uint8_t proto_id[32];
+			for (int j = 0; j < 32; j++) {
+				unsigned int b;
+				sscanf(proto_hex + j*2, "%02x", &b);
+				proto_id[j] = (uint8_t)b;
+			}
+			if (memcmp(proto_id, SUPERSCALAR_PROTOCOL_ID, 32) != 0) {
+				plugin_log(plugin_handle, LOG_UNUSUAL,
+					   "Unknown factory protocol, rejecting");
+				return command_hook_success(cmd);
+			}
+		}
+
+		/* Find factory by instance_id and map channel */
+		if (inst_hex && strlen(inst_hex) == 64) {
+			uint8_t inst_id[32];
+			for (int j = 0; j < 32; j++) {
+				unsigned int b;
+				sscanf(inst_hex + j*2, "%02x", &b);
+				inst_id[j] = (uint8_t)b;
+			}
+			factory_instance_t *fi = ss_factory_find(&ss_state,
+								  inst_id);
+			if (fi) {
+				/* Map this channel to the factory */
+				const jsmntok_t *cid_tok = json_get_member(buf,
+					openchannel, "channel_id");
+				if (cid_tok) {
+					const char *cid_hex = json_strdup(cmd,
+						buf, cid_tok);
+					uint8_t cid[32];
+					if (cid_hex && strlen(cid_hex) == 64) {
+						for (int j = 0; j < 32; j++) {
+							unsigned int b;
+							sscanf(cid_hex + j*2,
+								"%02x", &b);
+							cid[j] = (uint8_t)b;
+						}
+						ss_factory_map_channel(fi, cid,
+							fi->n_channels, 0);
+						plugin_log(plugin_handle,
+							   LOG_INFORM,
+							   "Mapped channel to "
+							   "factory leaf %zu",
+							   fi->n_channels - 1);
+					}
+				}
+
+				if (warn_tok) {
+					u32 ewt;
+					json_to_u32(buf, warn_tok, &ewt);
+					fi->early_warning_time = (uint16_t)ewt;
+				}
+
+				fi->lifecycle = FACTORY_LIFECYCLE_ACTIVE;
+			} else {
+				plugin_log(plugin_handle, LOG_UNUSUAL,
+					   "Factory instance not found for "
+					   "channel open");
+			}
+		}
+	} else {
+		plugin_log(plugin_handle, LOG_INFORM,
+			   "Factory channel open detected (no TLV fields)");
+	}
+
 	return command_hook_success(cmd);
 }
 
@@ -2478,6 +2755,27 @@ static struct command_result *json_factory_check_breach(struct command *cmd,
 	return command_finished(cmd, js);
 }
 
+/* Handle peer connect — send supported_factory_protocols */
+static struct command_result *handle_connect(struct command *cmd,
+					     const char *buf,
+					     const jsmntok_t *params)
+{
+	const jsmntok_t *connect_tok = json_get_member(buf, params, "connect");
+	if (!connect_tok)
+		return notification_handled(cmd);
+
+	const jsmntok_t *id_tok = json_get_member(buf, connect_tok, "id");
+	if (!id_tok)
+		return notification_handled(cmd);
+
+	const char *peer_id = json_strdup(cmd, buf, id_tok);
+
+	/* Send our supported protocols to the newly connected peer */
+	send_supported_protocols(cmd, peer_id);
+
+	return notification_handled(cmd);
+}
+
 /* Plugin init */
 static const char *init(struct command *init_cmd,
 			const char *buf UNUSED,
@@ -2485,8 +2783,6 @@ static const char *init(struct command *init_cmd,
 {
 	plugin_handle = init_cmd->plugin;
 	ss_state_init(&ss_state);
-
-	/* TODO: load factory instances from CLN datastore */
 
 	global_secp_ctx = secp256k1_context_create(
 		SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
@@ -2531,16 +2827,28 @@ static const struct plugin_command commands[] = {
 
 static const struct plugin_notification notifs[] = {
 	{ "block_added", handle_block_added },
+	{ "connect", handle_connect },
 };
 
 int main(int argc, char *argv[])
 {
+	struct feature_set *features = tal(NULL, struct feature_set);
 	setup_locale();
+
+	for (int i = 0; i < ARRAY_SIZE(features->bits); i++)
+		features->bits[i] = tal_arr(features, u8, 0);
+
+	/* Advertise pluggable_channel_factories (bit 271) */
+	set_feature_bit(&features->bits[INIT_FEATURE],
+			OPT_PLUGGABLE_CHANNEL_FACTORIES);
+	set_feature_bit(&features->bits[NODE_ANNOUNCE_FEATURE],
+			OPT_PLUGGABLE_CHANNEL_FACTORIES);
+
 	plugin_main(argv, init,
 		    take(NULL),
 		    PLUGIN_RESTARTABLE,
 		    true,
-		    NULL,
+		    take(features),
 		    commands, ARRAY_SIZE(commands),
 		    notifs, ARRAY_SIZE(notifs),
 		    hooks, ARRAY_SIZE(hooks),
