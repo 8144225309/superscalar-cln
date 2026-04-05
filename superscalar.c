@@ -31,6 +31,27 @@ static superscalar_state_t ss_state;
 
 /* Ceremony state is now per-factory in ss_state */
 
+/* Generic RPC callback — just log and ignore result */
+static struct command_result *rpc_done(struct command *cmd,
+				       const char *method,
+				       const char *buf,
+				       const jsmntok_t *result,
+				       void *arg)
+{
+	return command_still_pending(cmd);
+}
+
+static struct command_result *rpc_err(struct command *cmd,
+				      const char *method,
+				      const char *buf,
+				      const jsmntok_t *result,
+				      void *arg)
+{
+	plugin_log(plugin_handle, LOG_UNUSUAL,
+		   "RPC %s failed", method);
+	return command_still_pending(cmd);
+}
+
 /* Send a factory submessage to a peer via factory-send RPC.
  * Used by ceremony handlers when responding to protocol messages. */
 #if 0 /* Enable when ceremony logic is wired up */
@@ -504,6 +525,45 @@ static struct command_result *json_factory_create(struct command *cmd,
 				   blen);
 
 			fi->ceremony = CEREMONY_PROPOSED;
+
+			/* Send FACTORY_PROPOSE to each client.
+			 * Wire format: factory_message(32800) header
+			 *   [2 bytes: type 0x8020]
+			 *   [2 bytes: submsg_id 0x0100]
+			 *   [payload: nonce bundle] */
+			for (size_t ci = 0; ci < fi->n_clients; ci++) {
+				/* Build the full wire message */
+				uint8_t wire[4 + sizeof(nbuf)];
+				wire[0] = 0x80; wire[1] = 0x20; /* type 32800 */
+				wire[2] = 0x01; wire[3] = 0x00; /* submsg 0x0100 */
+				memcpy(wire + 4, nbuf, blen);
+				size_t wire_len = 4 + blen;
+
+				/* Convert to hex for sendcustommsg */
+				char *hex = tal_arr(cmd, char, wire_len * 2 + 1);
+				for (size_t h = 0; h < wire_len; h++)
+					sprintf(hex + h*2, "%02x", wire[h]);
+
+				/* Convert client node_id to hex */
+				char client_hex[67];
+				for (int h = 0; h < 33; h++)
+					sprintf(client_hex + h*2, "%02x",
+						fi->clients[ci].node_id[h]);
+
+				/* Send via sendcustommsg RPC */
+				struct out_req *req;
+				req = jsonrpc_request_start(cmd,
+					"sendcustommsg",
+					rpc_done, rpc_err, cmd);
+				json_add_string(req->js, "node_id",
+						client_hex);
+				json_add_string(req->js, "msg", hex);
+				send_outreq(req);
+
+				plugin_log(plugin_handle, LOG_INFORM,
+					   "Sent FACTORY_PROPOSE to client %zu "
+					   "(%zu bytes)", ci, wire_len);
+			}
 		}
 	}
 
