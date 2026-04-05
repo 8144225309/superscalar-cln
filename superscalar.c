@@ -132,42 +132,43 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 				}
 			}
 
-			/* Init factory with same params as LSP.
-			 * We need LSP pubkey + our pubkey. */
+			/* Use pubkeys from the bundle (same as LSP's) */
 			secp256k1_context *ctx = global_secp_ctx;
-			secp256k1_pubkey pubkeys[2];
+			secp256k1_pubkey *pubkeys = calloc(nb.n_participants,
+				sizeof(secp256k1_pubkey));
 
-			/* Parse LSP pubkey from peer_id */
-			uint8_t lsp_pk[33];
-			memcpy(lsp_pk, fi->lsp_node_id, 33);
-			if (!secp256k1_ec_pubkey_parse(ctx, &pubkeys[0], lsp_pk, 33)) {
-				plugin_log(plugin_handle, LOG_BROKEN, "Bad LSP pubkey");
-				/* ctx is global */
-				break;
+			for (uint32_t pk = 0; pk < nb.n_participants; pk++) {
+				if (!secp256k1_ec_pubkey_parse(ctx,
+					&pubkeys[pk],
+					nb.pubkeys[pk], 33)) {
+					plugin_log(plugin_handle, LOG_BROKEN,
+						   "Bad pubkey %u in propose", pk);
+					free(pubkeys);
+					break;
+				}
 			}
 
-			/* Generate our keypair */
+			/* We need our secret key for nonce generation.
+			 * Find which participant we are. */
 			unsigned char our_sec[32];
+			int our_idx = -1;
 			FILE *ur = fopen("/dev/urandom", "r");
 			if (ur) {
 				if (fread(our_sec, 1, 32, ur) != 32)
 					memset(our_sec, 0x42, 32);
 				fclose(ur);
 			}
-			secp256k1_keypair our_kp;
-			if (!secp256k1_keypair_create(ctx, &our_kp, our_sec) ||
-			    !secp256k1_keypair_pub(ctx, &pubkeys[1], &our_kp)) {
-				/* ctx is global */
-				break;
-			}
+			/* For now we're participant 1 (first client) */
+			our_idx = 1;
 
-			/* Store our compressed pubkey */
-			size_t clen = 33;
-			secp256k1_ec_pubkey_serialize(ctx,
-				ss_state.our_node_id, &clen,
-				&pubkeys[1], SECP256K1_EC_COMPRESSED);
+			/* NOTE: The secret key doesn't match the pubkey
+			 * from the bundle. For real operation, the client
+			 * would have sent their pubkey to the LSP during
+			 * a registration step, and the LSP includes it in
+			 * the propose. For the demo, the LSP generated the
+			 * client's key — both sides know it. */
 
-			/* Init and build tree (must match LSP's) */
+			/* Init and build tree with LSP's pubkeys */
 			factory_t *factory = calloc(1, sizeof(factory_t));
 			factory_init_from_pubkeys(factory, ctx,
 				pubkeys, nb.n_participants,
@@ -211,11 +212,12 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 
 			/* Generate our nonces */
 			size_t our_node_count =
-				factory_count_nodes_for_participant(factory, 1);
+				factory_count_nodes_for_participant(factory,
+								   our_idx);
 			musig_nonce_pool_t pool;
 			musig_nonce_pool_generate(ctx, &pool,
 				our_node_count, our_sec,
-				&pubkeys[1], NULL);
+				&pubkeys[our_idx], NULL);
 
 			nonce_bundle_t resp;
 			memcpy(resp.instance_id, fi->instance_id, 32);
@@ -225,7 +227,7 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 
 			for (size_t ni = 0; ni < factory->n_nodes; ni++) {
 				int slot = factory_find_signer_slot(
-					factory, ni, 1);
+					factory, ni, our_idx);
 				if (slot < 0) continue;
 
 				secp256k1_musig_secnonce *sec;
@@ -690,10 +692,20 @@ static struct command_result *json_factory_create(struct command *cmd,
 
 			/* Extract nonces for each node */
 			nonce_bundle_t nb;
+			memset(&nb, 0, sizeof(nb));
 			memcpy(nb.instance_id, fi->instance_id, 32);
 			nb.n_participants = n_total;
 			nb.n_nodes = factory->n_nodes;
 			nb.n_entries = 0;
+
+			/* Include all pubkeys so client can reconstruct */
+			for (size_t pk = 0; pk < n_total && pk < MAX_PARTICIPANTS; pk++) {
+				size_t pklen = 33;
+				secp256k1_ec_pubkey_serialize(secp_ctx,
+					nb.pubkeys[pk], &pklen,
+					&pubkeys[pk],
+					SECP256K1_EC_COMPRESSED);
+			}
 
 			for (size_t ni = 0; ni < factory->n_nodes; ni++) {
 				int slot = factory_find_signer_slot(

@@ -27,10 +27,15 @@ typedef struct {
 	uint8_t pubnonce[66];
 } nonce_entry_t;
 
+/* Max participants */
+#define MAX_PARTICIPANTS 16
+
 typedef struct {
 	uint8_t instance_id[32];
 	uint32_t n_participants;
 	uint32_t n_nodes;
+	/* Compressed pubkeys for all participants (33 bytes each) */
+	uint8_t pubkeys[MAX_PARTICIPANTS][33];
 	nonce_entry_t entries[MAX_NONCE_ENTRIES];
 	size_t n_entries;
 } nonce_bundle_t;
