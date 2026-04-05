@@ -1582,9 +1582,6 @@ static void dispatch_blip56_submsg(struct command *cmd,
 				   "SuperScalar=%s",
 				   peer_id, n_protos,
 				   has_superscalar ? "yes" : "no");
-
-			/* Send our protocols back */
-			send_supported_protocols(cmd, peer_id);
 		}
 		break;
 
