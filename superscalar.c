@@ -1167,8 +1167,8 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 			if (hdr_consumed < len &&
 			    nonce_bundle_deserialize(&cnb,
 				p, len - hdr_consumed)) {
-				/* Re-init sessions for close signing */
-				factory_sessions_init(factory);
+				/* Re-init just node 0 session for close signing */
+				factory_session_init_node(factory, 0);
 
 				for (size_t e = 0; e < cnb.n_entries; e++) {
 					secp256k1_musig_pubnonce pn;
@@ -1236,8 +1236,8 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 			json_add_string(nreq->js, "msg", nhex);
 			send_outreq(nreq);
 
-			/* Finalize and create partial sig */
-			factory_sessions_finalize(factory);
+			/* Finalize node 0 and create partial sig */
+			factory_session_finalize_node(factory, 0);
 
 			secp256k1_keypair kp;
 			if (!secp256k1_keypair_create(ctx, &kp, our_sec))
@@ -1311,7 +1311,8 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 					cnb.entries[e].signer_slot, &pn);
 			}
 
-			if (!factory_sessions_finalize(f))
+			/* Finalize just node 0 (close tx) */
+			if (!factory_session_finalize_node(f, 0))
 				plugin_log(plugin_handle, LOG_BROKEN,
 					   "LSP: close finalize failed");
 			else
@@ -1372,8 +1373,8 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 				}
 			}
 
-			/* Try to complete */
-			if (factory_sessions_complete(f)) {
+			/* Try to complete just node 0 (close tx) */
+			if (factory_session_complete_node(f, 0)) {
 				fi->lifecycle = FACTORY_LIFECYCLE_EXPIRED;
 				plugin_log(plugin_handle, LOG_INFORM,
 					   "LSP: COOPERATIVE CLOSE SIGNED!");
@@ -1927,8 +1928,8 @@ static struct command_result *json_factory_close(struct command *cmd,
 		outputs[k].script_pubkey_len = 34;
 	}
 
-	/* Re-init sessions for close signing */
-	factory_sessions_init(factory);
+	/* Re-init just node 0 for close signing */
+	factory_session_init_node(factory, 0);
 
 	/* Generate LSP nonces */
 	unsigned char lsp_seckey[32];
