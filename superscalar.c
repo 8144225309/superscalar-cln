@@ -103,19 +103,176 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 		plugin_log(plugin_handle, LOG_INFORM,
 			   "FACTORY_PROPOSE from %s (len=%zu)",
 			   peer_id, len);
-		/* Client side: LSP proposed a factory.
-		 * Parse instance_id from payload, create new factory. */
-		if (len >= 32) {
-			fi = ss_factory_new(&ss_state, data);
-			if (fi) {
-				fi->is_lsp = false;
-				fi->ceremony = CEREMONY_PROPOSED;
-				plugin_log(plugin_handle, LOG_INFORM,
-					   "Created factory instance for proposal");
+		/* Client side: deserialize nonce bundle, init factory,
+		 * generate our nonces, respond with NONCE_BUNDLE. */
+		{
+			nonce_bundle_t nb;
+			if (!nonce_bundle_deserialize(&nb, data, len)) {
+				plugin_log(plugin_handle, LOG_UNUSUAL,
+					   "Bad FACTORY_PROPOSE payload");
+				break;
 			}
-			/* TODO: parse tree params, init factory via
-			 * libsuperscalar, generate nonces, respond
-			 * with NONCE_BUNDLE */
+
+			fi = ss_factory_new(&ss_state, nb.instance_id);
+			if (!fi) {
+				plugin_log(plugin_handle, LOG_UNUSUAL,
+					   "Failed to create factory");
+				break;
+			}
+			fi->is_lsp = false;
+
+			/* Store LSP peer_id as node_id */
+			if (strlen(peer_id) == 66) {
+				for (int j = 0; j < 33; j++) {
+					unsigned int b;
+					sscanf(peer_id + j*2, "%02x", &b);
+					fi->lsp_node_id[j] = (uint8_t)b;
+				}
+			}
+
+			/* Init factory with same params as LSP.
+			 * We need LSP pubkey + our pubkey. */
+			secp256k1_context *ctx = secp256k1_context_create(
+				SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+			secp256k1_pubkey pubkeys[2];
+
+			/* Parse LSP pubkey from peer_id */
+			uint8_t lsp_pk[33];
+			memcpy(lsp_pk, fi->lsp_node_id, 33);
+			if (!secp256k1_ec_pubkey_parse(ctx, &pubkeys[0], lsp_pk, 33)) {
+				plugin_log(plugin_handle, LOG_BROKEN, "Bad LSP pubkey");
+				secp256k1_context_destroy(ctx);
+				break;
+			}
+
+			/* Generate our keypair */
+			unsigned char our_sec[32];
+			FILE *ur = fopen("/dev/urandom", "r");
+			if (ur) {
+				if (fread(our_sec, 1, 32, ur) != 32)
+					memset(our_sec, 0x42, 32);
+				fclose(ur);
+			}
+			secp256k1_keypair our_kp;
+			if (!secp256k1_keypair_create(ctx, &our_kp, our_sec) ||
+			    !secp256k1_keypair_pub(ctx, &pubkeys[1], &our_kp)) {
+				secp256k1_context_destroy(ctx);
+				break;
+			}
+
+			/* Store our compressed pubkey */
+			size_t clen = 33;
+			secp256k1_ec_pubkey_serialize(ctx,
+				ss_state.our_node_id, &clen,
+				&pubkeys[1], SECP256K1_EC_COMPRESSED);
+
+			/* Init and build tree (must match LSP's) */
+			factory_t *factory = calloc(1, sizeof(factory_t));
+			factory_init_from_pubkeys(factory, ctx,
+				pubkeys, nb.n_participants,
+				144, 16);
+			if (nb.n_participants <= 2)
+				factory_set_arity(factory, FACTORY_ARITY_1);
+			else
+				factory_set_arity(factory, FACTORY_ARITY_2);
+
+			uint8_t synth_txid[32], synth_spk[34];
+			for (int j = 0; j < 32; j++) synth_txid[j] = j + 1;
+			synth_spk[0] = 0x51; synth_spk[1] = 0x20;
+			memset(synth_spk + 2, 0xAA, 32);
+			factory_set_funding(factory, synth_txid, 0,
+					    1000000, synth_spk, 34);
+
+			if (!factory_build_tree(factory)) {
+				plugin_log(plugin_handle, LOG_BROKEN,
+					   "Client: factory_build_tree failed");
+				secp256k1_context_destroy(ctx);
+				free(factory);
+				break;
+			}
+			factory_sessions_init(factory);
+			fi->lib_factory = factory;
+
+			plugin_log(plugin_handle, LOG_INFORM,
+				   "Client: tree built, %zu nodes",
+				   (size_t)factory->n_nodes);
+
+			/* Set LSP nonces on our sessions */
+			for (size_t e = 0; e < nb.n_entries; e++) {
+				secp256k1_musig_pubnonce pn;
+				musig_pubnonce_parse(ctx, &pn,
+					nb.entries[e].pubnonce);
+				factory_session_set_nonce(factory,
+					nb.entries[e].node_idx,
+					nb.entries[e].signer_slot,
+					&pn);
+			}
+
+			/* Generate our nonces */
+			size_t our_node_count =
+				factory_count_nodes_for_participant(factory, 1);
+			musig_nonce_pool_t pool;
+			musig_nonce_pool_generate(ctx, &pool,
+				our_node_count, our_sec,
+				&pubkeys[1], NULL);
+
+			nonce_bundle_t resp;
+			memcpy(resp.instance_id, fi->instance_id, 32);
+			resp.n_participants = nb.n_participants;
+			resp.n_nodes = factory->n_nodes;
+			resp.n_entries = 0;
+
+			for (size_t ni = 0; ni < factory->n_nodes; ni++) {
+				int slot = factory_find_signer_slot(
+					factory, ni, 1);
+				if (slot < 0) continue;
+
+				secp256k1_musig_secnonce *sec;
+				secp256k1_musig_pubnonce pub;
+				if (!musig_nonce_pool_next(&pool, &sec, &pub))
+					break;
+
+				factory_session_set_nonce(factory, ni,
+							  (size_t)slot, &pub);
+				musig_pubnonce_serialize(ctx,
+					resp.entries[resp.n_entries].pubnonce,
+					&pub);
+				resp.entries[resp.n_entries].node_idx = ni;
+				resp.entries[resp.n_entries].signer_slot = slot;
+				resp.n_entries++;
+			}
+
+			plugin_log(plugin_handle, LOG_INFORM,
+				   "Client: generated %zu nonce entries",
+				   resp.n_entries);
+
+			/* Serialize and send NONCE_BUNDLE back to LSP */
+			uint8_t rbuf[32768];
+			size_t rlen = nonce_bundle_serialize(&resp,
+				rbuf, sizeof(rbuf));
+
+			/* Build wire message: type(2) + submsg(2) + payload */
+			uint8_t wire[4 + 32768];
+			wire[0] = 0x80; wire[1] = 0x20;
+			wire[2] = 0x01; wire[3] = 0x01; /* NONCE_BUNDLE */
+			memcpy(wire + 4, rbuf, rlen);
+
+			char *hex = tal_arr(cmd, char, (4+rlen)*2 + 1);
+			for (size_t h = 0; h < 4+rlen; h++)
+				sprintf(hex + h*2, "%02x", wire[h]);
+
+			struct out_req *req = jsonrpc_request_start(cmd,
+				"sendcustommsg", rpc_done, rpc_err, cmd);
+			json_add_string(req->js, "node_id", peer_id);
+			json_add_string(req->js, "msg", hex);
+			send_outreq(req);
+
+			fi->ceremony = CEREMONY_PROPOSED;
+			plugin_log(plugin_handle, LOG_INFORM,
+				   "Client: sent NONCE_BUNDLE (%zu bytes)",
+				   4 + rlen);
+
+			secp256k1_context_destroy(ctx);
 		}
 		break;
 
