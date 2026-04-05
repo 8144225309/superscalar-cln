@@ -16,6 +16,7 @@
 
 #include "ceremony.h"
 #include "factory_state.h"
+#include "nonce_exchange.h"
 
 /* SuperScalar library */
 #include <superscalar/factory.h>
@@ -405,20 +406,105 @@ static struct command_result *json_factory_create(struct command *cmd,
 		/* Store factory handle */
 		fi->lib_factory = factory;
 
-		/* Generate MuSig2 nonces for all tree nodes */
+		/* Initialize signing sessions */
 		rc = factory_sessions_init(factory);
 		if (rc == 0) {
 			plugin_log(plugin_handle, LOG_BROKEN,
-				   "factory_sessions_init failed: %d", rc);
-		} else {
-			plugin_log(plugin_handle, LOG_INFORM,
-				   "MuSig2 nonces generated");
-			fi->ceremony = CEREMONY_PROPOSED;
+				   "factory_sessions_init failed");
+			secp256k1_context_destroy(secp_ctx);
+			return command_fail(cmd, LIGHTNINGD,
+					    "Failed to init signing sessions");
 		}
 
-		/* TODO: Send FACTORY_PROPOSE to each client via
-		 * sendcustommsg or factory-send (if channel exists).
-		 * Payload = instance_id + tree params + LSP nonces */
+		/* Generate nonces using nonce pool.
+		 * Need a keypair for the LSP (participant 0). */
+		{
+			musig_nonce_pool_t pool;
+			unsigned char lsp_seckey[32];
+			secp256k1_keypair lsp_keypair;
+
+			/* Get LSP seckey (generated at init) */
+			FILE *urand2 = fopen("/dev/urandom", "r");
+			if (urand2) {
+				if (fread(lsp_seckey, 1, 32, urand2) != 32)
+					memset(lsp_seckey, 0x42, 32);
+				fclose(urand2);
+			}
+			if (!secp256k1_keypair_create(secp_ctx, &lsp_keypair,
+						      lsp_seckey)) {
+				secp256k1_context_destroy(secp_ctx);
+				return command_fail(cmd, LIGHTNINGD,
+						    "Failed to create LSP keypair");
+			}
+
+			/* Count nodes where LSP is a signer */
+			size_t lsp_node_count = factory_count_nodes_for_participant(
+				factory, 0);
+
+			/* Generate nonce pool */
+			if (!musig_nonce_pool_generate(secp_ctx, &pool,
+						       lsp_node_count,
+						       lsp_seckey,
+						       &pubkeys[0],
+						       NULL)) {
+				secp256k1_context_destroy(secp_ctx);
+				return command_fail(cmd, LIGHTNINGD,
+						    "Failed to generate nonce pool");
+			}
+
+			/* Extract nonces for each node */
+			nonce_bundle_t nb;
+			memcpy(nb.instance_id, fi->instance_id, 32);
+			nb.n_participants = n_total;
+			nb.n_nodes = factory->n_nodes;
+			nb.n_entries = 0;
+
+			for (size_t ni = 0; ni < factory->n_nodes; ni++) {
+				int slot = factory_find_signer_slot(
+					factory, ni, 0);
+				if (slot < 0) continue;
+
+				secp256k1_musig_secnonce *secnonce;
+				secp256k1_musig_pubnonce pubnonce;
+
+				if (!musig_nonce_pool_next(&pool,
+							   &secnonce,
+							   &pubnonce)) {
+					plugin_log(plugin_handle, LOG_BROKEN,
+						   "Nonce pool exhausted at node %zu",
+						   ni);
+					break;
+				}
+
+				/* Set on the factory session */
+				factory_session_set_nonce(factory, ni,
+							  (size_t)slot,
+							  &pubnonce);
+
+				/* Serialize for sending */
+				musig_pubnonce_serialize(secp_ctx,
+					nb.entries[nb.n_entries].pubnonce,
+					&pubnonce);
+				nb.entries[nb.n_entries].node_idx = ni;
+				nb.entries[nb.n_entries].signer_slot = slot;
+				nb.n_entries++;
+			}
+
+			plugin_log(plugin_handle, LOG_INFORM,
+				   "MuSig2 nonces: %zu entries for %zu nodes",
+				   nb.n_entries,
+				   (size_t)factory->n_nodes);
+
+			/* Serialize the nonce bundle */
+			uint8_t nbuf[32768];
+			size_t blen = nonce_bundle_serialize(&nb, nbuf,
+							     sizeof(nbuf));
+			plugin_log(plugin_handle, LOG_INFORM,
+				   "Nonce bundle serialized: %zu bytes",
+				   blen);
+
+			fi->ceremony = CEREMONY_PROPOSED;
+		}
 	}
 
 	secp256k1_context_destroy(secp_ctx);
