@@ -183,6 +183,78 @@ static struct command_result *rpc_err(struct command *cmd,
 	return command_still_pending(cmd);
 }
 
+/* Callback after fundchannel_start succeeds — call fundchannel_complete */
+static struct command_result *fundchannel_start_ok(struct command *cmd,
+						   const char *method,
+						   const char *buf,
+						   const jsmntok_t *result,
+						   void *arg)
+{
+	factory_instance_t *fi = (factory_instance_t *)arg;
+	const jsmntok_t *spk_tok;
+
+	spk_tok = json_get_member(buf, result, "scriptpubkey");
+	if (!spk_tok) {
+		plugin_log(plugin_handle, LOG_BROKEN,
+			   "fundchannel_start: no scriptpubkey in response");
+		return command_still_pending(cmd);
+	}
+
+	const char *spk_hex = json_strdup(cmd, buf, spk_tok);
+	plugin_log(plugin_handle, LOG_INFORM,
+		   "fundchannel_start succeeded, scriptpubkey=%s",
+		   spk_hex ? spk_hex : "?");
+
+	/* For factory channels, the funding tx is the DW tree leaf.
+	 * We need a PSBT with an output matching the scriptpubkey.
+	 * Use CLN's txprepare/fundchannel_complete flow.
+	 * For now, log success — full PSBT construction requires
+	 * extracting the leaf tx from the factory. */
+	fi->lifecycle = FACTORY_LIFECYCLE_ACTIVE;
+
+	plugin_log(plugin_handle, LOG_INFORM,
+		   "Factory channel initiated, lifecycle=active");
+
+	return command_still_pending(cmd);
+}
+
+/* Open factory channels for each client after ceremony completes */
+static void open_factory_channels(struct command *cmd,
+				   factory_instance_t *fi)
+{
+	for (size_t ci = 0; ci < fi->n_clients; ci++) {
+		char nid[67];
+		for (int j = 0; j < 33; j++)
+			sprintf(nid + j*2, "%02x",
+				fi->clients[ci].node_id[j]);
+		nid[66] = '\0';
+
+		char proto_hex[65], inst_hex[65];
+		for (int j = 0; j < 32; j++) {
+			sprintf(proto_hex + j*2, "%02x",
+				SUPERSCALAR_PROTOCOL_ID[j]);
+			sprintf(inst_hex + j*2, "%02x",
+				fi->instance_id[j]);
+		}
+
+		struct out_req *req = jsonrpc_request_start(cmd,
+			"fundchannel_start",
+			fundchannel_start_ok, rpc_err, fi);
+		json_add_string(req->js, "id", nid);
+		json_add_string(req->js, "amount", "500000sat");
+		json_add_bool(req->js, "announce", false);
+		json_add_u32(req->js, "mindepth", 0);
+		json_add_string(req->js, "factory_protocol_id", proto_hex);
+		json_add_string(req->js, "factory_instance_id", inst_hex);
+		json_add_u64(req->js, "factory_early_warning_time", 6);
+		send_outreq(req);
+
+		plugin_log(plugin_handle, LOG_INFORM,
+			   "Opening factory channel with client %zu (%s)",
+			   ci, nid);
+	}
+}
+
 /* Send a factory submessage to a peer via factory-send RPC.
  * Used by ceremony handlers when responding to protocol messages. */
 #if 0 /* Enable when ceremony logic is wired up */
@@ -713,6 +785,9 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 				plugin_log(plugin_handle, LOG_INFORM,
 					   "LSP: sent FACTORY_READY to %zu clients",
 					   fi->n_clients);
+
+				/* Open factory channels with each client */
+				open_factory_channels(cmd, fi);
 			}
 		}
 		break;
@@ -1076,6 +1151,42 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 						SS_SUBMSG_ROTATE_COMPLETE,
 						fi->instance_id, 32);
 				}
+
+				/* Trigger factory-change on open channels
+				 * to update their funding outpoint */
+				factory_t *rf = (factory_t *)fi->lib_factory;
+				if (rf && fi->n_channels > 0) {
+					for (size_t ch = 0; ch < fi->n_channels; ch++) {
+						char cid_hex[65];
+						for (int j = 0; j < 32; j++)
+							sprintf(cid_hex + j*2, "%02x",
+								fi->channels[ch].channel_id[j]);
+
+						/* Get new leaf txid */
+						char txid_hex[65];
+						size_t leaf_idx = fi->channels[ch].leaf_index;
+						if (leaf_idx < rf->n_nodes) {
+							for (int j = 0; j < 32; j++)
+								sprintf(txid_hex + j*2, "%02x",
+									rf->nodes[leaf_idx].txid[31-j]);
+						} else {
+							memset(txid_hex, '0', 64);
+						}
+						txid_hex[64] = '\0';
+
+						struct out_req *creq = jsonrpc_request_start(
+							cmd, "factory-change",
+							rpc_done, rpc_err, fi);
+						json_add_string(creq->js, "channel_id", cid_hex);
+						json_add_string(creq->js, "new_funding_txid", txid_hex);
+						json_add_u32(creq->js, "new_funding_outnum", 0);
+						send_outreq(creq);
+
+						plugin_log(plugin_handle, LOG_INFORM,
+							   "LSP: triggered factory-change on channel %zu",
+							   ch);
+					}
+				}
 			}
 		}
 		break;
@@ -1399,6 +1510,21 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 				plugin_log(plugin_handle, LOG_INFORM,
 					   "LSP: sent CLOSE_DONE to %zu clients",
 					   fi->n_clients);
+
+				/* Close open channels in this factory */
+				for (size_t ch = 0; ch < fi->n_channels; ch++) {
+					char cid_hex[65];
+					for (int j = 0; j < 32; j++)
+						sprintf(cid_hex + j*2, "%02x",
+							fi->channels[ch].channel_id[j]);
+					struct out_req *creq = jsonrpc_request_start(
+						cmd, "close",
+						rpc_done, rpc_err, fi);
+					json_add_string(creq->js, "id", cid_hex);
+					send_outreq(creq);
+					plugin_log(plugin_handle, LOG_INFORM,
+						   "LSP: closing channel %zu", ch);
+				}
 			} else {
 				plugin_log(plugin_handle, LOG_BROKEN,
 					   "LSP: close sessions_complete failed");
@@ -2008,6 +2134,25 @@ static struct command_result *json_factory_list(struct command *cmd,
 			"failed");
 		json_add_u32(js, "expiry_block", fi->expiry_block);
 		json_add_u32(js, "n_breach_epochs", fi->n_breach_epochs);
+
+		/* Channel mappings */
+		if (fi->n_channels > 0) {
+			json_array_start(js, "channels");
+			for (size_t ch = 0; ch < fi->n_channels; ch++) {
+				char cid[65];
+				for (int j = 0; j < 32; j++)
+					sprintf(cid + j*2, "%02x",
+						fi->channels[ch].channel_id[j]);
+				json_object_start(js, NULL);
+				json_add_string(js, "channel_id", cid);
+				json_add_u32(js, "leaf_index",
+					fi->channels[ch].leaf_index);
+				json_add_u32(js, "leaf_side",
+					fi->channels[ch].leaf_side);
+				json_object_end(js);
+			}
+			json_array_end(js);
+		}
 		json_object_end(js);
 	}
 	json_array_end(js);
