@@ -214,10 +214,17 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 			size_t our_node_count =
 				factory_count_nodes_for_participant(factory,
 								   our_idx);
-			musig_nonce_pool_t pool;
-			musig_nonce_pool_generate(ctx, &pool,
+			/* Heap-allocate pool so secnonces survive this scope */
+			musig_nonce_pool_t *pool = calloc(1, sizeof(musig_nonce_pool_t));
+			musig_nonce_pool_generate(ctx, pool,
 				our_node_count, our_sec,
 				&pubkeys[our_idx], NULL);
+
+			/* Store pool, seckey, participant index for signing */
+			fi->nonce_pool = pool;
+			memcpy(fi->our_seckey, our_sec, 32);
+			fi->our_participant_idx = our_idx;
+			fi->n_secnonces = 0;
 
 			nonce_bundle_t resp;
 			memcpy(resp.instance_id, fi->instance_id, 32);
@@ -225,6 +232,7 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 			resp.n_nodes = factory->n_nodes;
 			resp.n_entries = 0;
 
+			size_t pool_entry = 0;
 			for (size_t ni = 0; ni < factory->n_nodes; ni++) {
 				int slot = factory_find_signer_slot(
 					factory, ni, our_idx);
@@ -232,8 +240,14 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 
 				secp256k1_musig_secnonce *sec;
 				secp256k1_musig_pubnonce pub;
-				if (!musig_nonce_pool_next(&pool, &sec, &pub))
+				if (!musig_nonce_pool_next(pool, &sec, &pub))
 					break;
+
+				/* Record which pool index maps to which node */
+				fi->secnonce_pool_idx[fi->n_secnonces] = pool_entry;
+				fi->secnonce_node_idx[fi->n_secnonces] = ni;
+				fi->n_secnonces++;
+				pool_entry++;
 
 				factory_session_set_nonce(factory, ni,
 							  (size_t)slot, &pub);
@@ -278,11 +292,79 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 				plugin_log(plugin_handle, LOG_INFORM,
 					   "Client: nonces finalized");
 
-				/* TODO: Create partial sigs for all nodes
-				 * where we're a signer, serialize as
-				 * PSIG_BUNDLE, send to LSP.
-				 * Requires: keypair (our_sec) + finalized session
-				 * → musig_create_partial_sig per node */
+				/* Create partial sigs and send PSIG_BUNDLE */
+				secp256k1_keypair kp;
+				if (!secp256k1_keypair_create(ctx, &kp, our_sec)) {
+					plugin_log(plugin_handle, LOG_BROKEN,
+						   "Client: keypair create failed");
+				} else {
+					nonce_bundle_t psig_nb;
+					memset(&psig_nb, 0, sizeof(psig_nb));
+					memcpy(psig_nb.instance_id, fi->instance_id, 32);
+					psig_nb.n_participants = nb.n_participants;
+					psig_nb.n_nodes = factory->n_nodes;
+					psig_nb.n_entries = 0;
+
+					/* Use stored secnonces from heap-allocated pool */
+					musig_nonce_pool_t *sp =
+						(musig_nonce_pool_t *)fi->nonce_pool;
+
+					for (size_t si = 0; si < fi->n_secnonces; si++) {
+						uint32_t pi = fi->secnonce_pool_idx[si];
+						uint32_t ni = fi->secnonce_node_idx[si];
+						secp256k1_musig_secnonce *sn =
+							&sp->nonces[pi].secnonce;
+
+						int slot = factory_find_signer_slot(
+							factory, ni, fi->our_participant_idx);
+						if (slot < 0) continue;
+
+						secp256k1_musig_partial_sig psig;
+						if (!musig_create_partial_sig(
+							ctx, &psig, sn, &kp,
+							&factory->nodes[ni].signing_session)) {
+							plugin_log(plugin_handle, LOG_BROKEN,
+								   "Client: partial_sig failed node %u", ni);
+							continue;
+						}
+
+						musig_partial_sig_serialize(ctx,
+							psig_nb.entries[psig_nb.n_entries].pubnonce,
+							&psig);
+						psig_nb.entries[psig_nb.n_entries].node_idx = ni;
+						psig_nb.entries[psig_nb.n_entries].signer_slot = slot;
+						psig_nb.n_entries++;
+					}
+
+					plugin_log(plugin_handle, LOG_INFORM,
+						   "Client: created %zu partial sigs",
+						   psig_nb.n_entries);
+
+					/* Send PSIG_BUNDLE to LSP */
+					uint8_t pbuf[32768];
+					size_t plen = nonce_bundle_serialize(
+						&psig_nb, pbuf, sizeof(pbuf));
+
+					uint8_t pwire[4 + 32768];
+					pwire[0] = 0x80; pwire[1] = 0x20;
+					pwire[2] = 0x01; pwire[3] = 0x03; /* PSIG_BUNDLE */
+					memcpy(pwire + 4, pbuf, plen);
+
+					char *phex = tal_arr(cmd, char, (4+plen)*2 + 1);
+					for (size_t h = 0; h < 4+plen; h++)
+						sprintf(phex + h*2, "%02x", pwire[h]);
+
+					struct out_req *preq = jsonrpc_request_start(
+						cmd, "sendcustommsg",
+						rpc_done, rpc_err, cmd);
+					json_add_string(preq->js, "node_id", peer_id);
+					json_add_string(preq->js, "msg", phex);
+					send_outreq(preq);
+
+					plugin_log(plugin_handle, LOG_INFORM,
+						   "Client: sent PSIG_BUNDLE (%zu bytes)",
+						   4 + plen);
+				}
 			}
 
 			fi->ceremony = CEREMONY_PROPOSED;
@@ -431,10 +513,129 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 		plugin_log(plugin_handle, LOG_INFORM,
 			   "PSIG_BUNDLE from %s (len=%zu)",
 			   peer_id, len);
-		/* LSP side: client sent partial sigs.
-		 * TODO: call factory_session_set_partial_sig() for signer,
-		 * when all collected, call factory_sessions_complete(),
-		 * send FACTORY_READY to all clients */
+		if (fi && fi->is_lsp) {
+			nonce_bundle_t pnb;
+			if (!nonce_bundle_deserialize(&pnb, data, len)) {
+				plugin_log(plugin_handle, LOG_UNUSUAL,
+					   "Bad PSIG_BUNDLE");
+				break;
+			}
+
+			factory_t *f = (factory_t *)fi->lib_factory;
+			if (!f) break;
+
+			/* Set client partial sigs */
+			size_t psigs_set = 0;
+			for (size_t e = 0; e < pnb.n_entries; e++) {
+				secp256k1_musig_partial_sig ps;
+				if (!musig_partial_sig_parse(global_secp_ctx,
+					&ps, pnb.entries[e].pubnonce)) {
+					plugin_log(plugin_handle, LOG_BROKEN,
+						   "LSP: bad psig entry %zu", e);
+					continue;
+				}
+				if (!factory_session_set_partial_sig(f,
+					pnb.entries[e].node_idx,
+					pnb.entries[e].signer_slot,
+					&ps)) {
+					plugin_log(plugin_handle, LOG_BROKEN,
+						   "LSP: set_partial_sig failed %zu", e);
+					continue;
+				}
+				psigs_set++;
+			}
+
+			plugin_log(plugin_handle, LOG_INFORM,
+				   "LSP: set %zu/%zu client partial sigs",
+				   psigs_set, pnb.n_entries);
+
+			/* Create LSP's own partial sigs using stored secnonces */
+			{
+				secp256k1_keypair lsp_kp;
+				if (!secp256k1_keypair_create(global_secp_ctx,
+					&lsp_kp, fi->our_seckey)) {
+					plugin_log(plugin_handle, LOG_BROKEN,
+						   "LSP: keypair create failed");
+					break;
+				}
+
+				musig_nonce_pool_t *lsp_pool =
+					(musig_nonce_pool_t *)fi->nonce_pool;
+				size_t lsp_psigs = 0;
+				for (size_t si = 0; si < fi->n_secnonces; si++) {
+					uint32_t pi = fi->secnonce_pool_idx[si];
+					uint32_t ni = fi->secnonce_node_idx[si];
+					secp256k1_musig_secnonce *sn =
+						&lsp_pool->nonces[pi].secnonce;
+
+					secp256k1_musig_partial_sig psig;
+					if (!musig_create_partial_sig(
+						global_secp_ctx, &psig, sn,
+						&lsp_kp,
+						&f->nodes[ni].signing_session)) {
+						plugin_log(plugin_handle, LOG_BROKEN,
+							   "LSP: partial_sig failed node %u", ni);
+						continue;
+					}
+
+					int slot = factory_find_signer_slot(
+						f, ni, fi->our_participant_idx);
+					if (slot < 0) continue;
+
+					if (!factory_session_set_partial_sig(
+						f, ni, (size_t)slot, &psig)) {
+						plugin_log(plugin_handle, LOG_BROKEN,
+							   "LSP: set own psig failed node %u", ni);
+						continue;
+					}
+					lsp_psigs++;
+				}
+
+				plugin_log(plugin_handle, LOG_INFORM,
+					   "LSP: created %zu own partial sigs",
+					   lsp_psigs);
+			}
+
+			/* Try to complete — all sigs should be set now */
+			if (!factory_sessions_complete(f)) {
+				plugin_log(plugin_handle, LOG_BROKEN,
+					   "LSP: factory_sessions_complete failed");
+			} else {
+				fi->ceremony = CEREMONY_COMPLETE;
+				plugin_log(plugin_handle, LOG_INFORM,
+					   "LSP: FACTORY TREE SIGNED! "
+					   "ceremony=complete");
+
+				/* Send FACTORY_READY to all clients */
+				uint8_t ready_wire[4 + 32];
+				ready_wire[0] = 0x80; ready_wire[1] = 0x20;
+				ready_wire[2] = 0x01; ready_wire[3] = 0x04;
+				memcpy(ready_wire + 4, fi->instance_id, 32);
+
+				for (size_t ci = 0; ci < fi->n_clients; ci++) {
+					char nid[67];
+					for (int j = 0; j < 33; j++)
+						sprintf(nid + j*2, "%02x",
+							fi->clients[ci].node_id[j]);
+					nid[66] = '\0';
+
+					char *rhex = tal_arr(cmd, char, 36*2 + 1);
+					for (size_t h = 0; h < 36; h++)
+						sprintf(rhex + h*2, "%02x", ready_wire[h]);
+
+					struct out_req *rreq = jsonrpc_request_start(
+						cmd, "sendcustommsg",
+						rpc_done, rpc_err, cmd);
+					json_add_string(rreq->js, "node_id", nid);
+					json_add_string(rreq->js, "msg", rhex);
+					send_outreq(rreq);
+				}
+
+				plugin_log(plugin_handle, LOG_INFORM,
+					   "LSP: sent FACTORY_READY to %zu clients",
+					   fi->n_clients);
+			}
+		}
 		break;
 
 	case SS_SUBMSG_FACTORY_READY:
@@ -725,7 +926,6 @@ static struct command_result *json_factory_create(struct command *cmd,
 		/* Generate nonces using nonce pool.
 		 * Need a keypair for the LSP (participant 0). */
 		{
-			musig_nonce_pool_t pool;
 			unsigned char lsp_seckey[32];
 			secp256k1_keypair lsp_keypair;
 
@@ -742,19 +942,27 @@ static struct command_result *json_factory_create(struct command *cmd,
 						    "Failed to create LSP keypair");
 			}
 
+			/* Store seckey for signing phase */
+			memcpy(fi->our_seckey, lsp_seckey, 32);
+			fi->our_participant_idx = 0;
+			fi->n_secnonces = 0;
+
 			/* Count nodes where LSP is a signer */
 			size_t lsp_node_count = factory_count_nodes_for_participant(
 				factory, 0);
 
-			/* Generate nonce pool */
-			if (!musig_nonce_pool_generate(secp_ctx, &pool,
+			/* Heap-allocate pool so secnonces survive this scope */
+			musig_nonce_pool_t *pool = calloc(1, sizeof(musig_nonce_pool_t));
+			if (!musig_nonce_pool_generate(secp_ctx, pool,
 						       lsp_node_count,
 						       lsp_seckey,
 						       &pubkeys[0],
 						       NULL)) {
+				free(pool);
 				return command_fail(cmd, LIGHTNINGD,
 						    "Failed to generate nonce pool");
 			}
+			fi->nonce_pool = pool;
 
 			/* Extract nonces for each node */
 			nonce_bundle_t nb;
@@ -773,6 +981,7 @@ static struct command_result *json_factory_create(struct command *cmd,
 					SECP256K1_EC_COMPRESSED);
 			}
 
+			size_t pool_entry = 0;
 			for (size_t ni = 0; ni < factory->n_nodes; ni++) {
 				int slot = factory_find_signer_slot(
 					factory, ni, 0);
@@ -781,7 +990,7 @@ static struct command_result *json_factory_create(struct command *cmd,
 				secp256k1_musig_secnonce *secnonce;
 				secp256k1_musig_pubnonce pubnonce;
 
-				if (!musig_nonce_pool_next(&pool,
+				if (!musig_nonce_pool_next(pool,
 							   &secnonce,
 							   &pubnonce)) {
 					plugin_log(plugin_handle, LOG_BROKEN,
@@ -789,6 +998,12 @@ static struct command_result *json_factory_create(struct command *cmd,
 						   ni);
 					break;
 				}
+
+				/* Track pool index → node mapping */
+				fi->secnonce_pool_idx[fi->n_secnonces] = pool_entry;
+				fi->secnonce_node_idx[fi->n_secnonces] = ni;
+				fi->n_secnonces++;
+				pool_entry++;
 
 				/* Set on the factory session */
 				factory_session_set_nonce(factory, ni,

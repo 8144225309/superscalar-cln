@@ -105,6 +105,15 @@ typedef struct factory_instance {
 	 * in every file that includes factory_state.h. */
 	void *lib_factory;
 
+	/* MuSig2 nonce pool (heap-allocated, secnonces live inside) */
+	void *nonce_pool;
+	/* Per-entry: which pool index maps to which tree node */
+	uint32_t secnonce_node_idx[MAX_NONCE_ENTRIES];
+	uint32_t secnonce_pool_idx[MAX_NONCE_ENTRIES];
+	size_t n_secnonces;
+	uint8_t our_seckey[32];
+	int our_participant_idx;
+
 } factory_instance_t;
 
 /* Global plugin state */
