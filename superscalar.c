@@ -63,7 +63,7 @@ static void derive_demo_seckey(unsigned char seckey[32],
 /* Send a SuperScalar message wrapped in factory_piggyback (submsg 4).
  * Wire format: type(2) + submsg_id=4(2) + TLV[0]=protocol_id(34) +
  *              TLV[1024]=payload(4+len) where payload = ss_submsg(2)+data */
-static void send_factory_msg(struct command *cmd, const char *peer_id,
+static void UNUSED send_factory_msg(struct command *cmd, const char *peer_id,
 			     uint16_t ss_submsg, const uint8_t *data,
 			     size_t data_len)
 {
