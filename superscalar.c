@@ -700,30 +700,16 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 					   "ceremony=complete");
 
 				/* Send FACTORY_READY to all clients */
-				uint8_t ready_wire[4 + 32];
-				ready_wire[0] = 0x80; ready_wire[1] = 0x20;
-				ready_wire[2] = 0x01; ready_wire[3] = 0x04;
-				memcpy(ready_wire + 4, fi->instance_id, 32);
-
 				for (size_t ci = 0; ci < fi->n_clients; ci++) {
 					char nid[67];
 					for (int j = 0; j < 33; j++)
 						sprintf(nid + j*2, "%02x",
 							fi->clients[ci].node_id[j]);
 					nid[66] = '\0';
-
-					char *rhex = tal_arr(cmd, char, 36*2 + 1);
-					for (size_t h = 0; h < 36; h++)
-						sprintf(rhex + h*2, "%02x", ready_wire[h]);
-
-					struct out_req *rreq = jsonrpc_request_start(
-						cmd, "sendcustommsg",
-						rpc_done, rpc_err, cmd);
-					json_add_string(rreq->js, "node_id", nid);
-					json_add_string(rreq->js, "msg", rhex);
-					send_outreq(rreq);
+					send_factory_msg(cmd, nid,
+						SS_SUBMSG_FACTORY_READY,
+						fi->instance_id, 32);
 				}
-
 				plugin_log(plugin_handle, LOG_INFORM,
 					   "LSP: sent FACTORY_READY to %zu clients",
 					   fi->n_clients);
@@ -860,20 +846,9 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 			uint8_t rbuf[32768];
 			size_t rlen = nonce_bundle_serialize(&resp,
 				rbuf, sizeof(rbuf));
-			uint8_t wire[4 + 32768];
-			wire[0] = 0x80; wire[1] = 0x20;
-			wire[2] = 0x01; wire[3] = 0x09; /* ROTATE_NONCE */
-			memcpy(wire + 4, rbuf, rlen);
-
-			char *hex = tal_arr(cmd, char, (4+rlen)*2 + 1);
-			for (size_t h = 0; h < 4+rlen; h++)
-				sprintf(hex + h*2, "%02x", wire[h]);
-
-			struct out_req *req = jsonrpc_request_start(cmd,
-				"sendcustommsg", rpc_done, rpc_err, cmd);
-			json_add_string(req->js, "node_id", peer_id);
-			json_add_string(req->js, "msg", hex);
-			send_outreq(req);
+			send_factory_msg(cmd, peer_id,
+					 SS_SUBMSG_ROTATE_NONCE,
+					 rbuf, rlen);
 
 			/* Finalize and create partial sigs */
 			if (!factory_sessions_finalize(factory)) {
@@ -929,20 +904,9 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 			uint8_t pbuf[32768];
 			size_t plen = nonce_bundle_serialize(&psig_nb,
 				pbuf, sizeof(pbuf));
-			uint8_t pwire[4 + 32768];
-			pwire[0] = 0x80; pwire[1] = 0x20;
-			pwire[2] = 0x01; pwire[3] = 0x0A; /* ROTATE_PSIG */
-			memcpy(pwire + 4, pbuf, plen);
-
-			char *phex = tal_arr(cmd, char, (4+plen)*2 + 1);
-			for (size_t h = 0; h < 4+plen; h++)
-				sprintf(phex + h*2, "%02x", pwire[h]);
-
-			struct out_req *preq = jsonrpc_request_start(cmd,
-				"sendcustommsg", rpc_done, rpc_err, cmd);
-			json_add_string(preq->js, "node_id", peer_id);
-			json_add_string(preq->js, "msg", phex);
-			send_outreq(preq);
+			send_factory_msg(cmd, peer_id,
+					 SS_SUBMSG_ROTATE_PSIG,
+					 pbuf, plen);
 
 			fi->ceremony = CEREMONY_ROTATING;
 			plugin_log(plugin_handle, LOG_INFORM,
@@ -1079,15 +1043,12 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 				unsigned char rev_secret[32];
 				if (factory_get_revocation_secret(f, old_ep,
 								  rev_secret)) {
-					/* Wire: type(2)+submsg(2)+epoch(4)+secret(32) */
-					uint8_t rwire[4 + 4 + 32];
-					rwire[0] = 0x80; rwire[1] = 0x20;
-					rwire[2] = 0x01; rwire[3] = 0x0C;
-					rwire[4] = (old_ep >> 24) & 0xFF;
-					rwire[5] = (old_ep >> 16) & 0xFF;
-					rwire[6] = (old_ep >> 8) & 0xFF;
-					rwire[7] = old_ep & 0xFF;
-					memcpy(rwire + 8, rev_secret, 32);
+					uint8_t rev_payload[36];
+					rev_payload[0] = (old_ep >> 24) & 0xFF;
+					rev_payload[1] = (old_ep >> 16) & 0xFF;
+					rev_payload[2] = (old_ep >> 8) & 0xFF;
+					rev_payload[3] = old_ep & 0xFF;
+					memcpy(rev_payload + 4, rev_secret, 32);
 
 					for (size_t ci = 0; ci < fi->n_clients; ci++) {
 						char nid[67];
@@ -1095,47 +1056,25 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 							sprintf(nid + j*2, "%02x",
 								fi->clients[ci].node_id[j]);
 						nid[66] = '\0';
-
-						char *rhex = tal_arr(cmd, char, 40*2 + 1);
-						for (size_t h = 0; h < 40; h++)
-							sprintf(rhex + h*2, "%02x", rwire[h]);
-
-						struct out_req *rreq = jsonrpc_request_start(
-							cmd, "sendcustommsg",
-							rpc_done, rpc_err, cmd);
-						json_add_string(rreq->js, "node_id", nid);
-						json_add_string(rreq->js, "msg", rhex);
-						send_outreq(rreq);
+						send_factory_msg(cmd, nid,
+							SS_SUBMSG_REVOKE,
+							rev_payload, 36);
 					}
-
 					plugin_log(plugin_handle, LOG_INFORM,
 						   "LSP: sent REVOKE for epoch %u",
 						   old_ep);
 				}
 
 				/* Send ROTATE_COMPLETE to clients */
-				uint8_t cwire[4 + 32];
-				cwire[0] = 0x80; cwire[1] = 0x20;
-				cwire[2] = 0x01; cwire[3] = 0x0B;
-				memcpy(cwire + 4, fi->instance_id, 32);
-
 				for (size_t ci = 0; ci < fi->n_clients; ci++) {
 					char nid[67];
 					for (int j = 0; j < 33; j++)
 						sprintf(nid + j*2, "%02x",
 							fi->clients[ci].node_id[j]);
 					nid[66] = '\0';
-
-					char *chex = tal_arr(cmd, char, 36*2 + 1);
-					for (size_t h = 0; h < 36; h++)
-						sprintf(chex + h*2, "%02x", cwire[h]);
-
-					struct out_req *creq = jsonrpc_request_start(
-						cmd, "sendcustommsg",
-						rpc_done, rpc_err, cmd);
-					json_add_string(creq->js, "node_id", nid);
-					json_add_string(creq->js, "msg", chex);
-					send_outreq(creq);
+					send_factory_msg(cmd, nid,
+						SS_SUBMSG_ROTATE_COMPLETE,
+						fi->instance_id, 32);
 				}
 			}
 		}
@@ -1309,20 +1248,9 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 			uint8_t nbuf[32768];
 			size_t nlen = nonce_bundle_serialize(&nresp,
 				nbuf, sizeof(nbuf));
-			uint8_t nwire[4 + 32768];
-			nwire[0] = 0x80; nwire[1] = 0x20;
-			nwire[2] = 0x01; nwire[3] = 0x11;
-			memcpy(nwire + 4, nbuf, nlen);
-
-			char *nhex = tal_arr(cmd, char, (4+nlen)*2 + 1);
-			for (size_t h = 0; h < 4+nlen; h++)
-				sprintf(nhex + h*2, "%02x", nwire[h]);
-
-			struct out_req *nreq = jsonrpc_request_start(cmd,
-				"sendcustommsg", rpc_done, rpc_err, cmd);
-			json_add_string(nreq->js, "node_id", peer_id);
-			json_add_string(nreq->js, "msg", nhex);
-			send_outreq(nreq);
+			send_factory_msg(cmd, peer_id,
+					 SS_SUBMSG_CLOSE_NONCE,
+					 nbuf, nlen);
 
 			/* Finalize node 0 and create partial sig */
 			factory_session_finalize_node(factory, 0);
@@ -1353,20 +1281,9 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 				uint8_t pbuf[32768];
 				size_t plen = nonce_bundle_serialize(&presp,
 					pbuf, sizeof(pbuf));
-				uint8_t pwire[4 + 32768];
-				pwire[0] = 0x80; pwire[1] = 0x20;
-				pwire[2] = 0x01; pwire[3] = 0x13;
-				memcpy(pwire + 4, pbuf, plen);
-
-				char *phex = tal_arr(cmd, char, (4+plen)*2 + 1);
-				for (size_t h = 0; h < 4+plen; h++)
-					sprintf(phex + h*2, "%02x", pwire[h]);
-
-				struct out_req *preq = jsonrpc_request_start(cmd,
-					"sendcustommsg", rpc_done, rpc_err, cmd);
-				json_add_string(preq->js, "node_id", peer_id);
-				json_add_string(preq->js, "msg", phex);
-				send_outreq(preq);
+				send_factory_msg(cmd, peer_id,
+					SS_SUBMSG_CLOSE_PSIG,
+					pbuf, plen);
 
 				plugin_log(plugin_handle, LOG_INFORM,
 					   "Client: sent CLOSE_NONCE + CLOSE_PSIG");
@@ -1468,28 +1385,15 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 					   "LSP: COOPERATIVE CLOSE SIGNED!");
 
 				/* Send CLOSE_DONE */
-				uint8_t cwire[4 + 32];
-				cwire[0] = 0x80; cwire[1] = 0x20;
-				cwire[2] = 0x01; cwire[3] = 0x14;
-				memcpy(cwire + 4, fi->instance_id, 32);
-
 				for (size_t ci = 0; ci < fi->n_clients; ci++) {
 					char nid[67];
 					for (int j = 0; j < 33; j++)
 						sprintf(nid + j*2, "%02x",
 							fi->clients[ci].node_id[j]);
 					nid[66] = '\0';
-
-					char *chex = tal_arr(cmd, char, 36*2 + 1);
-					for (size_t h = 0; h < 36; h++)
-						sprintf(chex + h*2, "%02x", cwire[h]);
-
-					struct out_req *creq = jsonrpc_request_start(
-						cmd, "sendcustommsg",
-						rpc_done, rpc_err, cmd);
-					json_add_string(creq->js, "node_id", nid);
-					json_add_string(creq->js, "msg", chex);
-					send_outreq(creq);
+					send_factory_msg(cmd, nid,
+						SS_SUBMSG_CLOSE_DONE,
+						fi->instance_id, 32);
 				}
 
 				plugin_log(plugin_handle, LOG_INFORM,
@@ -2031,39 +1935,15 @@ static struct command_result *json_factory_create(struct command *cmd,
 
 			fi->ceremony = CEREMONY_PROPOSED;
 
-			/* Send FACTORY_PROPOSE to each client.
-			 * Wire format: factory_message(32800) header
-			 *   [2 bytes: type 0x8020]
-			 *   [2 bytes: submsg_id 0x0100]
-			 *   [payload: nonce bundle] */
+			/* Send FACTORY_PROPOSE to each client via piggyback */
 			for (size_t ci = 0; ci < fi->n_clients; ci++) {
-				/* Build the full wire message */
-				uint8_t wire[4 + sizeof(nbuf)];
-				wire[0] = 0x80; wire[1] = 0x20; /* type 32800 */
-				wire[2] = 0x01; wire[3] = 0x00; /* submsg 0x0100 */
-				memcpy(wire + 4, nbuf, blen);
-				size_t wire_len = 4 + blen;
-
-				/* Convert to hex for sendcustommsg */
-				char *hex = tal_arr(cmd, char, wire_len * 2 + 1);
-				for (size_t h = 0; h < wire_len; h++)
-					sprintf(hex + h*2, "%02x", wire[h]);
-
-				/* Convert client node_id to hex */
 				char client_hex[67];
 				for (int h = 0; h < 33; h++)
 					sprintf(client_hex + h*2, "%02x",
 						fi->clients[ci].node_id[h]);
-
-				/* Send via sendcustommsg RPC */
-				struct out_req *req;
-				req = jsonrpc_request_start(cmd,
-					"sendcustommsg",
-					rpc_done, rpc_err, cmd);
-				json_add_string(req->js, "node_id",
-						client_hex);
-				json_add_string(req->js, "msg", hex);
-				send_outreq(req);
+				send_factory_msg(cmd, client_hex,
+					SS_SUBMSG_FACTORY_PROPOSE,
+					nbuf, blen);
 
 				plugin_log(plugin_handle, LOG_INFORM,
 					   "Sent FACTORY_PROPOSE to client %zu "
@@ -2269,29 +2149,15 @@ static struct command_result *json_factory_close(struct command *cmd,
 	memcpy(p, nbuf, nlen);
 	size_t plen = (size_t)(p - payload) + nlen;
 
-	/* Wire: type(2) + submsg(2) + payload */
-	uint8_t wire[4 + 4096];
-	wire[0] = 0x80; wire[1] = 0x20;
-	wire[2] = 0x01; wire[3] = 0x10; /* CLOSE_PROPOSE */
-	memcpy(wire + 4, payload, plen);
-	size_t wire_len = 4 + plen;
-
 	for (size_t ci = 0; ci < fi->n_clients; ci++) {
 		char client_hex[67];
 		for (int j = 0; j < 33; j++)
 			sprintf(client_hex + j*2, "%02x",
 				fi->clients[ci].node_id[j]);
 		client_hex[66] = '\0';
-
-		char *hex = tal_arr(cmd, char, wire_len*2 + 1);
-		for (size_t h = 0; h < wire_len; h++)
-			sprintf(hex + h*2, "%02x", wire[h]);
-
-		struct out_req *req = jsonrpc_request_start(cmd,
-			"sendcustommsg", rpc_done, rpc_err, cmd);
-		json_add_string(req->js, "node_id", client_hex);
-		json_add_string(req->js, "msg", hex);
-		send_outreq(req);
+		send_factory_msg(cmd, client_hex,
+			SS_SUBMSG_CLOSE_PROPOSE,
+			payload, plen);
 	}
 
 	fi->lifecycle = FACTORY_LIFECYCLE_DYING;
@@ -2473,29 +2339,15 @@ static struct command_result *json_factory_rotate(struct command *cmd,
 	memcpy(payload + 8, nbuf, nlen);
 	size_t plen = 8 + nlen;
 
-	/* Wire: type(2) + submsg(2) + payload */
-	uint8_t wire[4 + 8 + 32768];
-	wire[0] = 0x80; wire[1] = 0x20;
-	wire[2] = 0x01; wire[3] = 0x08; /* ROTATE_PROPOSE */
-	memcpy(wire + 4, payload, plen);
-	size_t wire_len = 4 + plen;
-
 	for (size_t ci = 0; ci < fi->n_clients; ci++) {
 		char client_hex[67];
 		for (int j = 0; j < 33; j++)
 			sprintf(client_hex + j*2, "%02x",
 				fi->clients[ci].node_id[j]);
 		client_hex[66] = '\0';
-
-		char *hex = tal_arr(cmd, char, wire_len*2 + 1);
-		for (size_t h = 0; h < wire_len; h++)
-			sprintf(hex + h*2, "%02x", wire[h]);
-
-		struct out_req *req = jsonrpc_request_start(cmd,
-			"sendcustommsg", rpc_done, rpc_err, cmd);
-		json_add_string(req->js, "node_id", client_hex);
-		json_add_string(req->js, "msg", hex);
-		send_outreq(req);
+		send_factory_msg(cmd, client_hex,
+			SS_SUBMSG_ROTATE_PROPOSE,
+			payload, plen);
 	}
 
 	/* Reset ceremony tracking for rotation */
