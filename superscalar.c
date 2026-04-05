@@ -303,14 +303,40 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 			secp256k1_context *ctx = global_secp_ctx;
 
 			/* Set client nonces on sessions */
+			size_t nonces_set = 0;
 			for (size_t e = 0; e < cnb.n_entries; e++) {
 				secp256k1_musig_pubnonce pn;
-				musig_pubnonce_parse(ctx, &pn,
-					cnb.entries[e].pubnonce);
-				factory_session_set_nonce(f,
+				if (!musig_pubnonce_parse(ctx, &pn,
+					cnb.entries[e].pubnonce)) {
+					/* Dump first 8 bytes for debug */
+					plugin_log(plugin_handle, LOG_BROKEN,
+						   "LSP: bad pubnonce entry %zu "
+						   "node=%u slot=%u "
+						   "bytes=%02x%02x%02x%02x%02x%02x%02x%02x",
+						   e, cnb.entries[e].node_idx,
+						   cnb.entries[e].signer_slot,
+						   cnb.entries[e].pubnonce[0],
+						   cnb.entries[e].pubnonce[1],
+						   cnb.entries[e].pubnonce[2],
+						   cnb.entries[e].pubnonce[3],
+						   cnb.entries[e].pubnonce[4],
+						   cnb.entries[e].pubnonce[5],
+						   cnb.entries[e].pubnonce[6],
+						   cnb.entries[e].pubnonce[7]);
+					continue;
+				}
+				if (!factory_session_set_nonce(f,
 					cnb.entries[e].node_idx,
 					cnb.entries[e].signer_slot,
-					&pn);
+					&pn)) {
+					plugin_log(plugin_handle, LOG_BROKEN,
+						   "LSP: set_nonce failed "
+						   "node=%u slot=%u",
+						   cnb.entries[e].node_idx,
+						   cnb.entries[e].signer_slot);
+					continue;
+				}
+				nonces_set++;
 			}
 
 			/* Find which client sent this */
@@ -340,8 +366,8 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 			}
 
 			plugin_log(plugin_handle, LOG_INFORM,
-				   "LSP: set %zu client nonces",
-				   cnb.n_entries);
+				   "LSP: set %zu/%zu client nonces",
+				   nonces_set, cnb.n_entries);
 
 			/* Debug: log session state before finalize */
 			for (size_t di = 0; di < f->n_nodes; di++) {
@@ -356,16 +382,18 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 				plugin_log(plugin_handle, LOG_INFORM,
 					   "LSP: all nonces collected, finalizing");
 
-				/* TODO: call factory_sessions_finalize(f)
-				 * when session state is fully populated.
-				 * Currently crashes because not all signer
-				 * nonce slots are initialized — needs
-				 * debugging of slot numbering. */
+				plugin_log(plugin_handle, LOG_INFORM,
+					   "LSP: calling factory_sessions_finalize...");
+
+				if (!factory_sessions_finalize(f)) {
+					plugin_log(plugin_handle, LOG_BROKEN,
+						   "factory_sessions_finalize failed");
+					break;
+				}
 
 				fi->ceremony = CEREMONY_NONCES_COLLECTED;
 				plugin_log(plugin_handle, LOG_INFORM,
-					   "LSP: all nonces received, ceremony=nonces_collected"
-					   " (finalize deferred)");
+					   "LSP: nonces finalized! ceremony=nonces_collected");
 
 				/* TODO: serialize ALL_NONCES (aggregated)
 				 * and send to all clients.
