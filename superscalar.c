@@ -13,6 +13,7 @@
 #include <stdlib.h>
 #include <inttypes.h>
 #include <secp256k1.h>
+#include <secp256k1_extrakeys.h>
 
 #include "ceremony.h"
 #include "factory_state.h"
@@ -1095,14 +1096,325 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 		break;
 
 	case SS_SUBMSG_CLOSE_PROPOSE:
+		plugin_log(plugin_handle, LOG_INFORM,
+			   "CLOSE_PROPOSE from %s (len=%zu)",
+			   peer_id, len);
+		/* Client side: LSP proposes cooperative close.
+		 * Payload: n_outputs(4) + per output: amount(8) + spk_len(2) + spk(var)
+		 * + nonce_bundle */
+		if (fi && len >= 4) {
+			factory_t *factory = (factory_t *)fi->lib_factory;
+			if (!factory) break;
+			secp256k1_context *ctx = global_secp_ctx;
+
+			/* Parse output distribution */
+			const uint8_t *p = data;
+			uint32_t n_outputs = ((uint32_t)p[0] << 24) |
+				((uint32_t)p[1] << 16) |
+				((uint32_t)p[2] << 8) | p[3];
+			p += 4;
+
+			if (n_outputs > 8) break;
+			tx_output_t outputs[8];
+			for (uint32_t oi = 0; oi < n_outputs; oi++) {
+				if (p + 10 > data + len) break;
+				outputs[oi].amount_sats =
+					((uint64_t)p[0] << 56) |
+					((uint64_t)p[1] << 48) |
+					((uint64_t)p[2] << 40) |
+					((uint64_t)p[3] << 32) |
+					((uint64_t)p[4] << 24) |
+					((uint64_t)p[5] << 16) |
+					((uint64_t)p[6] << 8) | p[7];
+				p += 8;
+				uint16_t spk_len = ((uint16_t)p[0] << 8) | p[1];
+				p += 2;
+				if (spk_len > 34 || p + spk_len > data + len) break;
+				memcpy(outputs[oi].script_pubkey, p, spk_len);
+				outputs[oi].script_pubkey_len = spk_len;
+				p += spk_len;
+			}
+
+			/* Build unsigned close tx to get sighash */
+			tx_buf_t close_tx;
+			unsigned char sighash[32];
+			tx_buf_init(&close_tx, 512);
+
+			if (!factory_build_cooperative_close_unsigned(
+				factory, &close_tx, sighash,
+				outputs, n_outputs,
+				ss_state.current_blockheight)) {
+				plugin_log(plugin_handle, LOG_BROKEN,
+					   "Client: close tx build failed");
+				tx_buf_free(&close_tx);
+				break;
+			}
+
+			plugin_log(plugin_handle, LOG_INFORM,
+				   "Client: close tx built (%zu bytes)",
+				   close_tx.len);
+
+			/* Parse LSP nonces from remainder */
+			size_t hdr_consumed = (size_t)(p - data);
+			nonce_bundle_t cnb;
+			if (hdr_consumed < len &&
+			    nonce_bundle_deserialize(&cnb,
+				p, len - hdr_consumed)) {
+				/* Re-init sessions for close signing */
+				factory_sessions_init(factory);
+
+				for (size_t e = 0; e < cnb.n_entries; e++) {
+					secp256k1_musig_pubnonce pn;
+					musig_pubnonce_parse(ctx, &pn,
+						cnb.entries[e].pubnonce);
+					factory_session_set_nonce(factory,
+						cnb.entries[e].node_idx,
+						cnb.entries[e].signer_slot,
+						&pn);
+				}
+			}
+
+			/* Generate our nonces */
+			int our_idx = fi->our_participant_idx;
+			unsigned char our_sec[32];
+			derive_demo_seckey(our_sec, fi->instance_id, our_idx);
+
+			secp256k1_pubkey our_pub;
+			if (!secp256k1_ec_pubkey_create(ctx, &our_pub, our_sec))
+				break;
+
+			if (fi->nonce_pool) free(fi->nonce_pool);
+			musig_nonce_pool_t *pool = calloc(1,
+				sizeof(musig_nonce_pool_t));
+			/* Close uses 1 signing session (kickoff root) */
+			musig_nonce_pool_generate(ctx, pool, 1,
+				our_sec, &our_pub, NULL);
+			fi->nonce_pool = pool;
+			fi->n_secnonces = 0;
+
+			secp256k1_musig_secnonce *sec;
+			secp256k1_musig_pubnonce pub;
+			musig_nonce_pool_next(pool, &sec, &pub);
+			fi->secnonce_pool_idx[0] = 0;
+			fi->secnonce_node_idx[0] = 0;
+			fi->n_secnonces = 1;
+			factory_session_set_nonce(factory, 0, our_idx, &pub);
+
+			/* Send CLOSE_NONCE */
+			nonce_bundle_t nresp;
+			memcpy(nresp.instance_id, fi->instance_id, 32);
+			nresp.n_participants = 2;
+			nresp.n_nodes = 1;
+			nresp.n_entries = 1;
+			nresp.entries[0].node_idx = 0;
+			nresp.entries[0].signer_slot = our_idx;
+			musig_pubnonce_serialize(ctx,
+				nresp.entries[0].pubnonce, &pub);
+
+			uint8_t nbuf[32768];
+			size_t nlen = nonce_bundle_serialize(&nresp,
+				nbuf, sizeof(nbuf));
+			uint8_t nwire[4 + 32768];
+			nwire[0] = 0x80; nwire[1] = 0x20;
+			nwire[2] = 0x01; nwire[3] = 0x11;
+			memcpy(nwire + 4, nbuf, nlen);
+
+			char *nhex = tal_arr(cmd, char, (4+nlen)*2 + 1);
+			for (size_t h = 0; h < 4+nlen; h++)
+				sprintf(nhex + h*2, "%02x", nwire[h]);
+
+			struct out_req *nreq = jsonrpc_request_start(cmd,
+				"sendcustommsg", rpc_done, rpc_err, cmd);
+			json_add_string(nreq->js, "node_id", peer_id);
+			json_add_string(nreq->js, "msg", nhex);
+			send_outreq(nreq);
+
+			/* Finalize and create partial sig */
+			factory_sessions_finalize(factory);
+
+			secp256k1_keypair kp;
+			if (!secp256k1_keypair_create(ctx, &kp, our_sec))
+				break;
+
+			musig_nonce_pool_t *sp =
+				(musig_nonce_pool_t *)fi->nonce_pool;
+			secp256k1_musig_secnonce *sn =
+				&sp->nonces[0].secnonce;
+
+			secp256k1_musig_partial_sig psig;
+			if (musig_create_partial_sig(ctx, &psig, sn, &kp,
+				&factory->nodes[0].signing_session)) {
+
+				nonce_bundle_t presp;
+				memcpy(presp.instance_id, fi->instance_id, 32);
+				presp.n_participants = 2;
+				presp.n_nodes = 1;
+				presp.n_entries = 1;
+				presp.entries[0].node_idx = 0;
+				presp.entries[0].signer_slot = our_idx;
+				musig_partial_sig_serialize(ctx,
+					presp.entries[0].pubnonce, &psig);
+
+				uint8_t pbuf[32768];
+				size_t plen = nonce_bundle_serialize(&presp,
+					pbuf, sizeof(pbuf));
+				uint8_t pwire[4 + 32768];
+				pwire[0] = 0x80; pwire[1] = 0x20;
+				pwire[2] = 0x01; pwire[3] = 0x13;
+				memcpy(pwire + 4, pbuf, plen);
+
+				char *phex = tal_arr(cmd, char, (4+plen)*2 + 1);
+				for (size_t h = 0; h < 4+plen; h++)
+					sprintf(phex + h*2, "%02x", pwire[h]);
+
+				struct out_req *preq = jsonrpc_request_start(cmd,
+					"sendcustommsg", rpc_done, rpc_err, cmd);
+				json_add_string(preq->js, "node_id", peer_id);
+				json_add_string(preq->js, "msg", phex);
+				send_outreq(preq);
+
+				plugin_log(plugin_handle, LOG_INFORM,
+					   "Client: sent CLOSE_NONCE + CLOSE_PSIG");
+			}
+
+			tx_buf_free(&close_tx);
+			fi->lifecycle = FACTORY_LIFECYCLE_DYING;
+		}
+		break;
+
 	case SS_SUBMSG_CLOSE_NONCE:
+		plugin_log(plugin_handle, LOG_INFORM,
+			   "CLOSE_NONCE from %s (len=%zu)",
+			   peer_id, len);
+		/* LSP side: client sent close nonces */
+		if (fi && fi->is_lsp) {
+			nonce_bundle_t cnb;
+			if (!nonce_bundle_deserialize(&cnb, data, len))
+				break;
+			factory_t *f = (factory_t *)fi->lib_factory;
+			if (!f) break;
+
+			for (size_t e = 0; e < cnb.n_entries; e++) {
+				secp256k1_musig_pubnonce pn;
+				if (!musig_pubnonce_parse(global_secp_ctx, &pn,
+					cnb.entries[e].pubnonce))
+					continue;
+				factory_session_set_nonce(f,
+					cnb.entries[e].node_idx,
+					cnb.entries[e].signer_slot, &pn);
+			}
+
+			if (!factory_sessions_finalize(f))
+				plugin_log(plugin_handle, LOG_BROKEN,
+					   "LSP: close finalize failed");
+			else
+				plugin_log(plugin_handle, LOG_INFORM,
+					   "LSP: close nonces finalized");
+		}
+		break;
+
 	case SS_SUBMSG_CLOSE_ALL_NONCES:
+		plugin_log(plugin_handle, LOG_INFORM,
+			   "CLOSE_ALL_NONCES from %s", peer_id);
+		break;
+
 	case SS_SUBMSG_CLOSE_PSIG:
+		plugin_log(plugin_handle, LOG_INFORM,
+			   "CLOSE_PSIG from %s (len=%zu)",
+			   peer_id, len);
+		/* LSP side: client sent close partial sig */
+		if (fi && fi->is_lsp) {
+			nonce_bundle_t pnb;
+			if (!nonce_bundle_deserialize(&pnb, data, len))
+				break;
+			factory_t *f = (factory_t *)fi->lib_factory;
+			if (!f) break;
+
+			for (size_t e = 0; e < pnb.n_entries; e++) {
+				secp256k1_musig_partial_sig ps;
+				if (!musig_partial_sig_parse(global_secp_ctx,
+					&ps, pnb.entries[e].pubnonce))
+					continue;
+				factory_session_set_partial_sig(f,
+					pnb.entries[e].node_idx,
+					pnb.entries[e].signer_slot, &ps);
+			}
+
+			/* Create LSP's own partial sig */
+			secp256k1_keypair lsp_kp;
+			if (!secp256k1_keypair_create(global_secp_ctx,
+				&lsp_kp, fi->our_seckey))
+				break;
+
+			musig_nonce_pool_t *lsp_pool =
+				(musig_nonce_pool_t *)fi->nonce_pool;
+			if (lsp_pool && fi->n_secnonces > 0) {
+				uint32_t pi = fi->secnonce_pool_idx[0];
+				secp256k1_musig_secnonce *sn =
+					&lsp_pool->nonces[pi].secnonce;
+
+				secp256k1_musig_partial_sig psig;
+				if (musig_create_partial_sig(
+					global_secp_ctx, &psig, sn, &lsp_kp,
+					&f->nodes[0].signing_session)) {
+					factory_session_set_partial_sig(
+						f, 0, fi->our_participant_idx,
+						&psig);
+					plugin_log(plugin_handle, LOG_INFORM,
+						   "LSP: created own close psig");
+				}
+			}
+
+			/* Try to complete */
+			if (factory_sessions_complete(f)) {
+				fi->lifecycle = FACTORY_LIFECYCLE_EXPIRED;
+				plugin_log(plugin_handle, LOG_INFORM,
+					   "LSP: COOPERATIVE CLOSE SIGNED!");
+
+				/* Send CLOSE_DONE */
+				uint8_t cwire[4 + 32];
+				cwire[0] = 0x80; cwire[1] = 0x20;
+				cwire[2] = 0x01; cwire[3] = 0x14;
+				memcpy(cwire + 4, fi->instance_id, 32);
+
+				for (size_t ci = 0; ci < fi->n_clients; ci++) {
+					char nid[67];
+					for (int j = 0; j < 33; j++)
+						sprintf(nid + j*2, "%02x",
+							fi->clients[ci].node_id[j]);
+					nid[66] = '\0';
+
+					char *chex = tal_arr(cmd, char, 36*2 + 1);
+					for (size_t h = 0; h < 36; h++)
+						sprintf(chex + h*2, "%02x", cwire[h]);
+
+					struct out_req *creq = jsonrpc_request_start(
+						cmd, "sendcustommsg",
+						rpc_done, rpc_err, cmd);
+					json_add_string(creq->js, "node_id", nid);
+					json_add_string(creq->js, "msg", chex);
+					send_outreq(creq);
+				}
+
+				plugin_log(plugin_handle, LOG_INFORM,
+					   "LSP: sent CLOSE_DONE to %zu clients",
+					   fi->n_clients);
+			} else {
+				plugin_log(plugin_handle, LOG_BROKEN,
+					   "LSP: close sessions_complete failed");
+			}
+		}
+		break;
+
 	case SS_SUBMSG_CLOSE_DONE:
 		plugin_log(plugin_handle, LOG_INFORM,
-			   "Close ceremony submsg 0x%04x from %s",
-			   submsg_id, peer_id);
-		/* TODO: cooperative close ceremony */
+			   "CLOSE_DONE from %s (len=%zu)",
+			   peer_id, len);
+		if (fi) {
+			fi->lifecycle = FACTORY_LIFECYCLE_EXPIRED;
+			plugin_log(plugin_handle, LOG_INFORM,
+				   "Client: factory closed cooperatively");
+		}
 		break;
 
 	default:
@@ -1548,6 +1860,182 @@ static struct command_result *json_factory_list(struct command *cmd,
 	return command_finished(cmd, js);
 }
 
+/* factory-close RPC — LSP initiates cooperative close.
+ * Splits factory value equally among participants (demo). */
+static struct command_result *json_factory_close(struct command *cmd,
+						 const char *buf,
+						 const jsmntok_t *params)
+{
+	const char *id_hex;
+	factory_instance_t *fi;
+	uint8_t instance_id[32];
+
+	if (!param(cmd, buf, params,
+		   p_req("instance_id", param_string, &id_hex),
+		   NULL))
+		return command_param_failed();
+
+	if (strlen(id_hex) != 64)
+		return command_fail(cmd, LIGHTNINGD, "Bad instance_id length");
+
+	for (int j = 0; j < 32; j++) {
+		unsigned int b;
+		sscanf(id_hex + j*2, "%02x", &b);
+		instance_id[j] = (uint8_t)b;
+	}
+
+	fi = ss_factory_find(&ss_state, instance_id);
+	if (!fi)
+		return command_fail(cmd, LIGHTNINGD, "Factory not found");
+	if (!fi->is_lsp)
+		return command_fail(cmd, LIGHTNINGD, "Only LSP can close");
+
+	factory_t *factory = (factory_t *)fi->lib_factory;
+	if (!factory)
+		return command_fail(cmd, LIGHTNINGD, "No lib_factory handle");
+
+	secp256k1_context *ctx = global_secp_ctx;
+	size_t n_participants = 1 + fi->n_clients;
+
+	/* Build output distribution: split equally (demo) */
+	uint64_t total_sats = 1000000; /* from factory creation */
+	uint64_t per_participant = total_sats / n_participants;
+	tx_output_t outputs[8];
+	for (size_t k = 0; k < n_participants && k < 8; k++) {
+		outputs[k].amount_sats = per_participant;
+		/* P2TR output: OP_1 <32-byte x-only key> */
+		unsigned char sk[32];
+		derive_demo_seckey(sk, fi->instance_id, (int)k);
+		secp256k1_pubkey pk;
+		if (!secp256k1_ec_pubkey_create(ctx, &pk, sk))
+			return command_fail(cmd, LIGHTNINGD, "Bad close pubkey");
+		secp256k1_xonly_pubkey xpk;
+		secp256k1_xonly_pubkey_from_pubkey(ctx, &xpk, NULL, &pk);
+		unsigned char xpk_ser[32];
+		secp256k1_xonly_pubkey_serialize(ctx, xpk_ser, &xpk);
+		outputs[k].script_pubkey[0] = 0x51; /* OP_1 */
+		outputs[k].script_pubkey[1] = 0x20; /* PUSH 32 */
+		memcpy(outputs[k].script_pubkey + 2, xpk_ser, 32);
+		outputs[k].script_pubkey_len = 34;
+	}
+
+	/* Build unsigned close tx */
+	tx_buf_t close_tx;
+	unsigned char sighash[32];
+	tx_buf_init(&close_tx, 512);
+
+	/* Re-init sessions for close signing */
+	factory_sessions_init(factory);
+
+	/* Generate LSP nonces */
+	unsigned char lsp_seckey[32];
+	derive_demo_seckey(lsp_seckey, fi->instance_id, 0);
+	memcpy(fi->our_seckey, lsp_seckey, 32);
+	fi->our_participant_idx = 0;
+
+	secp256k1_pubkey lsp_pub;
+	if (!secp256k1_ec_pubkey_create(ctx, &lsp_pub, lsp_seckey))
+		return command_fail(cmd, LIGHTNINGD, "Bad LSP close pubkey");
+
+	if (fi->nonce_pool) free(fi->nonce_pool);
+	musig_nonce_pool_t *pool = calloc(1, sizeof(musig_nonce_pool_t));
+	musig_nonce_pool_generate(ctx, pool, 1, lsp_seckey, &lsp_pub, NULL);
+	fi->nonce_pool = pool;
+	fi->n_secnonces = 0;
+
+	secp256k1_musig_secnonce *secnonce;
+	secp256k1_musig_pubnonce pubnonce;
+	musig_nonce_pool_next(pool, &secnonce, &pubnonce);
+	fi->secnonce_pool_idx[0] = 0;
+	fi->secnonce_node_idx[0] = 0;
+	fi->n_secnonces = 1;
+	factory_session_set_nonce(factory, 0, 0, &pubnonce);
+
+	/* Build CLOSE_PROPOSE payload:
+	 * n_outputs(4) + per output: amount(8) + spk_len(2) + spk(var)
+	 * + nonce_bundle */
+	uint8_t payload[4096];
+	uint8_t *p = payload;
+	p[0] = 0; p[1] = 0; p[2] = 0; p[3] = (uint8_t)n_participants;
+	p += 4;
+	for (size_t k = 0; k < n_participants; k++) {
+		uint64_t amt = outputs[k].amount_sats;
+		p[0] = (amt >> 56) & 0xFF; p[1] = (amt >> 48) & 0xFF;
+		p[2] = (amt >> 40) & 0xFF; p[3] = (amt >> 32) & 0xFF;
+		p[4] = (amt >> 24) & 0xFF; p[5] = (amt >> 16) & 0xFF;
+		p[6] = (amt >> 8) & 0xFF;  p[7] = amt & 0xFF;
+		p += 8;
+		uint16_t sl = (uint16_t)outputs[k].script_pubkey_len;
+		p[0] = (sl >> 8) & 0xFF; p[1] = sl & 0xFF;
+		p += 2;
+		memcpy(p, outputs[k].script_pubkey, sl);
+		p += sl;
+	}
+
+	/* Append nonce bundle */
+	nonce_bundle_t nb;
+	memset(&nb, 0, sizeof(nb));
+	memcpy(nb.instance_id, fi->instance_id, 32);
+	nb.n_participants = n_participants;
+	nb.n_nodes = 1;
+	nb.n_entries = 1;
+	nb.entries[0].node_idx = 0;
+	nb.entries[0].signer_slot = 0;
+	musig_pubnonce_serialize(ctx, nb.entries[0].pubnonce, &pubnonce);
+
+	for (size_t pk = 0; pk < n_participants && pk < MAX_PARTICIPANTS; pk++) {
+		unsigned char sk2[32];
+		derive_demo_seckey(sk2, fi->instance_id, (int)pk);
+		secp256k1_pubkey ppk;
+		secp256k1_ec_pubkey_create(ctx, &ppk, sk2);
+		size_t pklen = 33;
+		secp256k1_ec_pubkey_serialize(ctx, nb.pubkeys[pk], &pklen,
+			&ppk, SECP256K1_EC_COMPRESSED);
+	}
+
+	uint8_t nbuf[32768];
+	size_t nlen = nonce_bundle_serialize(&nb, nbuf, sizeof(nbuf));
+	memcpy(p, nbuf, nlen);
+	size_t plen = (size_t)(p - payload) + nlen;
+
+	/* Wire: type(2) + submsg(2) + payload */
+	uint8_t wire[4 + 4096];
+	wire[0] = 0x80; wire[1] = 0x20;
+	wire[2] = 0x01; wire[3] = 0x10; /* CLOSE_PROPOSE */
+	memcpy(wire + 4, payload, plen);
+	size_t wire_len = 4 + plen;
+
+	for (size_t ci = 0; ci < fi->n_clients; ci++) {
+		char client_hex[67];
+		for (int j = 0; j < 33; j++)
+			sprintf(client_hex + j*2, "%02x",
+				fi->clients[ci].node_id[j]);
+		client_hex[66] = '\0';
+
+		char *hex = tal_arr(cmd, char, wire_len*2 + 1);
+		for (size_t h = 0; h < wire_len; h++)
+			sprintf(hex + h*2, "%02x", wire[h]);
+
+		struct out_req *req = jsonrpc_request_start(cmd,
+			"sendcustommsg", rpc_done, rpc_err, cmd);
+		json_add_string(req->js, "node_id", client_hex);
+		json_add_string(req->js, "msg", hex);
+		send_outreq(req);
+	}
+
+	fi->lifecycle = FACTORY_LIFECYCLE_DYING;
+	tx_buf_free(&close_tx);
+
+	plugin_log(plugin_handle, LOG_INFORM,
+		   "factory-close: sent CLOSE_PROPOSE to %zu clients",
+		   fi->n_clients);
+
+	struct json_stream *js = jsonrpc_stream_success(cmd);
+	json_add_string(js, "instance_id", id_hex);
+	json_add_string(js, "status", "close_proposed");
+	return command_finished(cmd, js);
+}
+
 /* factory-rotate RPC — LSP advances DW epoch and re-signs.
  * Takes instance_id of an existing factory. */
 static struct command_result *json_factory_rotate(struct command *cmd,
@@ -1790,6 +2278,10 @@ static const struct plugin_command commands[] = {
 	{
 		"factory-rotate",
 		json_factory_rotate,
+	},
+	{
+		"factory-close",
+		json_factory_close,
 	},
 };
 
