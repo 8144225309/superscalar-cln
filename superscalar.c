@@ -134,8 +134,8 @@ static void UNUSED send_factory_msg(struct command *cmd, const char *peer_id,
  * TLV type 512: list of 32-byte protocol IDs we support. */
 static void send_supported_protocols(struct command *cmd, const char *peer_id)
 {
-	/* Wire: type(2)+submsg(2) + TLV[512](35 bytes) */
-	uint8_t wire[4 + 35];
+	/* Wire: type(2)+submsg(2) + TLV[512](4+32=36 bytes) = 40 total */
+	uint8_t wire[40];
 	wire[0] = 0x80; wire[1] = 0x20; /* type 32800 */
 	wire[2] = 0x00; wire[3] = 0x02; /* submsg 2 = supported_factory_protocols */
 
