@@ -718,6 +718,9 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 			size_t our_count = factory_count_nodes_for_participant(
 				factory, our_idx);
 
+			secp256k1_pubkey our_pub;
+			secp256k1_ec_pubkey_create(ctx, &our_pub, our_sec);
+
 			if (fi->nonce_pool) {
 				free(fi->nonce_pool);
 				fi->nonce_pool = NULL;
@@ -725,7 +728,7 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 			musig_nonce_pool_t *pool = calloc(1,
 				sizeof(musig_nonce_pool_t));
 			musig_nonce_pool_generate(ctx, pool, our_count,
-				our_sec, NULL, NULL);
+				our_sec, &our_pub, NULL);
 			fi->nonce_pool = pool;
 			memcpy(fi->our_seckey, our_sec, 32);
 			fi->n_secnonces = 0;
