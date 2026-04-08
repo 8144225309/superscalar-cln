@@ -914,47 +914,19 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 				plugin_log(plugin_handle, LOG_INFORM,
 					   "LSP: nonces finalized! ceremony=nonces_collected");
 
-				/* Serialize ALL_NONCES: collect all pubnonces
-				 * from all signers on all nodes and broadcast
-				 * to clients so they can finalize + sign. */
-				nonce_bundle_t all_nb;
-				memset(&all_nb, 0, sizeof(all_nb));
-				memcpy(all_nb.instance_id, fi->instance_id, 32);
-				all_nb.n_participants = 1 + fi->n_clients;
-				all_nb.n_nodes = f->n_nodes;
-				all_nb.n_entries = 0;
-				for (uint32_t ni = 0; ni < f->n_nodes; ni++) {
-					for (uint32_t si = 0; si < f->nodes[ni].n_signers
-					     && all_nb.n_entries < MAX_NONCE_ENTRIES; si++) {
-						secp256k1_musig_pubnonce *pn =
-							&f->nodes[ni].signing_session.pubnonces[si];
-						all_nb.entries[all_nb.n_entries].node_idx = ni;
-						all_nb.entries[all_nb.n_entries].signer_slot = si;
-						musig_pubnonce_serialize(global_secp_ctx,
-							all_nb.entries[all_nb.n_entries].pubnonce,
-							pn);
-						all_nb.n_entries++;
-					}
+				/* For 2-party mode, the client already sent
+				 * both nonces AND psigs together, skipping
+				 * the ALL_NONCES round. For 3+ participants,
+				 * we need to broadcast ALL_NONCES so clients
+				 * can finalize and create partial sigs.
+				 * Multi-client ALL_NONCES needs nonce caching
+				 * in the NONCE_BUNDLE handler — pending. */
+				if (fi->n_clients > 1) {
+					plugin_log(plugin_handle, LOG_UNUSUAL,
+						   "LSP: multi-client ALL_NONCES "
+						   "round not yet implemented "
+						   "(%zu clients)", fi->n_clients);
 				}
-
-				uint8_t anbuf[MAX_WIRE_BUF];
-				size_t anlen = nonce_bundle_serialize(&all_nb,
-					anbuf, sizeof(anbuf));
-
-				for (size_t ci = 0; ci < fi->n_clients; ci++) {
-					char nid[67];
-					for (int j = 0; j < 33; j++)
-						sprintf(nid + j*2, "%02x",
-							fi->clients[ci].node_id[j]);
-					nid[66] = '\0';
-					send_factory_msg(cmd, nid,
-						SS_SUBMSG_ALL_NONCES,
-						anbuf, anlen);
-				}
-				plugin_log(plugin_handle, LOG_INFORM,
-					   "LSP: sent ALL_NONCES to %zu clients "
-					   "(%zu entries, %zu bytes)",
-					   fi->n_clients, all_nb.n_entries, anlen);
 			}
 
 			/* ctx is global */
@@ -2225,8 +2197,10 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 					   "LSP: COOPERATIVE CLOSE SIGNED!");
 
 				/* Broadcast the close TX (node 0) */
-				tx_buf_t *ctx_buf = &f->nodes[0].signed_tx;
-				if (ctx_buf->data && ctx_buf->len > 0) {
+				if (f->n_nodes > 0
+				    && f->nodes[0].signed_tx.data
+				    && f->nodes[0].signed_tx.len > 0) {
+					tx_buf_t *ctx_buf = &f->nodes[0].signed_tx;
 					char *ctx_hex = tal_arr(cmd, char,
 						ctx_buf->len * 2 + 1);
 					for (size_t h = 0; h < ctx_buf->len; h++)
