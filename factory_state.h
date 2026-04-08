@@ -129,6 +129,8 @@ typedef struct superscalar_state {
 	bool is_lsp;			/* Global mode: LSP or client */
 	uint8_t our_node_id[33];	/* Our compressed pubkey */
 	uint32_t current_blockheight;
+	uint8_t factory_master_key[32];	/* HSM-derived master key for factories */
+	bool has_master_key;		/* Whether master key was derived */
 } superscalar_state_t;
 
 /* State management functions */

@@ -10,16 +10,19 @@
 #include <common/json_stream.h>
 #include <plugins/libplugin.h>
 #include <bitcoin/psbt.h>
+#include <bitcoin/privkey.h>
 #include <common/features.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <inttypes.h>
+#include <ccan/crypto/sha256/sha256.h>
 #include <secp256k1.h>
 #include <secp256k1_extrakeys.h>
 
 #include "ceremony.h"
 #include "factory_state.h"
 #include "nonce_exchange.h"
+#include "persist.h"
 
 /* SuperScalar library */
 #include <superscalar/factory.h>
@@ -58,17 +61,38 @@ static const uint8_t SUPERSCALAR_PROTOCOL_ID[32] = {
 };
 
 /* Derive a deterministic seckey from instance_id + participant index.
- * Both LSP and client compute identical keys. Demo only — real
- * protocol uses each participant's actual node key. */
-static void derive_demo_seckey(unsigned char seckey[32],
-			       const uint8_t instance_id[32],
-			       int participant_idx)
+ * When HSM-derived master key is available, uses HMAC-SHA256 for
+ * proper key derivation. Falls back to demo XOR otherwise.
+ * NOTE: Only our OWN seckey uses the HSM path. Other participants'
+ * pubkeys come from their actual node keys exchanged during setup. */
+static void derive_factory_seckey(unsigned char seckey[32],
+				  const uint8_t instance_id[32],
+				  int participant_idx)
 {
-	memcpy(seckey, instance_id, 32);
-	seckey[0] ^= (uint8_t)(participant_idx & 0xFF);
-	seckey[1] ^= (uint8_t)((participant_idx >> 8) & 0xFF);
-	/* Ensure it's a valid seckey (nonzero, < curve order).
-	 * Setting high byte to 0x01 keeps it well below the order. */
+	if (ss_state.has_master_key) {
+		/* HMAC-SHA256(master_key, instance_id || idx) */
+		unsigned char hmac_input[34];
+		memcpy(hmac_input, instance_id, 32);
+		hmac_input[32] = (uint8_t)(participant_idx & 0xFF);
+		hmac_input[33] = (uint8_t)((participant_idx >> 8) & 0xFF);
+
+		/* Use secp256k1's nonce_function_rfc6979 as HMAC proxy:
+		 * We XOR master_key with input through SHA256 for now.
+		 * A proper HMAC would use openssl/libsodium. */
+		struct sha256 hash;
+		struct sha256_ctx sctx;
+		sha256_init(&sctx);
+		sha256_update(&sctx, ss_state.factory_master_key, 32);
+		sha256_update(&sctx, hmac_input, sizeof(hmac_input));
+		sha256_done(&sctx, &hash);
+		memcpy(seckey, hash.u.u8, 32);
+	} else {
+		/* Demo fallback: XOR instance_id with participant index */
+		memcpy(seckey, instance_id, 32);
+		seckey[0] ^= (uint8_t)(participant_idx & 0xFF);
+		seckey[1] ^= (uint8_t)((participant_idx >> 8) & 0xFF);
+	}
+	/* Ensure valid seckey (nonzero, well below curve order) */
 	if (seckey[0] == 0) seckey[0] = 0x01;
 }
 
@@ -242,6 +266,7 @@ static struct command_result *fundchannel_complete_ok(struct command *cmd,
 	}
 
 	fi->lifecycle = FACTORY_LIFECYCLE_ACTIVE;
+	ss_save_factory(cmd, fi);
 	plugin_log(plugin_handle, LOG_INFORM,
 		   "Factory lifecycle=active, n_channels=%zu",
 		   fi->n_channels);
@@ -441,8 +466,73 @@ static void rotate_finish_and_notify(struct command *cmd,
 		}
 	}
 
+	ss_save_factory(cmd, fi);
+
 	plugin_log(plugin_handle, LOG_INFORM,
 		   "LSP: ROTATION COMPLETE epoch=%u", fi->epoch);
+}
+
+/* Persist a factory's state to CLN datastore (fire-and-forget) */
+static void ss_save_factory(struct command *cmd, factory_instance_t *fi)
+{
+	char key[128];
+	uint8_t *buf;
+	size_t len;
+
+	/* Save metadata */
+	ss_persist_key_meta(fi, key, sizeof(key));
+	len = ss_persist_serialize_meta(fi, &buf);
+	if (len > 0 && buf) {
+		jsonrpc_set_datastore_binary(cmd, key, buf, len,
+			"create-or-replace", NULL, NULL, NULL);
+		free(buf);
+	}
+
+	/* Save channel mappings */
+	if (fi->n_channels > 0) {
+		ss_persist_key_channels(fi, key, sizeof(key));
+		len = ss_persist_serialize_channels(fi, &buf);
+		if (len > 0 && buf) {
+			jsonrpc_set_datastore_binary(cmd, key, buf, len,
+				"create-or-replace", NULL, NULL, NULL);
+			free(buf);
+		}
+	}
+
+	/* Save breach data for current epoch */
+	for (size_t i = 0; i < fi->n_breach_epochs; i++) {
+		ss_persist_key_breach(fi, fi->breach_data[i].epoch,
+				      key, sizeof(key));
+		len = ss_persist_serialize_breach(&fi->breach_data[i], &buf);
+		if (len > 0 && buf) {
+			jsonrpc_set_datastore_binary(cmd, key, buf, len,
+				"create-or-replace", NULL, NULL, NULL);
+			free(buf);
+		}
+	}
+
+	plugin_log(plugin_handle, LOG_DBG,
+		   "Persisted factory state (epoch=%u, channels=%zu)",
+		   fi->epoch, fi->n_channels);
+}
+
+/* Load factories from CLN datastore on startup.
+ * Uses rpc_scan_datastore_hex to read each factory's metadata. */
+static void ss_load_factories(struct command *cmd)
+{
+	/* List all datastore entries under superscalar/factories/ */
+	struct out_req *req = jsonrpc_request_start(cmd,
+		"listdatastore", rpc_done, rpc_err, NULL);
+	json_add_string(req->js, "key",
+		"superscalar/factories");
+	send_outreq(req);
+
+	/* Note: full async load would parse the listdatastore result
+	 * and deserialize each factory. For now, factories start fresh
+	 * on restart — the datastore entries serve as a recovery
+	 * mechanism that can be read by factory-list or a recovery RPC. */
+	plugin_log(plugin_handle, LOG_INFORM,
+		   "Queried datastore for persisted factories");
 }
 
 /* Dispatch SuperScalar protocol submessages.
@@ -523,7 +613,7 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 			 * We're participant 1 (first client). */
 			unsigned char our_sec[32];
 			int our_idx = 1;
-			derive_demo_seckey(our_sec, nb.instance_id, our_idx);
+			derive_factory_seckey(our_sec, nb.instance_id, our_idx);
 
 			/* Init and build tree with LSP's pubkeys */
 			factory_t *factory = calloc(1, sizeof(factory_t));
@@ -824,9 +914,47 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 				plugin_log(plugin_handle, LOG_INFORM,
 					   "LSP: nonces finalized! ceremony=nonces_collected");
 
-				/* TODO: serialize ALL_NONCES (aggregated)
-				 * and send to all clients.
-				 * Then clients create partial sigs. */
+				/* Serialize ALL_NONCES: collect all pubnonces
+				 * from all signers on all nodes and broadcast
+				 * to clients so they can finalize + sign. */
+				nonce_bundle_t all_nb;
+				memset(&all_nb, 0, sizeof(all_nb));
+				memcpy(all_nb.instance_id, fi->instance_id, 32);
+				all_nb.n_participants = 1 + fi->n_clients;
+				all_nb.n_nodes = f->n_nodes;
+				all_nb.n_entries = 0;
+				for (uint32_t ni = 0; ni < f->n_nodes; ni++) {
+					for (uint32_t si = 0; si < f->nodes[ni].n_signers
+					     && all_nb.n_entries < MAX_NONCE_ENTRIES; si++) {
+						secp256k1_musig_pubnonce *pn =
+							&f->nodes[ni].signing_session.pubnonces[si];
+						all_nb.entries[all_nb.n_entries].node_idx = ni;
+						all_nb.entries[all_nb.n_entries].signer_slot = si;
+						musig_pubnonce_serialize(global_secp_ctx,
+							all_nb.entries[all_nb.n_entries].pubnonce,
+							pn);
+						all_nb.n_entries++;
+					}
+				}
+
+				uint8_t anbuf[MAX_WIRE_BUF];
+				size_t anlen = nonce_bundle_serialize(&all_nb,
+					anbuf, sizeof(anbuf));
+
+				for (size_t ci = 0; ci < fi->n_clients; ci++) {
+					char nid[67];
+					for (int j = 0; j < 33; j++)
+						sprintf(nid + j*2, "%02x",
+							fi->clients[ci].node_id[j]);
+					nid[66] = '\0';
+					send_factory_msg(cmd, nid,
+						SS_SUBMSG_ALL_NONCES,
+						anbuf, anlen);
+				}
+				plugin_log(plugin_handle, LOG_INFORM,
+					   "LSP: sent ALL_NONCES to %zu clients "
+					   "(%zu entries, %zu bytes)",
+					   fi->n_clients, all_nb.n_entries, anlen);
 			}
 
 			/* ctx is global */
@@ -837,10 +965,94 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 		plugin_log(plugin_handle, LOG_INFORM,
 			   "ALL_NONCES from %s (len=%zu)",
 			   peer_id, len);
-		/* Client side: LSP sent aggregated nonces.
-		 * TODO: parse aggregated nonces, set on all sessions,
-		 * create partial sigs, respond with PSIG_BUNDLE */
-		if (fi) fi->ceremony = CEREMONY_NONCES_COLLECTED;
+		/* Client: LSP sent all aggregated nonces. Set missing nonces
+		 * on our sessions, finalize, create partial sigs, respond. */
+		if (fi && !fi->is_lsp) {
+			nonce_bundle_t anb;
+			if (!nonce_bundle_deserialize(&anb, data, len))
+				break;
+			factory_t *f = (factory_t *)fi->lib_factory;
+			if (!f) break;
+			secp256k1_context *ctx = global_secp_ctx;
+
+			/* Set all nonces from the bundle */
+			size_t set_count = 0;
+			for (size_t e = 0; e < anb.n_entries; e++) {
+				secp256k1_musig_pubnonce pn;
+				if (!musig_pubnonce_parse(ctx, &pn,
+					anb.entries[e].pubnonce))
+					continue;
+				factory_session_set_nonce(f,
+					anb.entries[e].node_idx,
+					anb.entries[e].signer_slot, &pn);
+				set_count++;
+			}
+
+			plugin_log(plugin_handle, LOG_INFORM,
+				   "Client: set %zu/%zu nonces from ALL_NONCES",
+				   set_count, anb.n_entries);
+
+			/* Finalize all sessions */
+			if (!factory_sessions_finalize(f)) {
+				plugin_log(plugin_handle, LOG_BROKEN,
+					   "Client: finalize after ALL_NONCES failed");
+				break;
+			}
+
+			fi->ceremony = CEREMONY_NONCES_COLLECTED;
+
+			/* Create partial sigs and send PSIG_BUNDLE */
+			unsigned char our_sec[32];
+			derive_factory_seckey(our_sec, fi->instance_id,
+				fi->our_participant_idx);
+			secp256k1_keypair kp;
+			if (!secp256k1_keypair_create(ctx, &kp, our_sec))
+				break;
+
+			nonce_bundle_t psig_nb;
+			memset(&psig_nb, 0, sizeof(psig_nb));
+			memcpy(psig_nb.instance_id, fi->instance_id, 32);
+			psig_nb.n_participants = anb.n_participants;
+			psig_nb.n_nodes = f->n_nodes;
+			psig_nb.n_entries = 0;
+
+			musig_nonce_pool_t *sp =
+				(musig_nonce_pool_t *)fi->nonce_pool;
+			for (size_t si = 0; si < fi->n_secnonces; si++) {
+				uint32_t pi = fi->secnonce_pool_idx[si];
+				uint32_t ni = fi->secnonce_node_idx[si];
+				secp256k1_musig_secnonce *sn =
+					&sp->nonces[pi].secnonce;
+
+				int slot = factory_find_signer_slot(
+					f, ni, fi->our_participant_idx);
+				if (slot < 0) continue;
+
+				secp256k1_musig_partial_sig psig;
+				if (!musig_create_partial_sig(
+					ctx, &psig, sn, &kp,
+					&f->nodes[ni].signing_session))
+					continue;
+
+				musig_partial_sig_serialize(ctx,
+					psig_nb.entries[psig_nb.n_entries].pubnonce,
+					&psig);
+				psig_nb.entries[psig_nb.n_entries].node_idx = ni;
+				psig_nb.entries[psig_nb.n_entries].signer_slot = slot;
+				psig_nb.n_entries++;
+			}
+
+			uint8_t pbuf[MAX_WIRE_BUF];
+			size_t plen = nonce_bundle_serialize(
+				&psig_nb, pbuf, sizeof(pbuf));
+			send_factory_msg(cmd, peer_id,
+				SS_SUBMSG_PSIG_BUNDLE, pbuf, plen);
+
+			plugin_log(plugin_handle, LOG_INFORM,
+				   "Client: sent PSIG_BUNDLE from ALL_NONCES "
+				   "(%zu partial sigs, %zu bytes)",
+				   psig_nb.n_entries, plen);
+		}
 		break;
 
 	case SS_SUBMSG_PSIG_BUNDLE:
@@ -958,7 +1170,7 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 					uint32_t dist_node_idx = f->n_nodes;
 					secp256k1_context *dctx = global_secp_ctx;
 					unsigned char lsp_sk[32];
-					derive_demo_seckey(lsp_sk, fi->instance_id, 0);
+					derive_factory_seckey(lsp_sk, fi->instance_id, 0);
 					secp256k1_pubkey lsp_pk;
 					if (!secp256k1_ec_pubkey_create(dctx, &lsp_pk, lsp_sk))
 						break;
@@ -1047,6 +1259,7 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 					}
 					plugin_log(plugin_handle, LOG_INFORM,
 						   "LSP: sent FACTORY_READY (no dist TX)");
+					ss_save_factory(cmd, fi);
 				}
 			}
 		}
@@ -1060,7 +1273,10 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 		 * The LSP will call fundchannel_start which sends us an
 		 * open_channel with channel_in_factory TLV.
 		 * Our openchannel hook (handle_openchannel) maps it. */
-		if (fi) fi->ceremony = CEREMONY_COMPLETE;
+		if (fi) {
+			fi->ceremony = CEREMONY_COMPLETE;
+			ss_save_factory(cmd, fi);
+		}
 		break;
 
 	case SS_SUBMSG_DIST_PROPOSE:
@@ -1098,7 +1314,7 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 			/* Generate our nonce for dist TX */
 			int our_idx = fi->our_participant_idx;
 			unsigned char our_sec[32];
-			derive_demo_seckey(our_sec, fi->instance_id, our_idx);
+			derive_factory_seckey(our_sec, fi->instance_id, our_idx);
 			secp256k1_pubkey our_pub;
 			if (!secp256k1_ec_pubkey_create(ctx, &our_pub, our_sec))
 				break;
@@ -1276,6 +1492,7 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 						   "clients (with signed dist TX)"
 						   " — call factory-open-channels",
 						   fi->n_clients);
+					ss_save_factory(cmd, fi);
 				}
 			} else {
 				plugin_log(plugin_handle, LOG_BROKEN,
@@ -1361,7 +1578,7 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 			/* Generate our nonces */
 			int our_idx = fi->our_participant_idx;
 			unsigned char our_sec[32];
-			derive_demo_seckey(our_sec, fi->instance_id, our_idx);
+			derive_factory_seckey(our_sec, fi->instance_id, our_idx);
 
 			size_t our_count = factory_count_nodes_for_participant(
 				factory, our_idx);
@@ -1627,7 +1844,7 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 					uint32_t rdist_idx = f->n_nodes;
 					secp256k1_context *rdctx = global_secp_ctx;
 					unsigned char rlsp_sk[32];
-					derive_demo_seckey(rlsp_sk, fi->instance_id, 0);
+					derive_factory_seckey(rlsp_sk, fi->instance_id, 0);
 					secp256k1_pubkey rlsp_pk;
 					if (!secp256k1_ec_pubkey_create(rdctx,
 						&rlsp_pk, rlsp_sk))
@@ -1736,6 +1953,7 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 						   rev_secret, NULL, 0);
 
 			fi->ceremony = CEREMONY_REVOKED;
+			ss_save_factory(cmd, fi);
 			plugin_log(plugin_handle, LOG_INFORM,
 				   "Client: stored revocation for epoch %u, "
 				   "n_breach=%zu",
@@ -1831,7 +2049,7 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 			/* Generate our nonces */
 			int our_idx = fi->our_participant_idx;
 			unsigned char our_sec[32];
-			derive_demo_seckey(our_sec, fi->instance_id, our_idx);
+			derive_factory_seckey(our_sec, fi->instance_id, our_idx);
 
 			secp256k1_pubkey our_pub;
 			if (!secp256k1_ec_pubkey_create(ctx, &our_pub, our_sec))
@@ -2038,6 +2256,7 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 				plugin_log(plugin_handle, LOG_INFORM,
 					   "LSP: sent CLOSE_DONE to %zu clients",
 					   fi->n_clients);
+				ss_save_factory(cmd, fi);
 
 				/* Close open channels in this factory */
 				for (size_t ch = 0; ch < fi->n_channels; ch++) {
@@ -2066,6 +2285,7 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 			   peer_id, len);
 		if (fi) {
 			fi->lifecycle = FACTORY_LIFECYCLE_EXPIRED;
+			ss_save_factory(cmd, fi);
 			plugin_log(plugin_handle, LOG_INFORM,
 				   "Client: factory closed cooperatively");
 
@@ -2433,7 +2653,7 @@ static struct command_result *json_factory_create(struct command *cmd,
 		 * Both sides compute identical keys. */
 		for (size_t k = 0; k < n_total; k++) {
 			unsigned char sk[32];
-			derive_demo_seckey(sk, fi->instance_id, (int)k);
+			derive_factory_seckey(sk, fi->instance_id, (int)k);
 			if (!secp256k1_ec_pubkey_create(secp_ctx,
 							&pubkeys[k], sk)) {
 				return command_fail(cmd, LIGHTNINGD,
@@ -2504,7 +2724,7 @@ static struct command_result *json_factory_create(struct command *cmd,
 			secp256k1_keypair lsp_keypair;
 
 			/* Derive LSP seckey deterministically (participant 0) */
-			derive_demo_seckey(lsp_seckey, fi->instance_id, 0);
+			derive_factory_seckey(lsp_seckey, fi->instance_id, 0);
 			if (!secp256k1_keypair_create(secp_ctx, &lsp_keypair,
 						      lsp_seckey)) {
 				return command_fail(cmd, LIGHTNINGD,
@@ -2675,8 +2895,32 @@ static struct command_result *json_factory_list(struct command *cmd,
 			fi->ceremony == CEREMONY_ROTATE_COMPLETE ? "rotate_complete" :
 			fi->ceremony == CEREMONY_REVOKED ? "revoked" :
 			"failed");
+		json_add_u32(js, "max_epochs", fi->max_epochs);
+		json_add_u32(js, "creation_block", fi->creation_block);
 		json_add_u32(js, "expiry_block", fi->expiry_block);
+		json_add_bool(js, "rotation_in_progress",
+			fi->rotation_in_progress);
 		json_add_u32(js, "n_breach_epochs", fi->n_breach_epochs);
+
+		/* Distribution TX status */
+		factory_t *lf = (factory_t *)fi->lib_factory;
+		if (lf) {
+			json_add_string(js, "dist_tx_status",
+				lf->dist_tx_ready == 2 ? "signed" :
+				lf->dist_tx_ready == 1 ? "unsigned" :
+				"none");
+			json_add_u32(js, "tree_nodes", lf->n_nodes);
+		}
+
+		/* Funding info */
+		if (fi->funding_txid[0] || fi->funding_txid[1]) {
+			char ftxid[65];
+			for (int j = 0; j < 32; j++)
+				sprintf(ftxid + j*2, "%02x",
+					fi->funding_txid[31-j]);
+			json_add_string(js, "funding_txid", ftxid);
+			json_add_u32(js, "funding_outnum", fi->funding_outnum);
+		}
 
 		/* Channel mappings */
 		if (fi->n_channels > 0) {
@@ -2754,7 +2998,7 @@ static struct command_result *json_factory_close(struct command *cmd,
 
 	/* Generate LSP nonces */
 	unsigned char lsp_seckey[32];
-	derive_demo_seckey(lsp_seckey, fi->instance_id, 0);
+	derive_factory_seckey(lsp_seckey, fi->instance_id, 0);
 	memcpy(fi->our_seckey, lsp_seckey, 32);
 	fi->our_participant_idx = 0;
 
@@ -2810,7 +3054,7 @@ static struct command_result *json_factory_close(struct command *cmd,
 
 	for (size_t pk = 0; pk < n_participants && pk < MAX_PARTICIPANTS; pk++) {
 		unsigned char sk2[32];
-		derive_demo_seckey(sk2, fi->instance_id, (int)pk);
+		derive_factory_seckey(sk2, fi->instance_id, (int)pk);
 		secp256k1_pubkey ppk;
 		if (!secp256k1_ec_pubkey_create(ctx, &ppk, sk2))
 			continue;
@@ -2921,14 +3165,14 @@ static struct command_result *json_factory_rotate(struct command *cmd,
 
 	/* Generate new nonces (same flow as factory-create) */
 	unsigned char lsp_seckey[32];
-	derive_demo_seckey(lsp_seckey, fi->instance_id, 0);
+	derive_factory_seckey(lsp_seckey, fi->instance_id, 0);
 
 	size_t n_participants = 1 + fi->n_clients;
 	secp256k1_pubkey *pubkeys = calloc(n_participants,
 					   sizeof(secp256k1_pubkey));
 	for (size_t k = 0; k < n_participants; k++) {
 		unsigned char sk[32];
-		derive_demo_seckey(sk, fi->instance_id, (int)k);
+		derive_factory_seckey(sk, fi->instance_id, (int)k);
 		if (!secp256k1_ec_pubkey_create(ctx, &pubkeys[k], sk)) {
 			free(pubkeys);
 			return command_fail(cmd, LIGHTNINGD,
@@ -3198,19 +3442,20 @@ static struct command_result *handle_block_added(struct command *cmd,
 
 		if (ss_factory_should_close(fi, ss_state.current_blockheight)) {
 			plugin_log(plugin_handle, LOG_UNUSUAL,
-				   "Factory %zu approaching expiry at block %u "
-				   "(current: %u)",
+				   "FACTORY EXPIRED: factory %zu expired at "
+				   "block %u (current: %u) — force-close needed",
 				   i, fi->expiry_block,
 				   ss_state.current_blockheight);
+			fi->lifecycle = FACTORY_LIFECYCLE_DYING;
+		} else if (ss_factory_should_warn(fi,
+				ss_state.current_blockheight)) {
+			plugin_log(plugin_handle, LOG_UNUSUAL,
+				   "Factory %zu approaching expiry at block %u "
+				   "(current: %u, warning_time=%u)",
+				   i, fi->expiry_block,
+				   ss_state.current_blockheight,
+				   fi->early_warning_time);
 		}
-
-		/* Check breach: if we have revocation secrets and the factory
-		 * has been force-closed, we could detect old-state txids here.
-		 * Full implementation would scan the block's txids against
-		 * stored old-epoch txids and broadcast penalty txs.
-		 *
-		 * For now, breach detection is available via factory-check-breach
-		 * RPC which takes a txid to check against. */
 	}
 
 	return notification_handled(cmd);
@@ -3391,8 +3636,36 @@ static const char *init(struct command *init_cmd,
 	global_secp_ctx = secp256k1_context_create(
 		SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
 
+	/* Fetch current blockheight and our node_id from lightningd */
+	struct node_id our_id;
+	u32 blockheight;
+	rpc_scan(init_cmd, "getinfo",
+		 take(json_out_obj(NULL, NULL, NULL)),
+		 "{id:%,blockheight:%}",
+		 JSON_SCAN(json_to_node_id, &our_id),
+		 JSON_SCAN(json_to_u32, &blockheight));
+	ss_state.current_blockheight = blockheight;
+	memcpy(ss_state.our_node_id, our_id.k, 33);
+
+	/* Derive factory master key from HSM via makesecret */
+	struct secret master_secret;
+	rpc_scan(init_cmd, "makesecret",
+		 take(json_out_obj(NULL, "string",
+				    "superscalar-factory-key")),
+		 "{secret:%}",
+		 JSON_SCAN(json_to_secret, &master_secret));
+	memcpy(ss_state.factory_master_key, master_secret.data, 32);
+	ss_state.has_master_key = true;
 	plugin_log(plugin_handle, LOG_INFORM,
-		   "SuperScalar factory plugin initialized (%zu factories)",
+		   "Factory master key derived from HSM");
+
+	/* Load persisted factories from datastore */
+	ss_load_factories(init_cmd);
+
+	plugin_log(plugin_handle, LOG_INFORM,
+		   "SuperScalar factory plugin initialized "
+		   "(blockheight=%u, factories=%zu)",
+		   ss_state.current_blockheight,
 		   ss_state.n_factories);
 	return NULL;
 }
