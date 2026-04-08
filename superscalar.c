@@ -2977,7 +2977,6 @@ static const struct plugin_notification notifs[] = {
 
 int main(int argc, char *argv[])
 {
-	fprintf(stderr, "superscalar: main() entered\n");
 	setup_locale();
 
 	/* Feature bit 271 (pluggable_channel_factories) is advertised
