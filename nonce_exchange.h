@@ -18,8 +18,9 @@
 #include <stdint.h>
 #include <stddef.h>
 
-/* Max entries in a nonce bundle (n_nodes * n_signers) */
-#define MAX_NONCE_ENTRIES 256
+/* Max entries in a nonce bundle (n_nodes * n_signers).
+ * Raised for v0.1.9 (256 nodes * 64 signers possible). */
+#define MAX_NONCE_ENTRIES 1024
 
 typedef struct {
 	uint32_t node_idx;
@@ -27,8 +28,8 @@ typedef struct {
 	uint8_t pubnonce[66];
 } nonce_entry_t;
 
-/* Max participants */
-#define MAX_PARTICIPANTS 16
+/* Max participants — matches FACTORY_MAX_SIGNERS in libsuperscalar v0.1.9. */
+#define MAX_PARTICIPANTS 64
 
 typedef struct {
 	uint8_t instance_id[32];

@@ -30,6 +30,7 @@ static struct plugin *plugin_handle;
 static superscalar_state_t ss_state;
 static secp256k1_context *global_secp_ctx;
 
+
 /* bLIP-56 factory message type */
 #define FACTORY_MSG_TYPE	32800
 

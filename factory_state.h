@@ -16,12 +16,13 @@
 #include <stddef.h>
 #include "ceremony.h"
 
-/* Max participants in a single factory (LSP + clients) */
-#define MAX_FACTORY_PARTICIPANTS 16
+/* Max participants in a single factory (LSP + clients).
+ * Matches FACTORY_MAX_SIGNERS in libsuperscalar v0.1.9. */
+#define MAX_FACTORY_PARTICIPANTS 64
 
 /* Max nonce entries (must match nonce_exchange.h) */
 #ifndef MAX_NONCE_ENTRIES
-#define MAX_NONCE_ENTRIES 256
+#define MAX_NONCE_ENTRIES 1024
 #endif
 
 /* Max concurrent factories */
