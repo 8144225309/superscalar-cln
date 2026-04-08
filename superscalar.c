@@ -842,7 +842,6 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 				/* Build distribution TX (nLockTime fallback).
 				 * This TX lets clients recover funds if LSP
 				 * vanishes — the core SuperScalar safety net. */
-				size_t n_parts = 1 + fi->n_clients;
 				tx_output_t dist_out[65];
 				size_t n_dist = factory_compute_distribution_outputs(
 					f, dist_out, 65, 500);
@@ -861,7 +860,8 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 					unsigned char lsp_sk[32];
 					derive_demo_seckey(lsp_sk, fi->instance_id, 0);
 					secp256k1_pubkey lsp_pk;
-					secp256k1_ec_pubkey_create(dctx, &lsp_pk, lsp_sk);
+					if (!secp256k1_ec_pubkey_create(dctx, &lsp_pk, lsp_sk))
+						break;
 
 					musig_nonce_pool_t *dpool = calloc(1,
 						sizeof(musig_nonce_pool_t));
@@ -1039,7 +1039,8 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 			/* Finalize and create partial sig */
 			if (factory_session_finalize_node(f, dist_idx)) {
 				secp256k1_keypair kp;
-				secp256k1_keypair_create(ctx, &kp, our_sec);
+				if (!secp256k1_keypair_create(ctx, &kp, our_sec))
+					break;
 				secp256k1_musig_partial_sig psig;
 				if (musig_create_partial_sig(ctx, &psig, sec,
 					&kp, &f->nodes[dist_idx].signing_session)) {
@@ -1124,8 +1125,9 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 				(musig_nonce_pool_t *)fi->nonce_pool;
 			if (dpool && fi->n_secnonces > 0) {
 				secp256k1_keypair lsp_kp;
-				secp256k1_keypair_create(global_secp_ctx,
-					&lsp_kp, fi->our_seckey);
+				if (!secp256k1_keypair_create(global_secp_ctx,
+					&lsp_kp, fi->our_seckey))
+					break;
 				secp256k1_musig_secnonce *sn =
 					&dpool->nonces[0].secnonce;
 				secp256k1_musig_partial_sig psig;
@@ -2602,11 +2604,9 @@ static struct command_result *json_factory_close(struct command *cmd,
 	tx_output_t outputs[65];
 	size_t n_outputs = factory_compute_distribution_outputs(
 		factory, outputs, 65, 500);
-	if (n_outputs == 0) {
-		free(pubkeys);
+	if (n_outputs == 0)
 		return command_fail(cmd, LIGHTNINGD,
 				    "Failed to compute close distribution");
-	}
 
 	/* Re-init just node 0 for close signing */
 	factory_session_init_node(factory, 0);
