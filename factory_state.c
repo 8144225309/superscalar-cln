@@ -100,8 +100,11 @@ void ss_factory_add_breach_data(factory_instance_t *fi,
 	epoch_breach_data_t *bd;
 	size_t new_count = fi->n_breach_epochs + 1;
 
-	fi->breach_data = realloc(fi->breach_data,
-				  new_count * sizeof(epoch_breach_data_t));
+	epoch_breach_data_t *tmp = realloc(fi->breach_data,
+				       new_count * sizeof(epoch_breach_data_t));
+	if (!tmp)
+		return;
+	fi->breach_data = tmp;
 	bd = &fi->breach_data[fi->n_breach_epochs];
 
 	bd->epoch = epoch;

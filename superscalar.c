@@ -446,8 +446,8 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 			if (!factory_build_tree(factory)) {
 				plugin_log(plugin_handle, LOG_BROKEN,
 					   "Client: factory_build_tree failed");
-				/* ctx is global */
 				free(factory);
+				free(pubkeys);
 				break;
 			}
 			factory_sessions_init(factory);
@@ -485,6 +485,7 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 			fi->n_secnonces = 0;
 
 			nonce_bundle_t resp;
+			memset(&resp, 0, sizeof(resp));
 			memcpy(resp.instance_id, fi->instance_id, 32);
 			resp.n_participants = nb.n_participants;
 			resp.n_nodes = factory->n_nodes;
@@ -600,6 +601,7 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 			}
 
 			fi->ceremony = CEREMONY_PROPOSED;
+			free(pubkeys);
 			plugin_log(plugin_handle, LOG_INFORM,
 				   "Client: sent NONCE_BUNDLE (%zu bytes)",
 				   4 + rlen);
@@ -952,6 +954,7 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 			fi->n_secnonces = 0;
 
 			nonce_bundle_t resp;
+			memset(&resp, 0, sizeof(resp));
 			memcpy(resp.instance_id, fi->instance_id, 32);
 			resp.n_participants = nb.n_participants;
 			resp.n_nodes = factory->n_nodes;
@@ -1413,6 +1416,7 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 
 			/* Send CLOSE_NONCE */
 			nonce_bundle_t nresp;
+			memset(&nresp, 0, sizeof(nresp));
 			memcpy(nresp.instance_id, fi->instance_id, 32);
 			nresp.n_participants = 2;
 			nresp.n_nodes = 1;
@@ -1446,6 +1450,7 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 				&factory->nodes[0].signing_session)) {
 
 				nonce_bundle_t presp;
+				memset(&presp, 0, sizeof(presp));
 				memcpy(presp.instance_id, fi->instance_id, 32);
 				presp.n_participants = 2;
 				presp.n_nodes = 1;
@@ -2011,7 +2016,8 @@ static struct command_result *json_factory_create(struct command *cmd,
 		if (rc == 0) {
 			plugin_log(plugin_handle, LOG_BROKEN,
 				   "factory_build_tree failed: %d", rc);
-			/* secp context is global, not destroyed */
+			free(factory);
+			free(pubkeys);
 			return command_fail(cmd, LIGHTNINGD,
 					    "Failed to build factory tree");
 		}
@@ -2028,7 +2034,8 @@ static struct command_result *json_factory_create(struct command *cmd,
 		if (rc == 0) {
 			plugin_log(plugin_handle, LOG_BROKEN,
 				   "factory_sessions_init failed");
-			/* secp context is global, not destroyed */
+			free(factory);
+			free(pubkeys);
 			return command_fail(cmd, LIGHTNINGD,
 					    "Failed to init signing sessions");
 		}
@@ -2064,6 +2071,7 @@ static struct command_result *json_factory_create(struct command *cmd,
 						       &pubkeys[0],
 						       NULL)) {
 				free(pool);
+				free(pubkeys);
 				return command_fail(cmd, LIGHTNINGD,
 						    "Failed to generate nonce pool");
 			}
@@ -2157,6 +2165,7 @@ static struct command_result *json_factory_create(struct command *cmd,
 	}
 
 	/* secp context is global, not destroyed */
+	free(pubkeys);
 
 	{
 		char id_hex[65];

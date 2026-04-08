@@ -10,7 +10,9 @@ static void buf_append(uint8_t **buf, size_t *len, size_t *cap,
 {
 	while (*len + n > *cap) {
 		*cap = (*cap == 0) ? 256 : *cap * 2;
-		*buf = realloc(*buf, *cap);
+		uint8_t *tmp = realloc(*buf, *cap);
+		if (!tmp) return;
+		*buf = tmp;
 	}
 	memcpy(*buf + *len, data, n);
 	*len += n;
