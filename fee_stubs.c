@@ -4,10 +4,7 @@
  * fee_should_use_anchor() for tree transaction construction.
  * CLN handles actual fee estimation; these provide sensible defaults. */
 
-#include <stdint.h>
-#include <stddef.h>
-
-typedef struct fee_estimator fee_estimator_t;
+#include <superscalar/fee.h>
 
 uint64_t fee_for_factory_tx(fee_estimator_t *fe, size_t n_outputs)
 {
