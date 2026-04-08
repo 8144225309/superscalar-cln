@@ -45,6 +45,11 @@
 #define SS_SUBMSG_ROTATE_COMPLETE	0x010B
 #define SS_SUBMSG_REVOKE		0x010C
 
+/* Distribution TX ceremony (signed after tree, before FACTORY_READY) */
+#define SS_SUBMSG_DIST_PROPOSE		0x010D
+#define SS_SUBMSG_DIST_NONCE		0x010E
+#define SS_SUBMSG_DIST_PSIG		0x010F
+
 /* Close ceremony */
 #define SS_SUBMSG_CLOSE_PROPOSE		0x0110
 #define SS_SUBMSG_CLOSE_NONCE		0x0111

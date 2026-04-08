@@ -836,26 +836,112 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 				plugin_log(plugin_handle, LOG_BROKEN,
 					   "LSP: factory_sessions_complete failed");
 			} else {
-				fi->ceremony = CEREMONY_COMPLETE;
 				plugin_log(plugin_handle, LOG_INFORM,
-					   "LSP: FACTORY TREE SIGNED! "
-					   "ceremony=complete");
+					   "LSP: FACTORY TREE SIGNED!");
 
-				/* Send FACTORY_READY to all clients */
-				for (size_t ci = 0; ci < fi->n_clients; ci++) {
-					char nid[67];
-					for (int j = 0; j < 33; j++)
-						sprintf(nid + j*2, "%02x",
-							fi->clients[ci].node_id[j]);
-					nid[66] = '\0';
-					send_factory_msg(cmd, nid,
-						SS_SUBMSG_FACTORY_READY,
-						fi->instance_id, 32);
+				/* Build distribution TX (nLockTime fallback).
+				 * This TX lets clients recover funds if LSP
+				 * vanishes — the core SuperScalar safety net. */
+				size_t n_parts = 1 + fi->n_clients;
+				tx_output_t dist_out[65];
+				size_t n_dist = factory_compute_distribution_outputs(
+					f, dist_out, 65, 500);
+
+				if (n_dist > 0 && factory_build_distribution_tx_unsigned(
+					f, dist_out, n_dist,
+					ss_state.current_blockheight + 144 * 90)) {
+					plugin_log(plugin_handle, LOG_INFORM,
+						   "LSP: distribution TX built "
+						   "(%zu outputs, sighash ready)",
+						   n_dist);
+
+					/* Generate nonce for dist TX signing.
+					 * Virtual node idx = f->n_nodes. */
+					secp256k1_context *dctx = global_secp_ctx;
+					unsigned char lsp_sk[32];
+					derive_demo_seckey(lsp_sk, fi->instance_id, 0);
+					secp256k1_pubkey lsp_pk;
+					secp256k1_ec_pubkey_create(dctx, &lsp_pk, lsp_sk);
+
+					musig_nonce_pool_t *dpool = calloc(1,
+						sizeof(musig_nonce_pool_t));
+					musig_nonce_pool_generate(dctx, dpool, 1,
+						lsp_sk, &lsp_pk, NULL);
+
+					secp256k1_musig_secnonce *dsec;
+					secp256k1_musig_pubnonce dpub;
+					musig_nonce_pool_next(dpool, &dsec, &dpub);
+
+					/* Build DIST_PROPOSE payload:
+					 * instance_id(32) + dist_tx_hex_len(4)
+					 * + dist_tx_hex(var) + nonce(66) */
+					uint8_t dpayload[32768];
+					uint8_t *dp = dpayload;
+					memcpy(dp, fi->instance_id, 32); dp += 32;
+					/* TX length */
+					uint32_t txlen = f->dist_unsigned_tx.len;
+					dp[0] = (txlen >> 24) & 0xFF;
+					dp[1] = (txlen >> 16) & 0xFF;
+					dp[2] = (txlen >> 8) & 0xFF;
+					dp[3] = txlen & 0xFF;
+					dp += 4;
+					/* TX data */
+					memcpy(dp, f->dist_unsigned_tx.data, txlen);
+					dp += txlen;
+					/* LSP nonce */
+					musig_pubnonce_serialize(dctx, dp, &dpub);
+					dp += 66;
+
+					size_t dplen = (size_t)(dp - dpayload);
+
+					/* Store dist nonce pool for later signing */
+					/* Reuse nonce_pool — tree signing is done */
+					if (fi->nonce_pool) free(fi->nonce_pool);
+					fi->nonce_pool = dpool;
+					fi->n_secnonces = 1;
+					fi->secnonce_pool_idx[0] = 0;
+					fi->secnonce_node_idx[0] = f->n_nodes;
+
+					/* Send DIST_PROPOSE to all clients */
+					for (size_t ci = 0; ci < fi->n_clients; ci++) {
+						char nid[67];
+						for (int j = 0; j < 33; j++)
+							sprintf(nid + j*2, "%02x",
+								fi->clients[ci].node_id[j]);
+						nid[66] = '\0';
+						send_factory_msg(cmd, nid,
+							SS_SUBMSG_DIST_PROPOSE,
+							dpayload, dplen);
+					}
+
+					/* Reset ceremony tracking for dist round */
+					ss_factory_reset_ceremony(fi);
+					fi->ceremony = CEREMONY_PSIGS_COLLECTED;
+
+					plugin_log(plugin_handle, LOG_INFORM,
+						   "LSP: sent DIST_PROPOSE to %zu "
+						   "clients (%zu bytes)",
+						   fi->n_clients, dplen);
+				} else {
+					/* Distribution TX build failed — proceed
+					 * without it (degraded safety) */
+					plugin_log(plugin_handle, LOG_UNUSUAL,
+						   "LSP: distribution TX build "
+						   "failed, proceeding without");
+					fi->ceremony = CEREMONY_COMPLETE;
+					for (size_t ci = 0; ci < fi->n_clients; ci++) {
+						char nid[67];
+						for (int j = 0; j < 33; j++)
+							sprintf(nid + j*2, "%02x",
+								fi->clients[ci].node_id[j]);
+						nid[66] = '\0';
+						send_factory_msg(cmd, nid,
+							SS_SUBMSG_FACTORY_READY,
+							fi->instance_id, 32);
+					}
+					plugin_log(plugin_handle, LOG_INFORM,
+						   "LSP: sent FACTORY_READY (no dist TX)");
 				}
-				plugin_log(plugin_handle, LOG_INFORM,
-					   "LSP: sent FACTORY_READY to %zu clients"
-					   " — call factory-open-channels to open LN channels",
-					   fi->n_clients);
 			}
 		}
 		break;
@@ -869,6 +955,233 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 		 * open_channel with channel_in_factory TLV.
 		 * Our openchannel hook (handle_openchannel) maps it. */
 		if (fi) fi->ceremony = CEREMONY_COMPLETE;
+		break;
+
+	case SS_SUBMSG_DIST_PROPOSE:
+		plugin_log(plugin_handle, LOG_INFORM,
+			   "DIST_PROPOSE from %s (len=%zu)",
+			   peer_id, len);
+		/* Client: LSP sent unsigned distribution TX + nonce.
+		 * Parse TX, generate nonce, create partial sig, respond. */
+		if (fi && len > 36) {
+			factory_t *f = (factory_t *)fi->lib_factory;
+			if (!f) break;
+			secp256k1_context *ctx = global_secp_ctx;
+			const uint8_t *dp = data + 32; /* skip instance_id */
+			size_t rem = len - 32;
+
+			/* Parse TX length + data */
+			if (rem < 4) break;
+			uint32_t txlen = ((uint32_t)dp[0] << 24) |
+				((uint32_t)dp[1] << 16) |
+				((uint32_t)dp[2] << 8) | dp[3];
+			dp += 4; rem -= 4;
+			if (rem < txlen + 66) break;
+
+			/* Store unsigned dist TX in factory */
+			tx_buf_init(&f->dist_unsigned_tx, txlen);
+			memcpy(f->dist_unsigned_tx.data, dp, txlen);
+			f->dist_unsigned_tx.len = txlen;
+			f->dist_tx_ready = 1;
+			dp += txlen; rem -= txlen;
+
+			/* Parse LSP nonce */
+			secp256k1_musig_pubnonce lsp_nonce;
+			musig_pubnonce_parse(ctx, &lsp_nonce, dp);
+
+			/* Generate our nonce for dist TX */
+			int our_idx = fi->our_participant_idx;
+			unsigned char our_sec[32];
+			derive_demo_seckey(our_sec, fi->instance_id, our_idx);
+			secp256k1_pubkey our_pub;
+			if (!secp256k1_ec_pubkey_create(ctx, &our_pub, our_sec))
+				break;
+
+			if (fi->nonce_pool) free(fi->nonce_pool);
+			musig_nonce_pool_t *pool = calloc(1,
+				sizeof(musig_nonce_pool_t));
+			musig_nonce_pool_generate(ctx, pool, 1,
+				our_sec, &our_pub, NULL);
+			fi->nonce_pool = pool;
+			fi->n_secnonces = 0;
+
+			secp256k1_musig_secnonce *sec;
+			secp256k1_musig_pubnonce pub;
+			musig_nonce_pool_next(pool, &sec, &pub);
+			fi->secnonce_pool_idx[0] = 0;
+			fi->secnonce_node_idx[0] = f->n_nodes;
+			fi->n_secnonces = 1;
+
+			/* Init signing session for dist TX (virtual node) */
+			uint32_t dist_idx = f->n_nodes;
+			factory_session_init_node(f, dist_idx);
+			factory_session_set_nonce(f, dist_idx, 0, &lsp_nonce);
+			factory_session_set_nonce(f, dist_idx, our_idx, &pub);
+
+			/* Send DIST_NONCE */
+			nonce_bundle_t nresp;
+			memset(&nresp, 0, sizeof(nresp));
+			memcpy(nresp.instance_id, fi->instance_id, 32);
+			nresp.n_participants = 1 + fi->n_clients;
+			nresp.n_nodes = 1;
+			nresp.n_entries = 1;
+			nresp.entries[0].node_idx = dist_idx;
+			nresp.entries[0].signer_slot = our_idx;
+			musig_pubnonce_serialize(ctx,
+				nresp.entries[0].pubnonce, &pub);
+
+			uint8_t nbuf[32768];
+			size_t nlen = nonce_bundle_serialize(&nresp,
+				nbuf, sizeof(nbuf));
+			send_factory_msg(cmd, peer_id,
+				SS_SUBMSG_DIST_NONCE, nbuf, nlen);
+
+			/* Finalize and create partial sig */
+			if (factory_session_finalize_node(f, dist_idx)) {
+				secp256k1_keypair kp;
+				secp256k1_keypair_create(ctx, &kp, our_sec);
+				secp256k1_musig_partial_sig psig;
+				if (musig_create_partial_sig(ctx, &psig, sec,
+					&kp, &f->nodes[dist_idx].signing_session)) {
+
+					nonce_bundle_t presp;
+					memset(&presp, 0, sizeof(presp));
+					memcpy(presp.instance_id, fi->instance_id, 32);
+					presp.n_participants = nresp.n_participants;
+					presp.n_nodes = 1;
+					presp.n_entries = 1;
+					presp.entries[0].node_idx = dist_idx;
+					presp.entries[0].signer_slot = our_idx;
+					musig_partial_sig_serialize(ctx,
+						presp.entries[0].pubnonce, &psig);
+
+					uint8_t pbuf[32768];
+					size_t plen = nonce_bundle_serialize(
+						&presp, pbuf, sizeof(pbuf));
+					send_factory_msg(cmd, peer_id,
+						SS_SUBMSG_DIST_PSIG, pbuf, plen);
+
+					plugin_log(plugin_handle, LOG_INFORM,
+						   "Client: sent DIST_NONCE + DIST_PSIG");
+				}
+			}
+		}
+		break;
+
+	case SS_SUBMSG_DIST_NONCE:
+		plugin_log(plugin_handle, LOG_INFORM,
+			   "DIST_NONCE from %s (len=%zu)", peer_id, len);
+		/* LSP: client sent dist nonce — set on session */
+		if (fi && fi->is_lsp) {
+			nonce_bundle_t cnb;
+			if (!nonce_bundle_deserialize(&cnb, data, len))
+				break;
+			factory_t *f = (factory_t *)fi->lib_factory;
+			if (!f) break;
+			for (size_t e = 0; e < cnb.n_entries; e++) {
+				secp256k1_musig_pubnonce pn;
+				musig_pubnonce_parse(global_secp_ctx, &pn,
+					cnb.entries[e].pubnonce);
+				factory_session_set_nonce(f,
+					cnb.entries[e].node_idx,
+					cnb.entries[e].signer_slot, &pn);
+			}
+			plugin_log(plugin_handle, LOG_INFORM,
+				   "LSP: dist nonces set");
+
+			/* Finalize dist signing session */
+			uint32_t dist_idx = f->n_nodes;
+			if (!factory_session_finalize_node(f, dist_idx))
+				plugin_log(plugin_handle, LOG_BROKEN,
+					   "LSP: dist finalize failed");
+		}
+		break;
+
+	case SS_SUBMSG_DIST_PSIG:
+		plugin_log(plugin_handle, LOG_INFORM,
+			   "DIST_PSIG from %s (len=%zu)", peer_id, len);
+		/* LSP: client sent dist partial sig — complete and send FACTORY_READY */
+		if (fi && fi->is_lsp) {
+			nonce_bundle_t pnb;
+			if (!nonce_bundle_deserialize(&pnb, data, len))
+				break;
+			factory_t *f = (factory_t *)fi->lib_factory;
+			if (!f) break;
+
+			/* Set client psig */
+			for (size_t e = 0; e < pnb.n_entries; e++) {
+				secp256k1_musig_partial_sig ps;
+				musig_partial_sig_parse(global_secp_ctx,
+					&ps, pnb.entries[e].pubnonce);
+				factory_session_set_partial_sig(f,
+					pnb.entries[e].node_idx,
+					pnb.entries[e].signer_slot, &ps);
+			}
+
+			/* Create LSP's own dist psig */
+			uint32_t dist_idx = f->n_nodes;
+			musig_nonce_pool_t *dpool =
+				(musig_nonce_pool_t *)fi->nonce_pool;
+			if (dpool && fi->n_secnonces > 0) {
+				secp256k1_keypair lsp_kp;
+				secp256k1_keypair_create(global_secp_ctx,
+					&lsp_kp, fi->our_seckey);
+				secp256k1_musig_secnonce *sn =
+					&dpool->nonces[0].secnonce;
+				secp256k1_musig_partial_sig psig;
+				if (musig_create_partial_sig(global_secp_ctx,
+					&psig, sn, &lsp_kp,
+					&f->nodes[dist_idx].signing_session)) {
+					int slot = factory_find_signer_slot(
+						f, dist_idx, 0);
+					if (slot >= 0)
+						factory_session_set_partial_sig(
+							f, dist_idx, (size_t)slot,
+							&psig);
+				}
+			}
+
+			/* Complete dist signing */
+			if (factory_session_complete_node(f, dist_idx)) {
+				f->dist_tx_ready = 2; /* signed */
+				fi->ceremony = CEREMONY_COMPLETE;
+				plugin_log(plugin_handle, LOG_INFORM,
+					   "LSP: DISTRIBUTION TX SIGNED! "
+					   "ceremony=complete");
+
+				/* NOW send FACTORY_READY */
+				for (size_t ci = 0; ci < fi->n_clients; ci++) {
+					char nid[67];
+					for (int j = 0; j < 33; j++)
+						sprintf(nid + j*2, "%02x",
+							fi->clients[ci].node_id[j]);
+					nid[66] = '\0';
+					send_factory_msg(cmd, nid,
+						SS_SUBMSG_FACTORY_READY,
+						fi->instance_id, 32);
+				}
+				plugin_log(plugin_handle, LOG_INFORM,
+					   "LSP: sent FACTORY_READY to %zu "
+					   "clients (with signed dist TX)"
+					   " — call factory-open-channels",
+					   fi->n_clients);
+			} else {
+				plugin_log(plugin_handle, LOG_BROKEN,
+					   "LSP: dist session_complete failed, "
+					   "sending FACTORY_READY anyway");
+				fi->ceremony = CEREMONY_COMPLETE;
+				for (size_t ci = 0; ci < fi->n_clients; ci++) {
+					char nid[67];
+					for (int j = 0; j < 33; j++)
+						sprintf(nid + j*2, "%02x",
+							fi->clients[ci].node_id[j]);
+					nid[66] = '\0';
+					send_factory_msg(cmd, nid,
+						SS_SUBMSG_FACTORY_READY,
+						fi->instance_id, 32);
+				}
+			}
+		}
 		break;
 
 	case SS_SUBMSG_ROTATE_PROPOSE:
@@ -2283,27 +2596,16 @@ static struct command_result *json_factory_close(struct command *cmd,
 	secp256k1_context *ctx = global_secp_ctx;
 	size_t n_participants = 1 + fi->n_clients;
 
-	/* Build output distribution: split equally (demo) */
-	uint64_t total_sats = 1000000; /* from factory creation */
-	uint64_t per_participant = total_sats / n_participants;
-	tx_output_t outputs[8];
-	for (size_t k = 0; k < n_participants && k < 8; k++) {
-		outputs[k].amount_sats = per_participant;
-		/* P2TR output: OP_1 <32-byte x-only key> */
-		unsigned char sk[32];
-		derive_demo_seckey(sk, fi->instance_id, (int)k);
-		secp256k1_pubkey pk;
-		if (!secp256k1_ec_pubkey_create(ctx, &pk, sk))
-			return command_fail(cmd, LIGHTNINGD, "Bad close pubkey");
-		secp256k1_xonly_pubkey xpk;
-		if (!secp256k1_xonly_pubkey_from_pubkey(ctx, &xpk, NULL, &pk))
-			return command_fail(cmd, LIGHTNINGD, "Bad xonly key");
-		unsigned char xpk_ser[32];
-		secp256k1_xonly_pubkey_serialize(ctx, xpk_ser, &xpk);
-		outputs[k].script_pubkey[0] = 0x51; /* OP_1 */
-		outputs[k].script_pubkey[1] = 0x20; /* PUSH 32 */
-		memcpy(outputs[k].script_pubkey + 2, xpk_ser, 32);
-		outputs[k].script_pubkey_len = 34;
+	/* Build output distribution using the library's balance-aware
+	 * function. Falls back to equal split if no client amounts
+	 * are provided (NULL). Fee set to 500 sats. */
+	tx_output_t outputs[65];
+	size_t n_outputs = factory_compute_distribution_outputs(
+		factory, outputs, 65, 500);
+	if (n_outputs == 0) {
+		free(pubkeys);
+		return command_fail(cmd, LIGHTNINGD,
+				    "Failed to compute close distribution");
 	}
 
 	/* Re-init just node 0 for close signing */
@@ -2338,9 +2640,9 @@ static struct command_result *json_factory_close(struct command *cmd,
 	 * + nonce_bundle */
 	uint8_t payload[4096];
 	uint8_t *p = payload;
-	p[0] = 0; p[1] = 0; p[2] = 0; p[3] = (uint8_t)n_participants;
+	p[0] = 0; p[1] = 0; p[2] = 0; p[3] = (uint8_t)n_outputs;
 	p += 4;
-	for (size_t k = 0; k < n_participants; k++) {
+	for (size_t k = 0; k < n_outputs; k++) {
 		uint64_t amt = outputs[k].amount_sats;
 		p[0] = (amt >> 56) & 0xFF; p[1] = (amt >> 48) & 0xFF;
 		p[2] = (amt >> 40) & 0xFF; p[3] = (amt >> 32) & 0xFF;
