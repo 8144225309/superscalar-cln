@@ -43,6 +43,14 @@ static secp256k1_context *global_secp_ctx;
 #define BLIP56_SUBMSG_SUPPORTED_PROTOCOLS	2
 #define BLIP56_SUBMSG_FACTORY_PIGGYBACK		4
 
+/* Configurable factory parameters */
+#define DEFAULT_FUNDING_SATS		500000	   /* Per-channel funding amount */
+#define DEFAULT_FACTORY_FUNDING_SATS	1000000	   /* Total factory funding */
+#define DW_STEP_BLOCKS			144	   /* Blocks between DW states (~1 day) */
+#define DIST_TX_LOCKTIME_DAYS		90	   /* nLockTime for distribution TX */
+#define MAX_DIST_OUTPUTS		65	   /* Max outputs in distribution TX */
+#define MAX_WIRE_BUF			32768	   /* Wire message buffer size */
+
 /* SuperScalar protocol ID: first 32 bytes of "SuperScalar/v1" zero-padded */
 static const uint8_t SUPERSCALAR_PROTOCOL_ID[32] = {
 	'S','u','p','e','r','S','c','a','l','a','r','/','v','1',
@@ -273,7 +281,7 @@ static struct command_result *fundchannel_start_ok(struct command *cmd,
 
 	/* Funding amount: half of factory total for 2 participants (demo) */
 	struct amount_sat funding_amt;
-	funding_amt.satoshis = 500000; /* raw: .satoshis */
+	funding_amt.satoshis = DEFAULT_FUNDING_SATS;
 
 	plugin_log(plugin_handle, LOG_INFORM,
 		   "fundchannel_start ok for client %zu, building PSBT "
@@ -333,7 +341,12 @@ static void open_factory_channels(struct command *cmd,
 			"fundchannel_start",
 			fundchannel_start_ok, rpc_err, ctx);
 		json_add_string(req->js, "id", nid);
-		json_add_string(req->js, "amount", "500000sat");
+		{
+			char amt_str[32];
+			snprintf(amt_str, sizeof(amt_str), "%usat",
+				 DEFAULT_FUNDING_SATS);
+			json_add_string(req->js, "amount", amt_str);
+		}
 		json_add_bool(req->js, "announce", false);
 		json_add_u32(req->js, "mindepth", 0);
 		json_add_string(req->js, "factory_protocol_id", proto_hex);
@@ -345,6 +358,91 @@ static void open_factory_channels(struct command *cmd,
 			   "Opening factory channel with client %zu (%s)",
 			   ci, nid);
 	}
+}
+
+/* Complete rotation: send REVOKE for old epoch, ROTATE_COMPLETE,
+ * and trigger factory-change on open channels. Called after both
+ * rotation tree and distribution TX are signed. */
+static void rotate_finish_and_notify(struct command *cmd,
+				     factory_instance_t *fi)
+{
+	factory_t *f = (factory_t *)fi->lib_factory;
+	if (!f) return;
+
+	fi->ceremony = CEREMONY_ROTATE_COMPLETE;
+	fi->rotation_in_progress = false;
+
+	/* Send revocation secret for old epoch */
+	uint32_t old_ep = fi->epoch - 1;
+	unsigned char rev_secret[32];
+	if (factory_get_revocation_secret(f, old_ep, rev_secret)) {
+		uint8_t rev_payload[36];
+		rev_payload[0] = (old_ep >> 24) & 0xFF;
+		rev_payload[1] = (old_ep >> 16) & 0xFF;
+		rev_payload[2] = (old_ep >> 8) & 0xFF;
+		rev_payload[3] = old_ep & 0xFF;
+		memcpy(rev_payload + 4, rev_secret, 32);
+
+		for (size_t ci = 0; ci < fi->n_clients; ci++) {
+			char nid[67];
+			for (int j = 0; j < 33; j++)
+				sprintf(nid + j*2, "%02x",
+					fi->clients[ci].node_id[j]);
+			nid[66] = '\0';
+			send_factory_msg(cmd, nid,
+				SS_SUBMSG_REVOKE, rev_payload, 36);
+		}
+		plugin_log(plugin_handle, LOG_INFORM,
+			   "LSP: sent REVOKE for epoch %u", old_ep);
+	}
+
+	/* Send ROTATE_COMPLETE to clients */
+	for (size_t ci = 0; ci < fi->n_clients; ci++) {
+		char nid[67];
+		for (int j = 0; j < 33; j++)
+			sprintf(nid + j*2, "%02x",
+				fi->clients[ci].node_id[j]);
+		nid[66] = '\0';
+		send_factory_msg(cmd, nid,
+			SS_SUBMSG_ROTATE_COMPLETE,
+			fi->instance_id, 32);
+	}
+
+	/* Trigger factory-change on open channels */
+	if (fi->n_channels > 0) {
+		for (size_t ch = 0; ch < fi->n_channels; ch++) {
+			char cid_hex[65];
+			for (int j = 0; j < 32; j++)
+				sprintf(cid_hex + j*2, "%02x",
+					fi->channels[ch].channel_id[j]);
+
+			char txid_hex[65];
+			size_t leaf_idx = fi->channels[ch].leaf_index;
+			if (leaf_idx < f->n_nodes) {
+				for (int j = 0; j < 32; j++)
+					sprintf(txid_hex + j*2, "%02x",
+						f->nodes[leaf_idx].txid[31-j]);
+			} else {
+				memset(txid_hex, '0', 64);
+			}
+			txid_hex[64] = '\0';
+
+			struct out_req *creq = jsonrpc_request_start(
+				cmd, "factory-change",
+				rpc_done, rpc_err, fi);
+			json_add_string(creq->js, "channel_id", cid_hex);
+			json_add_string(creq->js, "new_funding_txid", txid_hex);
+			json_add_u32(creq->js, "new_funding_outnum", 0);
+			send_outreq(creq);
+
+			plugin_log(plugin_handle, LOG_INFORM,
+				   "LSP: triggered factory-change on channel %zu",
+				   ch);
+		}
+	}
+
+	plugin_log(plugin_handle, LOG_INFORM,
+		   "LSP: ROTATION COMPLETE epoch=%u", fi->epoch);
 }
 
 /* Dispatch SuperScalar protocol submessages.
@@ -431,7 +529,7 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 			factory_t *factory = calloc(1, sizeof(factory_t));
 			factory_init_from_pubkeys(factory, ctx,
 				pubkeys, nb.n_participants,
-				144, 16);
+				DW_STEP_BLOCKS, 16);
 			if (nb.n_participants <= 2)
 				factory_set_arity(factory, FACTORY_ARITY_1);
 			else
@@ -442,7 +540,8 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 			synth_spk[0] = 0x51; synth_spk[1] = 0x20;
 			memset(synth_spk + 2, 0xAA, 32);
 			factory_set_funding(factory, synth_txid, 0,
-					    1000000, synth_spk, 34);
+					    DEFAULT_FACTORY_FUNDING_SATS,
+					    synth_spk, 34);
 
 			if (!factory_build_tree(factory)) {
 				plugin_log(plugin_handle, LOG_BROKEN,
@@ -524,7 +623,7 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 				   resp.n_entries);
 
 			/* Serialize and send NONCE_BUNDLE back to LSP */
-			uint8_t rbuf[32768];
+			uint8_t rbuf[MAX_WIRE_BUF];
 			size_t rlen = nonce_bundle_serialize(&resp,
 				rbuf, sizeof(rbuf));
 			send_factory_msg(cmd, peer_id,
@@ -588,7 +687,7 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 						   psig_nb.n_entries);
 
 					/* Send PSIG_BUNDLE to LSP */
-					uint8_t pbuf[32768];
+					uint8_t pbuf[MAX_WIRE_BUF];
 					size_t plen = nonce_bundle_serialize(
 						&psig_nb, pbuf, sizeof(pbuf));
 					send_factory_msg(cmd, peer_id,
@@ -842,13 +941,13 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 				/* Build distribution TX (nLockTime fallback).
 				 * This TX lets clients recover funds if LSP
 				 * vanishes — the core SuperScalar safety net. */
-				tx_output_t dist_out[65];
+				tx_output_t dist_out[MAX_DIST_OUTPUTS];
 				size_t n_dist = factory_compute_distribution_outputs(
-					f, dist_out, 65, 500);
+					f, dist_out, MAX_DIST_OUTPUTS, 500);
 
 				if (n_dist > 0 && factory_build_distribution_tx_unsigned(
 					f, dist_out, n_dist,
-					ss_state.current_blockheight + 144 * 90)) {
+					ss_state.current_blockheight + DW_STEP_BLOCKS * DIST_TX_LOCKTIME_DAYS)) {
 					plugin_log(plugin_handle, LOG_INFORM,
 						   "LSP: distribution TX built "
 						   "(%zu outputs, sighash ready)",
@@ -856,6 +955,7 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 
 					/* Generate nonce for dist TX signing.
 					 * Virtual node idx = f->n_nodes. */
+					uint32_t dist_node_idx = f->n_nodes;
 					secp256k1_context *dctx = global_secp_ctx;
 					unsigned char lsp_sk[32];
 					derive_demo_seckey(lsp_sk, fi->instance_id, 0);
@@ -872,10 +972,16 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 					secp256k1_musig_pubnonce dpub;
 					musig_nonce_pool_next(dpool, &dsec, &dpub);
 
+					/* Init MuSig2 signing session for dist TX
+					 * virtual node and set LSP's own nonce */
+					factory_session_init_node(f, dist_node_idx);
+					factory_session_set_nonce(f, dist_node_idx,
+						0, &dpub);
+
 					/* Build DIST_PROPOSE payload:
 					 * instance_id(32) + dist_tx_hex_len(4)
 					 * + dist_tx_hex(var) + nonce(66) */
-					uint8_t dpayload[32768];
+					uint8_t dpayload[MAX_WIRE_BUF];
 					uint8_t *dp = dpayload;
 					memcpy(dp, fi->instance_id, 32); dp += 32;
 					/* TX length */
@@ -1030,7 +1136,7 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 			musig_pubnonce_serialize(ctx,
 				nresp.entries[0].pubnonce, &pub);
 
-			uint8_t nbuf[32768];
+			uint8_t nbuf[MAX_WIRE_BUF];
 			size_t nlen = nonce_bundle_serialize(&nresp,
 				nbuf, sizeof(nbuf));
 			send_factory_msg(cmd, peer_id,
@@ -1056,7 +1162,7 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 					musig_partial_sig_serialize(ctx,
 						presp.entries[0].pubnonce, &psig);
 
-					uint8_t pbuf[32768];
+					uint8_t pbuf[MAX_WIRE_BUF];
 					size_t plen = nonce_bundle_serialize(
 						&presp, pbuf, sizeof(pbuf));
 					send_factory_msg(cmd, peer_id,
@@ -1146,41 +1252,48 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 			/* Complete dist signing */
 			if (factory_session_complete_node(f, dist_idx)) {
 				f->dist_tx_ready = 2; /* signed */
-				fi->ceremony = CEREMONY_COMPLETE;
 				plugin_log(plugin_handle, LOG_INFORM,
-					   "LSP: DISTRIBUTION TX SIGNED! "
-					   "ceremony=complete");
+					   "LSP: DISTRIBUTION TX SIGNED!");
 
-				/* NOW send FACTORY_READY */
-				for (size_t ci = 0; ci < fi->n_clients; ci++) {
-					char nid[67];
-					for (int j = 0; j < 33; j++)
-						sprintf(nid + j*2, "%02x",
-							fi->clients[ci].node_id[j]);
-					nid[66] = '\0';
-					send_factory_msg(cmd, nid,
-						SS_SUBMSG_FACTORY_READY,
-						fi->instance_id, 32);
+				if (fi->rotation_in_progress) {
+					/* Rotation dist TX done — finish rotation */
+					rotate_finish_and_notify(cmd, fi);
+				} else {
+					/* Creation dist TX done — send FACTORY_READY */
+					fi->ceremony = CEREMONY_COMPLETE;
+					for (size_t ci = 0; ci < fi->n_clients; ci++) {
+						char nid[67];
+						for (int j = 0; j < 33; j++)
+							sprintf(nid + j*2, "%02x",
+								fi->clients[ci].node_id[j]);
+						nid[66] = '\0';
+						send_factory_msg(cmd, nid,
+							SS_SUBMSG_FACTORY_READY,
+							fi->instance_id, 32);
+					}
+					plugin_log(plugin_handle, LOG_INFORM,
+						   "LSP: sent FACTORY_READY to %zu "
+						   "clients (with signed dist TX)"
+						   " — call factory-open-channels",
+						   fi->n_clients);
 				}
-				plugin_log(plugin_handle, LOG_INFORM,
-					   "LSP: sent FACTORY_READY to %zu "
-					   "clients (with signed dist TX)"
-					   " — call factory-open-channels",
-					   fi->n_clients);
 			} else {
 				plugin_log(plugin_handle, LOG_BROKEN,
-					   "LSP: dist session_complete failed, "
-					   "sending FACTORY_READY anyway");
-				fi->ceremony = CEREMONY_COMPLETE;
-				for (size_t ci = 0; ci < fi->n_clients; ci++) {
-					char nid[67];
-					for (int j = 0; j < 33; j++)
-						sprintf(nid + j*2, "%02x",
-							fi->clients[ci].node_id[j]);
-					nid[66] = '\0';
-					send_factory_msg(cmd, nid,
-						SS_SUBMSG_FACTORY_READY,
-						fi->instance_id, 32);
+					   "LSP: dist session_complete failed");
+				if (fi->rotation_in_progress) {
+					rotate_finish_and_notify(cmd, fi);
+				} else {
+					fi->ceremony = CEREMONY_COMPLETE;
+					for (size_t ci = 0; ci < fi->n_clients; ci++) {
+						char nid[67];
+						for (int j = 0; j < 33; j++)
+							sprintf(nid + j*2, "%02x",
+								fi->clients[ci].node_id[j]);
+						nid[66] = '\0';
+						send_factory_msg(cmd, nid,
+							SS_SUBMSG_FACTORY_READY,
+							fi->instance_id, 32);
+					}
 				}
 			}
 		}
@@ -1303,7 +1416,7 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 			}
 
 			/* Send ROTATE_NONCE */
-			uint8_t rbuf[32768];
+			uint8_t rbuf[MAX_WIRE_BUF];
 			size_t rlen = nonce_bundle_serialize(&resp,
 				rbuf, sizeof(rbuf));
 			send_factory_msg(cmd, peer_id,
@@ -1361,7 +1474,7 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 			}
 
 			/* Send ROTATE_PSIG */
-			uint8_t pbuf[32768];
+			uint8_t pbuf[MAX_WIRE_BUF];
 			size_t plen = nonce_bundle_serialize(&psig_nb,
 				pbuf, sizeof(pbuf));
 			send_factory_msg(cmd, peer_id,
@@ -1493,23 +1606,72 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 				plugin_log(plugin_handle, LOG_BROKEN,
 					   "LSP: rotate sessions_complete failed");
 			} else {
-				fi->ceremony = CEREMONY_ROTATE_COMPLETE;
 				plugin_log(plugin_handle, LOG_INFORM,
-					   "LSP: ROTATION SIGNED! epoch=%u",
+					   "LSP: ROTATION TREE SIGNED! epoch=%u",
 					   fi->epoch);
 
-				/* Send revocation secret for old epoch */
-				uint32_t old_ep = fi->epoch - 1;
-				unsigned char rev_secret[32];
-				if (factory_get_revocation_secret(f, old_ep,
-								  rev_secret)) {
-					uint8_t rev_payload[36];
-					rev_payload[0] = (old_ep >> 24) & 0xFF;
-					rev_payload[1] = (old_ep >> 16) & 0xFF;
-					rev_payload[2] = (old_ep >> 8) & 0xFF;
-					rev_payload[3] = old_ep & 0xFF;
-					memcpy(rev_payload + 4, rev_secret, 32);
+				/* Build new distribution TX for rotated tree */
+				fi->rotation_in_progress = true;
+				tx_output_t rot_dist_out[MAX_DIST_OUTPUTS];
+				size_t n_rdist = factory_compute_distribution_outputs(
+					f, rot_dist_out, MAX_DIST_OUTPUTS, 500);
 
+				if (n_rdist > 0 && factory_build_distribution_tx_unsigned(
+					f, rot_dist_out, n_rdist,
+					ss_state.current_blockheight + DW_STEP_BLOCKS * DIST_TX_LOCKTIME_DAYS)) {
+					plugin_log(plugin_handle, LOG_INFORM,
+						   "LSP: rotate dist TX built "
+						   "(%zu outputs)", n_rdist);
+
+					/* Generate nonce for dist TX */
+					uint32_t rdist_idx = f->n_nodes;
+					secp256k1_context *rdctx = global_secp_ctx;
+					unsigned char rlsp_sk[32];
+					derive_demo_seckey(rlsp_sk, fi->instance_id, 0);
+					secp256k1_pubkey rlsp_pk;
+					if (!secp256k1_ec_pubkey_create(rdctx,
+						&rlsp_pk, rlsp_sk))
+						break;
+
+					musig_nonce_pool_t *rdpool = calloc(1,
+						sizeof(musig_nonce_pool_t));
+					musig_nonce_pool_generate(rdctx, rdpool, 1,
+						rlsp_sk, &rlsp_pk, NULL);
+
+					secp256k1_musig_secnonce *rdsec;
+					secp256k1_musig_pubnonce rdpub;
+					musig_nonce_pool_next(rdpool, &rdsec, &rdpub);
+
+					/* Init session for dist TX virtual node */
+					factory_session_init_node(f, rdist_idx);
+					factory_session_set_nonce(f, rdist_idx,
+						0, &rdpub);
+
+					/* Build DIST_PROPOSE payload */
+					uint8_t rdpayload[MAX_WIRE_BUF];
+					uint8_t *rdp = rdpayload;
+					memcpy(rdp, fi->instance_id, 32); rdp += 32;
+					uint32_t rtxlen = f->dist_unsigned_tx.len;
+					rdp[0] = (rtxlen >> 24) & 0xFF;
+					rdp[1] = (rtxlen >> 16) & 0xFF;
+					rdp[2] = (rtxlen >> 8) & 0xFF;
+					rdp[3] = rtxlen & 0xFF;
+					rdp += 4;
+					memcpy(rdp, f->dist_unsigned_tx.data, rtxlen);
+					rdp += rtxlen;
+					musig_pubnonce_serialize(rdctx,
+						rdp, &rdpub);
+					rdp += 66;
+					size_t rdplen = (size_t)(rdp - rdpayload);
+
+					/* Store nonce pool for dist signing */
+					if (fi->nonce_pool) free(fi->nonce_pool);
+					fi->nonce_pool = rdpool;
+					fi->n_secnonces = 1;
+					fi->secnonce_pool_idx[0] = 0;
+					fi->secnonce_node_idx[0] = f->n_nodes;
+
+					/* Send DIST_PROPOSE to clients */
 					for (size_t ci = 0; ci < fi->n_clients; ci++) {
 						char nid[67];
 						for (int j = 0; j < 33; j++)
@@ -1517,60 +1679,22 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 								fi->clients[ci].node_id[j]);
 						nid[66] = '\0';
 						send_factory_msg(cmd, nid,
-							SS_SUBMSG_REVOKE,
-							rev_payload, 36);
+							SS_SUBMSG_DIST_PROPOSE,
+							rdpayload, rdplen);
 					}
+
+					ss_factory_reset_ceremony(fi);
+					fi->ceremony = CEREMONY_PSIGS_COLLECTED;
 					plugin_log(plugin_handle, LOG_INFORM,
-						   "LSP: sent REVOKE for epoch %u",
-						   old_ep);
-				}
-
-				/* Send ROTATE_COMPLETE to clients */
-				for (size_t ci = 0; ci < fi->n_clients; ci++) {
-					char nid[67];
-					for (int j = 0; j < 33; j++)
-						sprintf(nid + j*2, "%02x",
-							fi->clients[ci].node_id[j]);
-					nid[66] = '\0';
-					send_factory_msg(cmd, nid,
-						SS_SUBMSG_ROTATE_COMPLETE,
-						fi->instance_id, 32);
-				}
-
-				/* Trigger factory-change on open channels
-				 * to update their funding outpoint */
-				factory_t *rf = (factory_t *)fi->lib_factory;
-				if (rf && fi->n_channels > 0) {
-					for (size_t ch = 0; ch < fi->n_channels; ch++) {
-						char cid_hex[65];
-						for (int j = 0; j < 32; j++)
-							sprintf(cid_hex + j*2, "%02x",
-								fi->channels[ch].channel_id[j]);
-
-						/* Get new leaf txid */
-						char txid_hex[65];
-						size_t leaf_idx = fi->channels[ch].leaf_index;
-						if (leaf_idx < rf->n_nodes) {
-							for (int j = 0; j < 32; j++)
-								sprintf(txid_hex + j*2, "%02x",
-									rf->nodes[leaf_idx].txid[31-j]);
-						} else {
-							memset(txid_hex, '0', 64);
-						}
-						txid_hex[64] = '\0';
-
-						struct out_req *creq = jsonrpc_request_start(
-							cmd, "factory-change",
-							rpc_done, rpc_err, fi);
-						json_add_string(creq->js, "channel_id", cid_hex);
-						json_add_string(creq->js, "new_funding_txid", txid_hex);
-						json_add_u32(creq->js, "new_funding_outnum", 0);
-						send_outreq(creq);
-
-						plugin_log(plugin_handle, LOG_INFORM,
-							   "LSP: triggered factory-change on channel %zu",
-							   ch);
-					}
+						   "LSP: sent rotate DIST_PROPOSE "
+						   "to %zu clients (%zu bytes)",
+						   fi->n_clients, rdplen);
+				} else {
+					/* Dist TX failed — proceed without */
+					plugin_log(plugin_handle, LOG_UNUSUAL,
+						   "LSP: rotate dist TX failed, "
+						   "completing without");
+					rotate_finish_and_notify(cmd, fi);
 				}
 			}
 		}
@@ -1742,7 +1866,7 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 			musig_pubnonce_serialize(ctx,
 				nresp.entries[0].pubnonce, &pub);
 
-			uint8_t nbuf[32768];
+			uint8_t nbuf[MAX_WIRE_BUF];
 			size_t nlen = nonce_bundle_serialize(&nresp,
 				nbuf, sizeof(nbuf));
 			send_factory_msg(cmd, peer_id,
@@ -1776,7 +1900,7 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 				musig_partial_sig_serialize(ctx,
 					presp.entries[0].pubnonce, &psig);
 
-				uint8_t pbuf[32768];
+				uint8_t pbuf[MAX_WIRE_BUF];
 				size_t plen = nonce_bundle_serialize(&presp,
 					pbuf, sizeof(pbuf));
 				send_factory_msg(cmd, peer_id,
@@ -1881,6 +2005,23 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 				fi->lifecycle = FACTORY_LIFECYCLE_EXPIRED;
 				plugin_log(plugin_handle, LOG_INFORM,
 					   "LSP: COOPERATIVE CLOSE SIGNED!");
+
+				/* Broadcast the close TX (node 0) */
+				tx_buf_t *ctx_buf = &f->nodes[0].signed_tx;
+				if (ctx_buf->data && ctx_buf->len > 0) {
+					char *ctx_hex = tal_arr(cmd, char,
+						ctx_buf->len * 2 + 1);
+					for (size_t h = 0; h < ctx_buf->len; h++)
+						sprintf(ctx_hex + h*2, "%02x",
+							ctx_buf->data[h]);
+					struct out_req *btx = jsonrpc_request_start(
+						cmd, "sendrawtransaction",
+						rpc_done, rpc_err, fi);
+					json_add_string(btx->js, "tx", ctx_hex);
+					send_outreq(btx);
+					plugin_log(plugin_handle, LOG_INFORM,
+						   "LSP: broadcast cooperative close TX");
+				}
 
 				/* Send CLOSE_DONE */
 				for (size_t ci = 0; ci < fi->n_clients; ci++) {
@@ -2303,7 +2444,7 @@ static struct command_result *json_factory_create(struct command *cmd,
 		/* Initialize factory with derived pubkeys */
 		factory_init_from_pubkeys(factory, secp_ctx,
 					  pubkeys, n_total,
-					  144, /* step_blocks: 1 day */
+					  DW_STEP_BLOCKS,
 					  16); /* states_per_layer */
 
 		/* Set arity: 1 client/leaf for 2 participants, 2 for more */
@@ -2454,7 +2595,7 @@ static struct command_result *json_factory_create(struct command *cmd,
 				   (size_t)factory->n_nodes);
 
 			/* Serialize the nonce bundle */
-			uint8_t nbuf[32768];
+			uint8_t nbuf[MAX_WIRE_BUF];
 			size_t blen = nonce_bundle_serialize(&nb, nbuf,
 							     sizeof(nbuf));
 			plugin_log(plugin_handle, LOG_INFORM,
@@ -2601,9 +2742,9 @@ static struct command_result *json_factory_close(struct command *cmd,
 	/* Build output distribution using the library's balance-aware
 	 * function. Falls back to equal split if no client amounts
 	 * are provided (NULL). Fee set to 500 sats. */
-	tx_output_t outputs[65];
+	tx_output_t outputs[MAX_DIST_OUTPUTS];
 	size_t n_outputs = factory_compute_distribution_outputs(
-		factory, outputs, 65, 500);
+		factory, outputs, MAX_DIST_OUTPUTS, 500);
 	if (n_outputs == 0)
 		return command_fail(cmd, LIGHTNINGD,
 				    "Failed to compute close distribution");
@@ -2678,7 +2819,7 @@ static struct command_result *json_factory_close(struct command *cmd,
 			&ppk, SECP256K1_EC_COMPRESSED);
 	}
 
-	uint8_t nbuf[32768];
+	uint8_t nbuf[MAX_WIRE_BUF];
 	size_t nlen = nonce_bundle_serialize(&nb, nbuf, sizeof(nbuf));
 	memcpy(p, nbuf, nlen);
 	size_t plen = (size_t)(p - payload) + nlen;
@@ -2857,11 +2998,11 @@ static struct command_result *json_factory_rotate(struct command *cmd,
 
 	/* Serialize and send ROTATE_PROPOSE to all clients.
 	 * Payload: [4 bytes: old_epoch] [4 bytes: new_epoch] + nonce_bundle */
-	uint8_t nbuf[32768];
+	uint8_t nbuf[MAX_WIRE_BUF];
 	size_t nlen = nonce_bundle_serialize(&nb, nbuf, sizeof(nbuf));
 
 	/* Prepend epoch info: old(4) + new(4) + bundle */
-	uint8_t payload[8 + 32768];
+	uint8_t payload[8 + MAX_WIRE_BUF];
 	payload[0] = (old_epoch >> 24) & 0xFF;
 	payload[1] = (old_epoch >> 16) & 0xFF;
 	payload[2] = (old_epoch >> 8) & 0xFF;
@@ -2962,6 +3103,16 @@ static struct command_result *json_factory_force_close(struct command *cmd,
 			   ni,
 			   factory->nodes[ni].type == 0 ? "kickoff" : "state",
 			   stx->len, txid_hex);
+
+		/* Broadcast via sendrawtransaction */
+		struct out_req *breq = jsonrpc_request_start(
+			cmd, "sendrawtransaction",
+			rpc_done, rpc_err, fi);
+		json_add_string(breq->js, "tx", tx_hex);
+		send_outreq(breq);
+		plugin_log(plugin_handle, LOG_INFORM,
+			   "force-close: broadcast node %zu (txid=%s)",
+			   ni, txid_hex);
 		broadcast_count++;
 	}
 
@@ -2990,7 +3141,7 @@ static struct command_result *json_factory_force_close(struct command *cmd,
 	struct json_stream *js = jsonrpc_stream_success(cmd);
 	json_add_string(js, "instance_id", id_hex);
 	json_add_u64(js, "n_signed_txs", broadcast_count);
-	json_add_string(js, "status", "force_close_ready");
+	json_add_string(js, "status", "force_close_broadcast");
 
 	/* Include raw txs for manual broadcast */
 	json_array_start(js, "transactions");
@@ -3137,11 +3288,20 @@ static struct command_result *json_factory_check_breach(struct command *cmd,
 		   "Breach penalty tx built for epoch %u (%zu bytes)",
 		   *epoch, burn_tx.len);
 
+	/* Broadcast penalty TX immediately */
+	struct out_req *breq = jsonrpc_request_start(
+		cmd, "sendrawtransaction",
+		rpc_done, rpc_err, fi);
+	json_add_string(breq->js, "tx", burn_hex);
+	send_outreq(breq);
+	plugin_log(plugin_handle, LOG_INFORM,
+		   "Breach penalty tx broadcast for epoch %u", *epoch);
+
 	struct json_stream *js = jsonrpc_stream_success(cmd);
 	json_add_string(js, "burn_tx", burn_hex);
 	json_add_u64(js, "burn_tx_len", burn_tx.len);
 	json_add_u32(js, "epoch", *epoch);
-	json_add_string(js, "status", "penalty_ready");
+	json_add_string(js, "status", "penalty_broadcast");
 	tx_buf_free(&burn_tx);
 	return command_finished(cmd, js);
 }
