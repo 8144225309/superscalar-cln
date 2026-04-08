@@ -2162,10 +2162,9 @@ static struct command_result *json_factory_create(struct command *cmd,
 					   "(%zu bytes)", ci, blen);
 			}
 		}
-	}
 
-	/* secp context is global, not destroyed */
-	free(pubkeys);
+		free(pubkeys);
+	}
 
 	{
 		char id_hex[65];
