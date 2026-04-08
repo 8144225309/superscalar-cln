@@ -75,6 +75,14 @@ static struct command_result *rpc_err(struct command *cmd,
 				      const jsmntok_t *result,
 				      void *arg);
 
+/* Per-client context for async fundchannel_start → fundchannel_complete chain.
+ * Carries the factory pointer and the specific client index so callbacks
+ * know which peer they're completing with. */
+struct open_channel_ctx {
+	factory_instance_t *fi;
+	size_t client_idx;
+};
+
 /* Send a SuperScalar message wrapped in factory_piggyback (submsg 4).
  * Wire format: type(2) + submsg_id=4(2) + TLV[0]=protocol_id(34) +
  *              TLV[1024]=payload(4+len) where payload = ss_submsg(2)+data */
@@ -179,8 +187,16 @@ static struct command_result *rpc_err(struct command *cmd,
 				      const jsmntok_t *result,
 				      void *arg)
 {
-	plugin_log(plugin_handle, LOG_UNUSUAL,
-		   "RPC %s failed", method);
+	const jsmntok_t *msg_tok = json_get_member(buf, result, "message");
+	if (msg_tok) {
+		const char *errmsg = json_strdup(cmd, buf, msg_tok);
+		plugin_log(plugin_handle, LOG_UNUSUAL,
+			   "RPC %s failed: %s", method,
+			   errmsg ? errmsg : "(null)");
+	} else {
+		plugin_log(plugin_handle, LOG_UNUSUAL,
+			   "RPC %s failed (no message)", method);
+	}
 	return command_still_pending(cmd);
 }
 
@@ -191,17 +207,20 @@ static struct command_result *fundchannel_complete_ok(struct command *cmd,
 						      const jsmntok_t *result,
 						      void *arg)
 {
-	factory_instance_t *fi = (factory_instance_t *)arg;
+	struct open_channel_ctx *ctx = (struct open_channel_ctx *)arg;
+	factory_instance_t *fi = ctx->fi;
+	size_t ci = ctx->client_idx;
 	const jsmntok_t *cid_tok;
 
 	cid_tok = json_get_member(buf, result, "channel_id");
 	if (cid_tok) {
 		const char *cid_hex = json_strdup(cmd, buf, cid_tok);
 		plugin_log(plugin_handle, LOG_INFORM,
-			   "Factory channel opened: channel_id=%s",
-			   cid_hex ? cid_hex : "?");
+			   "Factory channel opened for client %zu: "
+			   "channel_id=%s", ci, cid_hex ? cid_hex : "?");
 
-		/* Map channel to factory */
+		/* Map channel to factory leaf.
+		 * leaf_index = client index (each client gets one leaf). */
 		if (cid_hex && strlen(cid_hex) == 64) {
 			uint8_t cid[32];
 			for (int j = 0; j < 32; j++) {
@@ -209,8 +228,7 @@ static struct command_result *fundchannel_complete_ok(struct command *cmd,
 				sscanf(cid_hex + j*2, "%02x", &b);
 				cid[j] = (uint8_t)b;
 			}
-			ss_factory_map_channel(fi, cid,
-					       fi->n_channels, 0);
+			ss_factory_map_channel(fi, cid, (int)ci, 0);
 		}
 	}
 
@@ -229,7 +247,9 @@ static struct command_result *fundchannel_start_ok(struct command *cmd,
 						   const jsmntok_t *result,
 						   void *arg)
 {
-	factory_instance_t *fi = (factory_instance_t *)arg;
+	struct open_channel_ctx *ctx = (struct open_channel_ctx *)arg;
+	factory_instance_t *fi = ctx->fi;
+	size_t ci = ctx->client_idx;
 	const jsmntok_t *spk_tok;
 
 	spk_tok = json_get_member(buf, result, "scriptpubkey");
@@ -255,37 +275,37 @@ static struct command_result *fundchannel_start_ok(struct command *cmd,
 	funding_amt.satoshis = 500000; /* raw: .satoshis */
 
 	plugin_log(plugin_handle, LOG_INFORM,
-		   "fundchannel_start ok, building PSBT (spk=%s, amt=%"PRIu64")",
-		   spk_hex, funding_amt.satoshis);
+		   "fundchannel_start ok for client %zu, building PSBT "
+		   "(spk=%s, amt=%"PRIu64")",
+		   ci, spk_hex, funding_amt.satoshis);
 
 	/* Build minimal PSBT: 0 inputs, 1 output matching funding script */
 	struct wally_psbt *psbt = create_psbt(cmd, 0, 0, 0);
 	psbt_append_output(psbt, spk, funding_amt);
 
-	/* Get the peer node_id from the first client */
+	/* Get the peer node_id for this specific client */
 	char nid[67];
-	if (fi->n_clients > 0) {
-		for (int j = 0; j < 33; j++)
-			sprintf(nid + j*2, "%02x",
-				fi->clients[0].node_id[j]);
-		nid[66] = '\0';
-	}
+	for (int j = 0; j < 33; j++)
+		sprintf(nid + j*2, "%02x", fi->clients[ci].node_id[j]);
+	nid[66] = '\0';
 
 	/* Call fundchannel_complete with the PSBT */
 	struct out_req *req = jsonrpc_request_start(cmd,
 		"fundchannel_complete",
-		fundchannel_complete_ok, rpc_err, fi);
+		fundchannel_complete_ok, rpc_err, ctx);
 	json_add_string(req->js, "id", nid);
 	json_add_psbt(req->js, "psbt", psbt);
 	send_outreq(req);
 
 	plugin_log(plugin_handle, LOG_INFORM,
-		   "Called fundchannel_complete with factory PSBT");
+		   "Called fundchannel_complete for client %zu (%s)",
+		   ci, nid);
 
 	return command_still_pending(cmd);
 }
 
-/* Open factory channels for each client after ceremony completes */
+/* Open factory channels for each client.
+ * Called from factory-open-channels RPC (separate cmd context). */
 static void open_factory_channels(struct command *cmd,
 				   factory_instance_t *fi)
 {
@@ -304,9 +324,13 @@ static void open_factory_channels(struct command *cmd,
 				fi->instance_id[j]);
 		}
 
+		struct open_channel_ctx *ctx = tal(cmd, struct open_channel_ctx);
+		ctx->fi = fi;
+		ctx->client_idx = ci;
+
 		struct out_req *req = jsonrpc_request_start(cmd,
 			"fundchannel_start",
-			fundchannel_start_ok, rpc_err, fi);
+			fundchannel_start_ok, rpc_err, ctx);
 		json_add_string(req->js, "id", nid);
 		json_add_string(req->js, "amount", "500000sat");
 		json_add_bool(req->js, "announce", false);
@@ -321,30 +345,6 @@ static void open_factory_channels(struct command *cmd,
 			   ci, nid);
 	}
 }
-
-/* Send a factory submessage to a peer via factory-send RPC.
- * Used by ceremony handlers when responding to protocol messages. */
-#if 0 /* Enable when ceremony logic is wired up */
-static struct command_result *
-send_factory_submsg(struct command *cmd,
-		    const char *channel_id,
-		    u16 submsg_id,
-		    const u8 *data, size_t len)
-{
-	struct out_req *req;
-	char *hex;
-
-	req = jsonrpc_request_start(cmd->plugin, cmd, "factory-send",
-				    NULL, NULL, NULL);
-	json_add_string(req->js, "channel_id", channel_id);
-	json_add_u64(req->js, "submessage_id", submsg_id);
-
-	hex = tal_hexstr(cmd, data, len);
-	json_add_string(req->js, "data", hex);
-
-	return send_outreq(cmd->plugin, req);
-}
-#endif
 
 /* Dispatch SuperScalar protocol submessages.
  * Data format: [32 bytes instance_id][payload] */
@@ -850,11 +850,9 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 						fi->instance_id, 32);
 				}
 				plugin_log(plugin_handle, LOG_INFORM,
-					   "LSP: sent FACTORY_READY to %zu clients",
+					   "LSP: sent FACTORY_READY to %zu clients"
+					   " — call factory-open-channels to open LN channels",
 					   fi->n_clients);
-
-				/* Open factory channels with each client */
-				open_factory_channels(cmd, fi);
 			}
 		}
 		break;
@@ -864,8 +862,9 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 			   "FACTORY_READY from %s (len=%zu)",
 			   peer_id, len);
 		/* Client side: factory tree is fully signed.
-		 * TODO: verify factory, open channel via CLN with
-		 * channel_in_factory TLV */
+		 * The LSP will call fundchannel_start which sends us an
+		 * open_channel with channel_in_factory TLV.
+		 * Our openchannel hook (handle_openchannel) maps it. */
 		if (fi) fi->ceremony = CEREMONY_COMPLETE;
 		break;
 
@@ -1607,6 +1606,21 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 			fi->lifecycle = FACTORY_LIFECYCLE_EXPIRED;
 			plugin_log(plugin_handle, LOG_INFORM,
 				   "Client: factory closed cooperatively");
+
+			/* Close our side of each channel in this factory */
+			for (size_t ch = 0; ch < fi->n_channels; ch++) {
+				char cid_hex[65];
+				for (int j = 0; j < 32; j++)
+					sprintf(cid_hex + j*2, "%02x",
+						fi->channels[ch].channel_id[j]);
+				struct out_req *creq = jsonrpc_request_start(
+					cmd, "close",
+					rpc_done, rpc_err, fi);
+				json_add_string(creq->js, "id", cid_hex);
+				send_outreq(creq);
+				plugin_log(plugin_handle, LOG_INFORM,
+					   "Client: closing channel %zu", ch);
+			}
 		}
 		break;
 
@@ -2642,6 +2656,22 @@ static struct command_result *json_factory_force_close(struct command *cmd,
 
 	fi->lifecycle = FACTORY_LIFECYCLE_DYING;
 
+	/* Force-close all LN channels in this factory */
+	for (size_t ch = 0; ch < fi->n_channels; ch++) {
+		char cid_hex[65];
+		for (int j = 0; j < 32; j++)
+			sprintf(cid_hex + j*2, "%02x",
+				fi->channels[ch].channel_id[j]);
+		struct out_req *creq = jsonrpc_request_start(
+			cmd, "close",
+			rpc_done, rpc_err, fi);
+		json_add_string(creq->js, "id", cid_hex);
+		json_add_u32(creq->js, "unilateraltimeout", 1);
+		send_outreq(creq);
+		plugin_log(plugin_handle, LOG_INFORM,
+			   "force-close: closing channel %zu", ch);
+	}
+
 	plugin_log(plugin_handle, LOG_INFORM,
 		   "force-close: %zu signed transactions ready",
 		   broadcast_count);
@@ -2826,6 +2856,59 @@ static struct command_result *handle_connect(struct command *cmd,
 	return notification_handled(cmd);
 }
 
+/* RPC: factory-open-channels
+ * Opens LN channels inside a completed factory.
+ * Must be called after factory-create ceremony finishes (FACTORY_READY).
+ * Separated from ceremony completion so the RPC cmd context stays alive
+ * for the async fundchannel_start / fundchannel_complete chain. */
+static struct command_result *json_factory_open_channels(struct command *cmd,
+							  const char *buf,
+							  const jsmntok_t *params)
+{
+	const char *inst_hex;
+
+	if (!param(cmd, buf, params,
+		   p_req("instance_id", param_string, &inst_hex),
+		   NULL))
+		return command_param_failed();
+
+	/* Decode 32-byte instance_id from hex */
+	uint8_t instance_id[32];
+	if (strlen(inst_hex) != 64) {
+		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+				    "instance_id must be 64 hex chars");
+	}
+	for (int i = 0; i < 32; i++) {
+		unsigned int b;
+		if (sscanf(inst_hex + i*2, "%02x", &b) != 1)
+			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+					    "instance_id: invalid hex");
+		instance_id[i] = (uint8_t)b;
+	}
+
+	factory_instance_t *fi = ss_factory_find(&ss_state, instance_id);
+	if (!fi)
+		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+				    "No factory with that instance_id");
+
+	if (fi->ceremony != CEREMONY_COMPLETE)
+		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+				    "Factory ceremony not complete (state=%d)",
+				    fi->ceremony);
+
+	if (!fi->is_lsp)
+		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+				    "Only the LSP opens channels");
+
+	plugin_log(plugin_handle, LOG_INFORM,
+		   "factory-open-channels: opening channels for %zu clients",
+		   fi->n_clients);
+
+	open_factory_channels(cmd, fi);
+
+	return command_still_pending(cmd);
+}
+
 /* Plugin init */
 static const char *init(struct command *init_cmd,
 			const char *buf UNUSED,
@@ -2872,6 +2955,10 @@ static const struct plugin_command commands[] = {
 	{
 		"factory-check-breach",
 		json_factory_check_breach,
+	},
+	{
+		"factory-open-channels",
+		json_factory_open_channels,
 	},
 };
 
