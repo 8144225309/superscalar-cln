@@ -1,13 +1,15 @@
 # superscalar-cln
 
-SuperScalar channel factory plugin for Core Lightning.
+SuperScalar channel factory plugin for [Core Lightning](https://github.com/ElementsProject/lightning). Implements [bLIP-56](https://github.com/lightning/blips/pull/56) (pluggable channel factories) using Decker-Wattenhofer state trees with MuSig2 signing.
 
-Implements the factory protocol side of [bLIP-56](https://github.com/lightning/blips/pull/56) (pluggable channel factories) using Decker-Wattenhofer state trees with MuSig2.
+This plugin enables a Core Lightning node to participate in [SuperScalar](https://github.com/8144225309/SuperScalar) channel factories — shared UTXOs that give multiple users non-custodial Lightning channel access in a single on-chain transaction. For a detailed explanation of the protocol, visit [superscalar.win](https://superscalar.win).
 
 ## Requirements
 
-- [Core Lightning](https://github.com/8144225309/lightning/tree/blip-56) with bLIP-56 support (branch `blip-56`)
+- [Core Lightning (bLIP-56 fork)](https://github.com/8144225309/lightning/tree/blip-56) — the `blip-56` branch, which adds pluggable channel factory wire messages, TLVs, and RPCs to CLN
 - Bitcoin Core 28+
+- `libsuperscalar_core.a` (static library from the [SuperScalar](https://github.com/8144225309/SuperScalar) build)
+- `libsecp256k1` with extrakeys module
 
 ## Building
 
@@ -30,12 +32,69 @@ make plugins/superscalar
 lightningd --plugin=/path/to/cln-blip56/plugins/superscalar
 ```
 
+The plugin registers CLN hooks (`custommsg`, `openchannel`, `block_added`, `connect`) and advertises feature bit 271 (`OPT_PLUGGABLE_CHANNEL_FACTORIES`) via the bLIP-56 fork.
+
+## RPC Methods
+
+The plugin exposes seven JSON-RPC methods through CLN's standard interface:
+
+| Method | Parameters | Description |
+|--------|-----------|-------------|
+| `factory-create` | `funding_sats`, `clients` (array of node IDs) | Create a new factory: builds DW tree, generates MuSig2 nonces, sends `FACTORY_PROPOSE` to all clients |
+| `factory-list` | (none) | List all factories with full status: instance ID, epoch, lifecycle, ceremony state, channels, tree nodes, breach data, distribution TX status |
+| `factory-rotate` | `instance_id` | Advance the Decker-Wattenhofer epoch: rebuilds tree transactions with new nonces, sends `ROTATE_PROPOSE` |
+| `factory-close` | `instance_id` | Initiate cooperative close: computes distribution outputs, sends `CLOSE_PROPOSE` |
+| `factory-force-close` | `instance_id` | Broadcast all signed DW tree transactions for unilateral exit, force-closes associated LN channels |
+| `factory-check-breach` | `instance_id`, `txid`, `vout`, `amount_sats`, `epoch` | Build and broadcast a penalty/burn transaction for a detected breach (old-epoch state on-chain) |
+| `factory-open-channels` | `instance_id` | Open Lightning channels inside the factory via `fundchannel_start`/`fundchannel_complete` with factory TLVs |
+
 ## Architecture
 
 CLN handles channels. The plugin handles the factory.
 
-The plugin receives factory protocol messages from peers via the `custommsg` hook and sends responses via the `factory-send` RPC. Factory state changes (rotation, rebalance) are triggered via the `factory-change` RPC.
+- **Inbound**: Factory protocol messages arrive from peers via the `custommsg` hook (message type 32800) and are demultiplexed by submessage ID
+- **Outbound**: The plugin sends factory messages via `sendcustommsg`, wrapped in bLIP-56's `factory_piggyback` envelope
+- **Channel opening**: Factory channels are opened with `fundchannel_start`/`fundchannel_complete`, passing `factory_protocol_id`, `factory_instance_id`, and `factory_early_warning_time` TLVs
+- **State changes**: Factory rotation triggers `factory-change` in the CLN fork, which uses STFU + splice infrastructure to re-sign commitments against new funding outpoints
+- **Persistence**: Factory state is serialized to CLN's datastore under `superscalar/factories/{instance_id}/`
 
-## Status
+### Factory Creation Ceremony (MuSig2)
 
-Early development. The plugin skeleton registers hooks and receives messages. The factory protocol logic (DW tree construction, MuSig2 signing, state changes) is being ported from the [SuperScalar](https://github.com/8144225309/SuperScalar) implementation.
+Factory creation is a 3-round MuSig2 protocol between 1 LSP and N clients:
+
+1. **`FACTORY_PROPOSE`** (LSP -> Clients): LSP builds DW tree, generates nonces, sends nonce bundle
+2. **`NONCE_BUNDLE`** (Clients -> LSP): Clients build identical tree, generate their nonces, send back. In 2-party mode, clients also send partial signatures in the same round
+3. **`PSIG_BUNDLE`** (Clients -> LSP): LSP aggregates nonces and partial sigs into final Schnorr signatures, then co-signs the distribution TX and sends `FACTORY_READY`
+
+### Factory Lifecycle
+
+`INIT` -> `ACTIVE` -> `DYING` -> `EXPIRED`
+
+Ceremony states: `IDLE` -> `PROPOSED` -> `NONCES_COLLECTED` -> `PSIGS_COLLECTED` -> `COMPLETE`
+
+## Why the bLIP-56 Fork is Required
+
+This plugin depends on protocol extensions that only exist in the [bLIP-56 CLN fork](https://github.com/8144225309/lightning/tree/blip-56):
+
+- **Wire message 32800** (`factory_message`) — envelope for all factory protocol traffic
+- **TLV 65600** (`channel_in_factory`) on `open_channel`/`accept_channel` — marks channels as factory-owned, enables zero-conf
+- **Feature bit 270/271** — peers discover factory support during init
+- **`factory-change` RPC** — triggers STFU-gated commitment re-signing for new funding outpoints after rotation
+- **`factory-sign-commitment` RPC** — signs commitment transactions against new factory state
+- **Zero-conf factory channels** — CLN skips funding watch for factory leaf outputs (they're never broadcast on-chain)
+
+Without the fork, the plugin cannot open factory channels, send factory messages, or perform state rotations.
+
+## Related Projects
+
+| Project | Description |
+|---------|-------------|
+| [SuperScalar](https://github.com/8144225309/SuperScalar) | Reference implementation of the SuperScalar protocol |
+| [lightning (bLIP-56 fork)](https://github.com/8144225309/lightning/tree/blip-56) | Core Lightning fork with pluggable channel factory support |
+| [superscalar-wallet](https://github.com/8144225309/superscalar-wallet) | Web-based wallet UI for SuperScalar factory management |
+| [superscalar-docs](https://github.com/8144225309/superscalar-docs) | Protocol documentation and visual guides |
+| [superscalar.win](https://superscalar.win) | SuperScalar explainer and documentation site |
+
+## License
+
+MIT
