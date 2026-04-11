@@ -3053,9 +3053,22 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 				}
 			}
 
+			/* Cache client nonces for ALL_NONCES round */
+			if (fi->cached_nonces && fi->n_cached_nonces + cnb.n_entries
+			    <= fi->cached_nonces_cap) {
+				nonce_entry_t *cache =
+					(nonce_entry_t *)fi->cached_nonces;
+				memcpy(cache + fi->n_cached_nonces,
+				       cnb.entries,
+				       cnb.n_entries * sizeof(nonce_entry_t));
+				fi->n_cached_nonces += cnb.n_entries;
+			}
+
 			plugin_log(plugin_handle, LOG_INFORM,
-				   "LSP: rotate nonces set %zu/%zu",
-				   nonces_set, cnb.n_entries);
+				   "LSP: rotate nonces set %zu/%zu "
+				   "(cached: %zu total)",
+				   nonces_set, cnb.n_entries,
+				   fi->n_cached_nonces);
 
 			if (ss_factory_all_nonces_received(fi)) {
 				if (!factory_sessions_finalize(f)) {
@@ -4883,6 +4896,18 @@ static struct command_result *json_factory_rotate(struct command *cmd,
 		nb.entries[nb.n_entries].node_idx = ni;
 		nb.entries[nb.n_entries].signer_slot = slot;
 		nb.n_entries++;
+	}
+
+	/* Cache LSP rotation nonces for ALL_NONCES round (3+ party) */
+	if (fi->cached_nonces) free(fi->cached_nonces);
+	fi->cached_nonces_cap = MAX_NONCE_ENTRIES;
+	fi->cached_nonces = calloc(fi->cached_nonces_cap,
+		sizeof(nonce_entry_t));
+	fi->n_cached_nonces = 0;
+	if (fi->cached_nonces && nb.n_entries <= fi->cached_nonces_cap) {
+		memcpy(fi->cached_nonces, nb.entries,
+		       nb.n_entries * sizeof(nonce_entry_t));
+		fi->n_cached_nonces = nb.n_entries;
 	}
 
 	/* Serialize and send ROTATE_PROPOSE to all clients.
