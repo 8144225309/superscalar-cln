@@ -1446,14 +1446,13 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 				break;
 			}
 
-			/* Parse client partial sigs */
-			secp256k1_musig_partial_sig client_psigs[64];
+			/* Count valid client partial sigs */
 			size_t n_psigs = 0;
 			for (size_t e = 0; e < pnb.n_entries; e++) {
 				secp256k1_musig_partial_sig ps;
 				if (musig_partial_sig_parse(global_secp_ctx,
 					&ps, pnb.entries[e].pubnonce))
-					client_psigs[n_psigs++] = ps;
+					n_psigs++;
 			}
 
 			/* Create LSP's own dist psig using standalone session */
