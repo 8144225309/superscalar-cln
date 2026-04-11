@@ -3632,9 +3632,13 @@ static const char *init(struct command *init_cmd,
 		 "{secret:%}",
 		 JSON_SCAN(json_to_secret, &master_secret));
 	memcpy(ss_state.factory_master_key, master_secret.data, 32);
-	ss_state.has_master_key = true;
+	/* HSM key derivation requires real pubkey exchange (TODO item 4).
+	 * Until then, keep has_master_key=false so both sides use the
+	 * same demo derivation and produce matching keypairs. */
+	ss_state.has_master_key = false;
 	plugin_log(plugin_handle, LOG_INFORM,
-		   "Factory master key derived from HSM");
+		   "Factory master key derived from HSM (stored, not active "
+		   "until pubkey exchange is implemented)");
 
 	/* Load persisted factories from datastore */
 	ss_load_factories(init_cmd);
