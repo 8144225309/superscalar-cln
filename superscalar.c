@@ -3731,6 +3731,61 @@ static struct command_result *json_factory_create(struct command *cmd,
 			   "Factory tree built: %zu participants",
 			   n_total);
 
+		/* Configure per-leaf amounts: split funding among clients
+		 * with 20% reserved as LSP liquidity stock (L-stock).
+		 * L-stock is the last output on each leaf. */
+		{
+			uint64_t total = *funding_sats;
+			uint64_t lstock_pct = 20;
+			uint64_t lstock_total = total * lstock_pct / 100;
+			uint64_t client_total = total - lstock_total;
+
+			for (int ls = 0; ls < factory->n_leaf_nodes; ls++) {
+				size_t leaf_ni = factory->leaf_node_indices[ls];
+				factory_node_t *ln = &factory->nodes[leaf_ni];
+				size_t n_clients_on_leaf = 0;
+				for (size_t s = 0; s < ln->n_signers; s++)
+					if (ln->signer_indices[s] != 0)
+						n_clients_on_leaf++;
+
+				/* Distribute evenly among clients on this
+				 * leaf, with L-stock as the last output */
+				size_t n_outputs = n_clients_on_leaf + 1;
+				uint64_t *amts = calloc(n_outputs, sizeof(uint64_t));
+				if (amts) {
+					uint64_t per_client = client_total /
+						(n_total - 1); /* per client */
+					for (size_t a = 0; a < n_clients_on_leaf; a++)
+						amts[a] = per_client;
+					/* L-stock = remainder */
+					uint64_t leaf_total = ln->input_amount;
+					uint64_t client_sum = per_client * n_clients_on_leaf;
+					amts[n_clients_on_leaf] = leaf_total > client_sum
+						? leaf_total - client_sum : 546;
+
+					if (factory_set_leaf_amounts(factory, ls,
+								    amts, n_outputs))
+						plugin_log(plugin_handle, LOG_INFORM,
+							   "Leaf %d: %zu clients, "
+							   "L-stock=%"PRIu64" sats",
+							   ls, n_clients_on_leaf,
+							   amts[n_clients_on_leaf]);
+					free(amts);
+				}
+			}
+		}
+
+		/* Generate L-stock hashes (revocation-based) and store them.
+		 * These allow clients to build identical L-stock taptrees. */
+		if (factory_generate_flat_secrets(factory, 256)) {
+			factory_set_l_stock_hashes(factory,
+				(const unsigned char (*)[32])factory->l_stock_hashes,
+				factory->n_l_stock_hashes);
+			plugin_log(plugin_handle, LOG_INFORM,
+				   "Generated %zu L-stock hashes",
+				   factory->n_l_stock_hashes);
+		}
+
 		/* Store factory handle + populate metadata from tree */
 		fi->lib_factory = factory;
 		fi->n_tree_nodes = (uint32_t)factory->n_nodes;
@@ -5068,6 +5123,119 @@ static const char *init(struct command *init_cmd,
 	return NULL;
 }
 
+/* factory-buy-liquidity RPC — rebalance a leaf to move L-stock to client.
+ * LSP calls this to sell inbound liquidity from its L-stock reserve
+ * to a specific client's channel. Calls factory_set_leaf_amounts to
+ * adjust amounts, then requires a leaf re-signing ceremony. */
+static struct command_result *json_factory_buy_liquidity(struct command *cmd,
+							  const char *buf,
+							  const jsmntok_t *params)
+{
+	const char *inst_hex;
+	u32 *client_idx;
+	u64 *amount_sats;
+
+	if (!param(cmd, buf, params,
+		   p_req("instance_id", param_string, &inst_hex),
+		   p_req("client_idx", param_u32, &client_idx),
+		   p_req("amount_sats", param_u64, &amount_sats),
+		   NULL))
+		return command_param_failed();
+
+	if (strlen(inst_hex) != 64)
+		return command_fail(cmd, LIGHTNINGD, "Bad instance_id");
+
+	uint8_t instance_id[32];
+	for (int j = 0; j < 32; j++) {
+		unsigned int b;
+		sscanf(inst_hex + j*2, "%02x", &b);
+		instance_id[j] = (uint8_t)b;
+	}
+
+	factory_instance_t *fi = ss_factory_find(&ss_state, instance_id);
+	if (!fi)
+		return command_fail(cmd, LIGHTNINGD, "Factory not found");
+
+	factory_t *factory = (factory_t *)fi->lib_factory;
+	if (!factory)
+		return command_fail(cmd, LIGHTNINGD, "No lib_factory");
+
+	/* Find which leaf this client is on */
+	int leaf_node = factory_find_leaf_for_client(factory,
+						      *client_idx + 1);
+	if (leaf_node < 0)
+		return command_fail(cmd, LIGHTNINGD,
+				    "Client %u not found on any leaf",
+				    *client_idx);
+
+	/* Find leaf_side index */
+	int leaf_side = -1;
+	for (int ls = 0; ls < factory->n_leaf_nodes; ls++) {
+		if ((int)factory->leaf_node_indices[ls] == leaf_node) {
+			leaf_side = ls;
+			break;
+		}
+	}
+	if (leaf_side < 0)
+		return command_fail(cmd, LIGHTNINGD, "Leaf side not found");
+
+	/* Read current amounts from the leaf node */
+	factory_node_t *ln = &factory->nodes[leaf_node];
+	size_t n_out = ln->n_outputs;
+	uint64_t *new_amts = calloc(n_out, sizeof(uint64_t));
+	if (!new_amts)
+		return command_fail(cmd, LIGHTNINGD, "OOM");
+
+	for (size_t i = 0; i < n_out; i++)
+		new_amts[i] = ln->outputs[i].amount;
+
+	/* Find client's output index (non-LSP signer position) */
+	uint32_t client_out = 0;
+	for (size_t s = 0; s < ln->n_signers; s++) {
+		if (ln->signer_indices[s] == *client_idx + 1)
+			break;
+		if (ln->signer_indices[s] != 0)
+			client_out++;
+	}
+	size_t lstock_out = n_out - 1; /* L-stock is last output */
+
+	/* Check L-stock has enough */
+	if (new_amts[lstock_out] < *amount_sats + 546) {
+		free(new_amts);
+		return command_fail(cmd, LIGHTNINGD,
+				    "Insufficient L-stock: %"PRIu64" < %"PRIu64,
+				    new_amts[lstock_out], *amount_sats);
+	}
+
+	/* Move amount from L-stock to client */
+	new_amts[client_out] += *amount_sats;
+	new_amts[lstock_out] -= *amount_sats;
+
+	int rc = factory_set_leaf_amounts(factory, leaf_side,
+					  new_amts, n_out);
+	free(new_amts);
+
+	if (!rc)
+		return command_fail(cmd, LIGHTNINGD,
+				    "factory_set_leaf_amounts failed");
+
+	plugin_log(plugin_handle, LOG_INFORM,
+		   "Liquidity purchase: moved %"PRIu64" sats from L-stock "
+		   "to client %u on leaf %d",
+		   *amount_sats, *client_idx, leaf_side);
+
+	/* TODO: trigger leaf re-signing ceremony (MuSig2 over new leaf TX).
+	 * For now, just update the tree state — the next rotation will
+	 * pick up the new amounts. */
+
+	struct json_stream *js = jsonrpc_stream_success(cmd);
+	json_add_string(js, "status", "liquidity_allocated");
+	json_add_u64(js, "amount_sats", *amount_sats);
+	json_add_u32(js, "leaf_side", leaf_side);
+	json_add_u32(js, "client_idx", *client_idx);
+	return command_finished(cmd, js);
+}
+
 /* factory-initiate-exit RPC — LSP triggers key turnover for a client.
  * Sends TURNOVER_REQUEST to the specified client, beginning the
  * assisted exit protocol. The client responds with their factory key. */
@@ -5210,6 +5378,10 @@ static const struct plugin_command commands[] = {
 	{
 		"factory-initiate-exit",
 		json_factory_initiate_exit,
+	},
+	{
+		"factory-buy-liquidity",
+		json_factory_buy_liquidity,
 	},
 };
 
