@@ -97,6 +97,21 @@ static void derive_factory_seckey(unsigned char seckey[32],
 	if (seckey[0] == 0) seckey[0] = 0x01;
 }
 
+/* Derive a placeholder seckey for building tree topology only.
+ * NOT used for signing — only to get valid pubkeys for tree construction
+ * before real pubkeys are collected from participants. */
+static void derive_placeholder_seckey(unsigned char seckey[32],
+				      const uint8_t instance_id[32],
+				      int participant_idx)
+{
+	/* Simple deterministic XOR — same result on all nodes */
+	memcpy(seckey, instance_id, 32);
+	seckey[0] ^= (uint8_t)(participant_idx & 0xFF);
+	seckey[1] ^= (uint8_t)((participant_idx >> 8) & 0xFF);
+	seckey[2] ^= 0x77; /* extra differentiation from derive_factory_seckey */
+	if (seckey[0] == 0) seckey[0] = 0x01;
+}
+
 /* Forward declarations */
 static void ss_save_factory(struct command *cmd, factory_instance_t *fi);
 
@@ -873,6 +888,12 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 					&pn);
 			}
 
+			/* Compute our REAL factory pubkey from HSM-derived seckey.
+			 * This is sent in the NONCE_BUNDLE so the LSP can
+			 * rebuild the DW tree with real pubkeys. */
+			secp256k1_pubkey our_real_pub;
+			secp256k1_ec_pubkey_create(ctx, &our_real_pub, our_sec);
+
 			/* Generate our nonces */
 			size_t our_node_count =
 				factory_count_nodes_for_participant(factory,
@@ -881,7 +902,7 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 			musig_nonce_pool_t *pool = calloc(1, sizeof(musig_nonce_pool_t));
 			musig_nonce_pool_generate(ctx, pool,
 				our_node_count, our_sec,
-				&pubkeys[our_idx], NULL);
+				&our_real_pub, NULL); /* bind to real pubkey */
 
 			/* Store pool, seckey, participant index for signing */
 			fi->nonce_pool = pool;
@@ -899,6 +920,13 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 			resp->n_participants = nb->n_participants;
 			resp->n_nodes = factory->n_nodes;
 			resp->n_entries = 0;
+			/* Include our real pubkey at our slot so LSP can rebuild tree */
+			if (our_idx < MAX_PARTICIPANTS) {
+				size_t pk_out = 33;
+				secp256k1_ec_pubkey_serialize(ctx,
+					resp->pubkeys[our_idx], &pk_out,
+					&our_real_pub, SECP256K1_EC_COMPRESSED);
+			}
 
 			size_t pool_entry = 0;
 			for (size_t ni = 0; ni < factory->n_nodes; ni++) {
@@ -1110,6 +1138,7 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 
 			/* Find which client sent this */
 			client_state_t *cl = NULL;
+			size_t cl_ci = SIZE_MAX;
 			if (strlen(peer_id) == 66) {
 				uint8_t pid[33];
 				for (int j = 0; j < 33; j++) {
@@ -1117,10 +1146,28 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 					sscanf(peer_id + j*2, "%02x", &b);
 					pid[j] = (uint8_t)b;
 				}
-				cl = ss_factory_find_client(fi, pid);
+				for (size_t xci = 0; xci < fi->n_clients; xci++) {
+					if (memcmp(fi->clients[xci].node_id, pid, 33) == 0) {
+						cl = &fi->clients[xci];
+						cl_ci = xci;
+						break;
+					}
+				}
 			}
 			if (cl) {
 				cl->nonce_received = true;
+				/* Extract real factory pubkey from client's bundle.
+				 * Client populates pubkeys[own_slot] where slot=ci+1. */
+				size_t client_slot = cl_ci + 1; /* 0=LSP, 1..n=clients */
+				if (client_slot < cnb->n_participants
+				    && cnb->pubkeys[client_slot][0] != 0) {
+					memcpy(cl->factory_pubkey,
+					       cnb->pubkeys[client_slot], 33);
+					cl->has_factory_pubkey = true;
+					plugin_log(plugin_handle, LOG_INFORM,
+						   "LSP: stored real pubkey for "
+						   "client %zu", cl_ci);
+				}
 				plugin_log(plugin_handle, LOG_INFORM,
 					   "LSP: matched client, nonce_received=true");
 			} else {
@@ -1150,6 +1197,116 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 			if (ss_factory_all_nonces_received(fi)) {
 				plugin_log(plugin_handle, LOG_INFORM,
 					   "LSP: all nonces collected, finalizing");
+
+				/* Rebuild DW tree with real pubkeys collected
+				 * from NONCE_BUNDLE responses. Uses the same
+				 * tree topology (n_nodes unchanged), but correct
+				 * key aggregation for MuSig2 challenge computation.
+				 * LSP uses its own real key (fi->our_seckey),
+				 * clients use factory_pubkey from their bundles. */
+				{
+					size_t n_total = 1 + fi->n_clients;
+					secp256k1_pubkey *real_pks =
+						calloc(n_total, sizeof(secp256k1_pubkey));
+					bool rebuild_ok = false;
+					if (real_pks) {
+						/* LSP pubkey from our_seckey */
+						secp256k1_ec_pubkey_create(
+							global_secp_ctx,
+							&real_pks[0],
+							fi->our_seckey);
+						/* Client pubkeys */
+						rebuild_ok = true;
+						for (size_t rci = 0;
+						     rci < fi->n_clients; rci++) {
+							if (!fi->clients[rci].has_factory_pubkey) {
+								plugin_log(plugin_handle,
+									   LOG_UNUSUAL,
+									   "LSP: client %zu "
+									   "has no real pubkey, "
+									   "using placeholder",
+									   rci);
+								unsigned char psk[32];
+								derive_placeholder_seckey(
+									psk, fi->instance_id,
+									(int)(rci + 1));
+								secp256k1_ec_pubkey_create(
+									global_secp_ctx,
+									&real_pks[rci + 1],
+									psk);
+							} else {
+								if (!secp256k1_ec_pubkey_parse(
+									global_secp_ctx,
+									&real_pks[rci + 1],
+									fi->clients[rci].factory_pubkey,
+									33)) {
+									plugin_log(plugin_handle,
+										   LOG_BROKEN,
+										   "LSP: bad pubkey "
+										   "for client %zu",
+										   rci);
+									rebuild_ok = false;
+									break;
+								}
+							}
+						}
+					}
+
+					if (rebuild_ok && real_pks) {
+						/* Allocate new factory with real pubkeys */
+						factory_t *new_f = calloc(1, sizeof(factory_t));
+						factory_init_from_pubkeys(new_f, global_secp_ctx,
+							real_pks, n_total,
+							DW_STEP_BLOCKS, 16);
+						factory_set_arity(new_f,
+							n_total <= 2 ? FACTORY_ARITY_1
+								     : FACTORY_ARITY_2);
+						/* Synthetic funding (matches factory-create) */
+						uint8_t syn_txid[32], syn_spk[34];
+						for (int j = 0; j < 32; j++) syn_txid[j] = j + 1;
+						syn_spk[0] = 0x51; syn_spk[1] = 0x20;
+						memset(syn_spk + 2, 0xAA, 32);
+						factory_set_funding(new_f, syn_txid, 0,
+							DEFAULT_FACTORY_FUNDING_SATS,
+							syn_spk, 34);
+						factory_build_tree(new_f);
+
+						/* Free old factory, swap in new */
+						factory_t *old_f = (factory_t *)fi->lib_factory;
+						if (old_f) {
+							factory_free(old_f);
+							free(old_f);
+						}
+						fi->lib_factory = new_f;
+						f = new_f;
+
+						/* Re-init sessions then re-set all nonces
+						 * from cache (LSP's + all clients') */
+						factory_sessions_init(f);
+						nonce_entry_t *cache2 =
+							(nonce_entry_t *)fi->cached_nonces;
+						if (cache2) {
+							for (size_t ne = 0;
+							     ne < fi->n_cached_nonces; ne++) {
+								secp256k1_musig_pubnonce pn2;
+								if (musig_pubnonce_parse(
+									global_secp_ctx, &pn2,
+									cache2[ne].pubnonce)) {
+									factory_session_set_nonce(
+										f,
+										cache2[ne].node_idx,
+										cache2[ne].signer_slot,
+										&pn2);
+								}
+							}
+						}
+						plugin_log(plugin_handle, LOG_INFORM,
+							   "LSP: rebuilt tree with real "
+							   "pubkeys (%zu participants)",
+							   n_total);
+					}
+					free(real_pks);
+				}
 
 				plugin_log(plugin_handle, LOG_INFORM,
 					   "LSP: calling factory_sessions_finalize...");
@@ -1189,6 +1346,31 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 								(factory_t *)fi->lib_factory;
 							all_nb->n_nodes = af ?
 								af->n_nodes : 0;
+
+							/* Include real pubkeys so clients
+							 * can rebuild tree with correct
+							 * key aggregation.
+							 * [0] = LSP, [1..n] = clients */
+							{
+								size_t pk_out = 33;
+								secp256k1_pubkey lsp_pub;
+								secp256k1_ec_pubkey_create(
+									global_secp_ctx,
+									&lsp_pub,
+									fi->our_seckey);
+								secp256k1_ec_pubkey_serialize(
+									global_secp_ctx,
+									all_nb->pubkeys[0],
+									&pk_out, &lsp_pub,
+									SECP256K1_EC_COMPRESSED);
+								for (size_t rci = 0;
+								     rci < fi->n_clients; rci++) {
+									if (fi->clients[rci].has_factory_pubkey)
+										memcpy(all_nb->pubkeys[rci + 1],
+										       fi->clients[rci].factory_pubkey,
+										       33);
+								}
+							}
 
 							/* Copy cached entries */
 							size_t n = fi->n_cached_nonces;
@@ -1243,8 +1425,8 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 		plugin_log(plugin_handle, LOG_INFORM,
 			   "ALL_NONCES from %s (len=%zu)",
 			   peer_id, len);
-		/* Client: LSP sent all aggregated nonces. Set missing nonces
-		 * on our sessions, finalize, create partial sigs, respond. */
+		/* Client: LSP sent all aggregated nonces. Rebuild tree with
+		 * real pubkeys, set nonces, finalize, create partial sigs. */
 		if (fi && !fi->is_lsp) {
 			/* Heap-allocate both bundles: 79KB each with 1024 entries */
 			nonce_bundle_t *anb = calloc(1, sizeof(*anb));
@@ -1257,11 +1439,65 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 			if (!f) { free(anb); break; }
 			secp256k1_context *ctx = global_secp_ctx;
 
-			/* Re-init sessions: musig_session_set_pubnonce blindly
-			 * increments nonces_collected on every call. FACTORY_PROPOSE
-			 * already set LSP+own nonces, so nonces_collected is already
-			 * 2 for some nodes. Re-init resets the counter to 0 so we
-			 * can set all 18 nonces cleanly from ALL_NONCES. */
+			/* Rebuild tree with real pubkeys from ALL_NONCES bundle.
+			 * ALL_NONCES carries pubkeys[0..n_participants-1]:
+			 *   [0] = LSP real pubkey, [1..n] = client real pubkeys.
+			 * This ensures MuSig2 challenge uses correct key aggregation. */
+			if (anb->n_participants > 1
+			    && anb->pubkeys[0][0] != 0) {
+				secp256k1_pubkey *real_pks =
+					calloc(anb->n_participants,
+					       sizeof(secp256k1_pubkey));
+				bool all_valid = real_pks != NULL;
+				for (uint32_t rpi = 0;
+				     rpi < anb->n_participants && all_valid; rpi++) {
+					if (anb->pubkeys[rpi][0] == 0) {
+						/* Missing pubkey — fall back to placeholder */
+						unsigned char psk[32];
+						derive_placeholder_seckey(
+							psk, fi->instance_id,
+							(int)rpi);
+						secp256k1_ec_pubkey_create(
+							ctx, &real_pks[rpi], psk);
+					} else if (!secp256k1_ec_pubkey_parse(
+						ctx, &real_pks[rpi],
+						anb->pubkeys[rpi], 33)) {
+						all_valid = false;
+					}
+				}
+				if (all_valid) {
+					factory_t *new_f = calloc(1, sizeof(factory_t));
+					factory_init_from_pubkeys(new_f, ctx,
+						real_pks, anb->n_participants,
+						DW_STEP_BLOCKS, 16);
+					factory_set_arity(new_f,
+						anb->n_participants <= 2
+						? FACTORY_ARITY_1 : FACTORY_ARITY_2);
+					uint8_t syn_txid[32], syn_spk[34];
+					for (int j = 0; j < 32; j++) syn_txid[j] = j + 1;
+					syn_spk[0] = 0x51; syn_spk[1] = 0x20;
+					memset(syn_spk + 2, 0xAA, 32);
+					factory_set_funding(new_f, syn_txid, 0,
+						DEFAULT_FACTORY_FUNDING_SATS,
+						syn_spk, 34);
+					factory_build_tree(new_f);
+
+					factory_t *old_f = f;
+					factory_free(old_f);
+					free(old_f);
+					fi->lib_factory = new_f;
+					f = new_f;
+					plugin_log(plugin_handle, LOG_INFORM,
+						   "Client: rebuilt tree with real "
+						   "pubkeys from ALL_NONCES");
+				}
+				free(real_pks);
+			}
+
+			/* Re-init sessions: resets nonces_collected to 0.
+			 * FACTORY_PROPOSE already set LSP+own nonces, so
+			 * nonces_collected > 0. Must re-init before setting
+			 * all 18 nonces from ALL_NONCES. */
 			factory_sessions_init(f);
 
 			/* Set all nonces from the bundle */
@@ -3228,11 +3464,19 @@ static struct command_result *json_factory_create(struct command *cmd,
 		secp256k1_pubkey *pubkeys = calloc(n_total,
 						   sizeof(secp256k1_pubkey));
 
-		/* Derive keypairs deterministically from instance_id.
-		 * Both sides compute identical keys. */
+		/* Pubkeys for tree construction.
+		 * LSP (k=0): real factory key (HSM-derived or demo XOR).
+		 * Clients (k≥1): placeholder keys — used only for tree
+		 * topology, replaced by real pubkeys after NONCE_BUNDLE
+		 * collection. All nodes produce identical placeholder keys
+		 * for client slots since derive_placeholder_seckey is
+		 * deterministic (instance_id + slot only). */
 		for (size_t k = 0; k < n_total; k++) {
 			unsigned char sk[32];
-			derive_factory_seckey(sk, fi->instance_id, (int)k);
+			if (k == 0)
+				derive_factory_seckey(sk, fi->instance_id, 0);
+			else
+				derive_placeholder_seckey(sk, fi->instance_id, (int)k);
 			if (!secp256k1_ec_pubkey_create(secp_ctx,
 							&pubkeys[k], sk)) {
 				return command_fail(cmd, LIGHTNINGD,
@@ -4299,13 +4543,13 @@ static const char *init(struct command *init_cmd,
 		 "{secret:%}",
 		 JSON_SCAN(json_to_secret, &master_secret));
 	memcpy(ss_state.factory_master_key, master_secret.data, 32);
-	/* HSM key derivation requires real pubkey exchange (TODO item 4).
-	 * Until then, keep has_master_key=false so both sides use the
-	 * same demo derivation and produce matching keypairs. */
-	ss_state.has_master_key = false;
+	/* HSM key active: each node derives its own factory seckey from
+	 * its master key + instance_id. Real pubkeys are exchanged during
+	 * the NONCE_BUNDLE round; LSP rebuilds the DW tree after collection. */
+	ss_state.has_master_key = true;
 	plugin_log(plugin_handle, LOG_INFORM,
-		   "Factory master key derived from HSM (stored, not active "
-		   "until pubkey exchange is implemented)");
+		   "Factory master key derived from HSM (active — real pubkey "
+		   "exchange enabled)");
 
 	/* Load persisted factories from datastore */
 	ss_load_factories(init_cmd);

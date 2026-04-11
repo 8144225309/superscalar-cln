@@ -56,6 +56,8 @@ typedef struct {
 	bool nonce_received;		/* Sent NONCE_BUNDLE this round */
 	bool psig_received;		/* Sent PSIG_BUNDLE this round */
 	int signer_slot;		/* Index in MuSig2 signer set */
+	uint8_t factory_pubkey[33];	/* Real factory pubkey (from NONCE_BUNDLE) */
+	bool has_factory_pubkey;	/* Whether factory_pubkey was received */
 } client_state_t;
 
 /* Factory instance */
