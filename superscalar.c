@@ -5187,7 +5187,7 @@ static struct command_result *json_factory_buy_liquidity(struct command *cmd,
 		return command_fail(cmd, LIGHTNINGD, "OOM");
 
 	for (size_t i = 0; i < n_out; i++)
-		new_amts[i] = ln->outputs[i].amount;
+		new_amts[i] = ln->outputs[i].amount_sats;
 
 	/* Find client's output index (non-LSP signer position) */
 	uint32_t client_out = 0;
