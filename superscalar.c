@@ -3036,9 +3036,22 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 				nonces_set++;
 			}
 
-			/* Mark client nonce received */
-			if (fi->n_clients == 1)
-				fi->clients[0].nonce_received = true;
+			/* Mark client nonce received — identify by peer_id */
+			if (strlen(peer_id) == 66) {
+				uint8_t pid[33];
+				for (int j = 0; j < 33; j++) {
+					unsigned int b;
+					sscanf(peer_id + j*2, "%02x", &b);
+					pid[j] = (uint8_t)b;
+				}
+				for (size_t xci = 0; xci < fi->n_clients; xci++) {
+					if (memcmp(fi->clients[xci].node_id,
+						   pid, 33) == 0) {
+						fi->clients[xci].nonce_received = true;
+						break;
+					}
+				}
+			}
 
 			plugin_log(plugin_handle, LOG_INFORM,
 				   "LSP: rotate nonces set %zu/%zu",
@@ -3051,6 +3064,58 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 				} else {
 					plugin_log(plugin_handle, LOG_INFORM,
 						   "LSP: rotate nonces finalized");
+
+					/* For 3+ party: broadcast aggregated
+					 * rotation nonces so clients can
+					 * finalize and create partial sigs. */
+					if (fi->n_clients > 1) {
+						nonce_entry_t *rnc =
+							(nonce_entry_t *)fi->cached_nonces;
+						if (rnc && fi->n_cached_nonces > 0) {
+							nonce_bundle_t *anb = calloc(1,
+								sizeof(*anb));
+							if (anb) {
+								memcpy(anb->instance_id,
+									fi->instance_id, 32);
+								anb->n_participants =
+									1 + fi->n_clients;
+								anb->n_nodes = f->n_nodes;
+								size_t n = fi->n_cached_nonces;
+								if (n > MAX_NONCE_ENTRIES)
+									n = MAX_NONCE_ENTRIES;
+								memcpy(anb->entries, rnc,
+									n * sizeof(nonce_entry_t));
+								anb->n_entries = n;
+								uint8_t *abuf = calloc(1,
+									MAX_WIRE_BUF);
+								size_t alen =
+									nonce_bundle_serialize(
+										anb, abuf,
+										MAX_WIRE_BUF);
+								free(anb);
+								for (size_t ci = 0;
+								     ci < fi->n_clients;
+								     ci++) {
+									char nid[67];
+									for (int j = 0; j < 33; j++)
+										sprintf(nid+j*2, "%02x",
+											fi->clients[ci].node_id[j]);
+									nid[66] = '\0';
+									send_factory_msg(cmd, nid,
+										SS_SUBMSG_ALL_NONCES,
+										abuf, alen);
+								}
+								free(abuf);
+								plugin_log(plugin_handle,
+									LOG_INFORM,
+									"LSP: sent rotation "
+									"ALL_NONCES to %zu clients",
+									fi->n_clients);
+							}
+						}
+					}
+					/* Reset nonce tracking for PSIG round */
+					ss_factory_reset_ceremony(fi);
 				}
 			}
 		}
