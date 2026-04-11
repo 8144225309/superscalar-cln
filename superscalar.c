@@ -117,6 +117,9 @@ static struct command_result *rpc_err(struct command *cmd,
 struct open_channel_ctx {
 	factory_instance_t *fi;
 	size_t client_idx;
+	size_t *channels_done;  /* shared counter among all clients */
+	size_t n_total;         /* total channels to open */
+	struct command *orig_cmd; /* original RPC command to complete */
 };
 
 /* Send a SuperScalar message wrapped in factory_piggyback (submsg 4).
@@ -274,6 +277,22 @@ static struct command_result *fundchannel_complete_ok(struct command *cmd,
 		   "Factory lifecycle=active, n_channels=%zu",
 		   fi->n_channels);
 
+	/* Track completion — when all channels are open, reply to RPC */
+	if (ctx->channels_done) {
+		(*ctx->channels_done)++;
+		if (*ctx->channels_done >= ctx->n_total && ctx->orig_cmd) {
+			struct json_stream *js =
+				jsonrpc_stream_success(ctx->orig_cmd);
+			char id_hex[65];
+			for (int j = 0; j < 32; j++)
+				sprintf(id_hex + j*2, "%02x",
+					fi->instance_id[j]);
+			json_add_string(js, "instance_id", id_hex);
+			json_add_u64(js, "n_channels", fi->n_channels);
+			json_add_string(js, "status", "channels_open");
+			return command_finished(ctx->orig_cmd, js);
+		}
+	}
 	return command_still_pending(cmd);
 }
 
@@ -346,6 +365,10 @@ static struct command_result *fundchannel_start_ok(struct command *cmd,
 static void open_factory_channels(struct command *cmd,
 				   factory_instance_t *fi)
 {
+	/* Shared counter — freed with cmd (tal parent) */
+	size_t *done_counter = tal(cmd, size_t);
+	*done_counter = 0;
+
 	for (size_t ci = 0; ci < fi->n_clients; ci++) {
 		char nid[67];
 		for (int j = 0; j < 33; j++)
@@ -364,6 +387,9 @@ static void open_factory_channels(struct command *cmd,
 		struct open_channel_ctx *ctx = tal(cmd, struct open_channel_ctx);
 		ctx->fi = fi;
 		ctx->client_idx = ci;
+		ctx->channels_done = done_counter;
+		ctx->n_total = fi->n_clients;
+		ctx->orig_cmd = cmd;
 
 		struct out_req *req = jsonrpc_request_start(cmd,
 			"fundchannel_start",
@@ -514,28 +540,116 @@ static void ss_save_factory(struct command *cmd, factory_instance_t *fi)
 		}
 	}
 
+	/* Update factory index — list of all known instance IDs.
+	 * Format: count(2) + instance_ids(32 each) */
+	size_t idx_len = 2 + ss_state.n_factories * 32;
+	uint8_t *idx_buf = calloc(1, idx_len);
+	idx_buf[0] = (ss_state.n_factories >> 8) & 0xFF;
+	idx_buf[1] = ss_state.n_factories & 0xFF;
+	for (size_t i = 0; i < ss_state.n_factories; i++)
+		memcpy(idx_buf + 2 + i * 32,
+		       ss_state.factories[i]->instance_id, 32);
+	jsonrpc_set_datastore_binary(cmd,
+		"superscalar/factory-index", idx_buf, idx_len,
+		"create-or-replace", rpc_done, rpc_err, fi);
+	free(idx_buf);
+
 	plugin_log(plugin_handle, LOG_DBG,
 		   "Persisted factory state (epoch=%u, channels=%zu)",
 		   fi->epoch, fi->n_channels);
 }
 
 /* Load factories from CLN datastore on startup.
- * Uses rpc_scan_datastore_hex to read each factory's metadata. */
+ * Reads factory-index key to discover instance IDs, then
+ * loads each factory's meta and channel mappings. */
 static void ss_load_factories(struct command *cmd)
 {
-	/* List all datastore entries under superscalar/factories/ */
-	struct out_req *req = jsonrpc_request_start(cmd,
-		"listdatastore", rpc_done, rpc_err, NULL);
-	json_add_string(req->js, "key",
-		"superscalar/factories");
-	send_outreq(req);
+	size_t loaded = 0;
+	u8 *meta_hex = NULL;
+	const char *err;
 
-	/* Note: full async load would parse the listdatastore result
-	 * and deserialize each factory. For now, factories start fresh
-	 * on restart — the datastore entries serve as a recovery
-	 * mechanism that can be read by factory-list or a recovery RPC. */
+	/* Read factory index: count(2) + instance_ids(32 each) */
+	err = rpc_scan_datastore_hex(tmpctx, cmd,
+		"superscalar/factory-index",
+		JSON_SCAN_TAL(tmpctx, json_tok_bin_from_hex, &meta_hex));
+
+	if (!err && meta_hex) {
+		/* Index format: count(2) + instance_ids(32 each) */
+		size_t idx_len = tal_bytelen(meta_hex);
+		if (idx_len >= 2) {
+			uint16_t count = (meta_hex[0] << 8) | meta_hex[1];
+			const u8 *p = meta_hex + 2;
+			size_t rem = idx_len - 2;
+
+			for (uint16_t i = 0; i < count && rem >= 32; i++) {
+				char id_hex[65];
+				for (int j = 0; j < 32; j++)
+					sprintf(id_hex + j*2, "%02x", p[j]);
+				id_hex[64] = '\0';
+
+				/* Try loading this factory's meta */
+				char meta_path[128];
+				snprintf(meta_path, sizeof(meta_path),
+					 "superscalar/factories/%s/meta",
+					 id_hex);
+				u8 *fmeta = NULL;
+				err = rpc_scan_datastore_hex(tmpctx, cmd,
+					meta_path,
+					JSON_SCAN_TAL(tmpctx,
+						json_tok_bin_from_hex,
+						&fmeta));
+				if (err || !fmeta) {
+					p += 32; rem -= 32;
+					continue;
+				}
+
+				/* Deserialize */
+				factory_instance_t *fi = ss_factory_new(
+					&ss_state, p);
+				if (!fi) {
+					p += 32; rem -= 32;
+					continue;
+				}
+
+				if (!ss_persist_deserialize_meta(fi,
+					fmeta, tal_bytelen(fmeta))) {
+					plugin_log(plugin_handle, LOG_UNUSUAL,
+						   "Failed to deserialize "
+						   "factory %s", id_hex);
+					p += 32; rem -= 32;
+					continue;
+				}
+
+				/* Load channel mappings */
+				char ch_path[128];
+				snprintf(ch_path, sizeof(ch_path),
+					 "superscalar/factories/%s/channels",
+					 id_hex);
+				u8 *chdata = NULL;
+				if (!rpc_scan_datastore_hex(tmpctx, cmd,
+					ch_path,
+					JSON_SCAN_TAL(tmpctx,
+						json_tok_bin_from_hex,
+						&chdata))
+				    && chdata) {
+					ss_persist_deserialize_channels(fi,
+						chdata, tal_bytelen(chdata));
+				}
+
+				loaded++;
+				plugin_log(plugin_handle, LOG_INFORM,
+					   "Loaded factory %s (epoch=%u, "
+					   "channels=%zu, lifecycle=%d)",
+					   id_hex, fi->epoch,
+					   fi->n_channels, fi->lifecycle);
+
+				p += 32; rem -= 32;
+			}
+		}
+	}
+
 	plugin_log(plugin_handle, LOG_INFORM,
-		   "Queried datastore for persisted factories");
+		   "Loaded %zu factories from datastore", loaded);
 }
 
 /* Dispatch SuperScalar protocol submessages.
