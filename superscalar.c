@@ -230,10 +230,9 @@ static struct command_result *withdraw_funding_err(struct command *cmd,
 {
 	struct funding_ctx *fctx = (struct funding_ctx *)arg;
 	fctx->fi->ceremony = CEREMONY_FAILED;
+	const char *err_str = json_strdup(tmpctx, buf, result);
 	plugin_log(plugin_handle, LOG_BROKEN,
-		   "withdraw failed: %.*s",
-		   json_tok_full_len(result),
-		   json_tok_contents(buf, result));
+		   "withdraw failed: %s", err_str ? err_str : "unknown");
 	return notification_handled(cmd);
 }
 
