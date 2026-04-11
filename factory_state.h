@@ -111,6 +111,10 @@ typedef struct factory_instance {
 	 * in every file that includes factory_state.h. */
 	void *lib_factory;
 
+	/* Distribution TX standalone MuSig2 signing session.
+	 * Separate from tree node sessions — uses root keyagg. */
+	void *dist_session;  /* musig_signing_session_t* */
+
 	/* MuSig2 nonce pool (heap-allocated, secnonces live inside) */
 	void *nonce_pool;
 	/* Per-entry: which pool index maps to which tree node */

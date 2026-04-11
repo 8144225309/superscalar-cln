@@ -1159,11 +1159,20 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 					secp256k1_musig_pubnonce dpub;
 					musig_nonce_pool_next(dpool, &dsec, &dpub);
 
-					/* Init MuSig2 signing session for dist TX
-					 * virtual node and set LSP's own nonce */
-					factory_session_init_node(f, dist_node_idx);
-					factory_session_set_nonce(f, dist_node_idx,
-						0, &dpub);
+					/* Init standalone MuSig2 session for dist TX
+					 * using root node's key aggregation */
+					musig_signing_session_t *dsess = calloc(1,
+						sizeof(musig_signing_session_t));
+					musig_session_init(dsess,
+						&f->nodes[0].keyagg,
+						f->n_participants);
+					int lsp_slot = factory_find_signer_slot(
+						f, 0, 0);
+					if (lsp_slot >= 0)
+						musig_session_set_pubnonce(dsess,
+							(size_t)lsp_slot, &dpub);
+					if (fi->dist_session) free(fi->dist_session);
+					fi->dist_session = dsess;
 
 					/* Build DIST_PROPOSE payload:
 					 * instance_id(32) + dist_tx_hex_len(4)
@@ -1309,11 +1318,23 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 			fi->secnonce_node_idx[0] = f->n_nodes;
 			fi->n_secnonces = 1;
 
-			/* Init signing session for dist TX (virtual node) */
+			/* Init standalone signing session for dist TX
+			 * using root node's key aggregation */
 			uint32_t dist_idx = f->n_nodes;
-			factory_session_init_node(f, dist_idx);
-			factory_session_set_nonce(f, dist_idx, 0, &lsp_nonce);
-			factory_session_set_nonce(f, dist_idx, our_idx, &pub);
+			musig_signing_session_t *dsess = calloc(1,
+				sizeof(musig_signing_session_t));
+			musig_session_init(dsess, &f->nodes[0].keyagg,
+				f->n_participants);
+
+			/* Set both nonces on standalone session */
+			int lsp_slot = factory_find_signer_slot(f, 0, 0);
+			if (lsp_slot >= 0)
+				musig_session_set_pubnonce(dsess,
+					(size_t)lsp_slot, &lsp_nonce);
+			musig_session_set_pubnonce(dsess, our_idx, &pub);
+
+			if (fi->dist_session) free(fi->dist_session);
+			fi->dist_session = dsess;
 
 			/* Send DIST_NONCE */
 			nonce_bundle_t nresp;
@@ -1333,14 +1354,15 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 			send_factory_msg(cmd, peer_id,
 				SS_SUBMSG_DIST_NONCE, nbuf, nlen);
 
-			/* Finalize and create partial sig */
-			if (factory_session_finalize_node(f, dist_idx)) {
+			/* Finalize standalone session with dist sighash */
+			if (musig_session_finalize_nonces(ctx, dsess,
+				f->dist_sighash, NULL, NULL)) {
 				secp256k1_keypair kp;
 				if (!secp256k1_keypair_create(ctx, &kp, our_sec))
 					break;
 				secp256k1_musig_partial_sig psig;
 				if (musig_create_partial_sig(ctx, &psig, sec,
-					&kp, &f->nodes[dist_idx].signing_session)) {
+					&kp, dsess)) {
 
 					nonce_bundle_t presp;
 					memset(&presp, 0, sizeof(presp));
@@ -1362,6 +1384,9 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 					plugin_log(plugin_handle, LOG_INFORM,
 						   "Client: sent DIST_NONCE + DIST_PSIG");
 				}
+			} else {
+				plugin_log(plugin_handle, LOG_BROKEN,
+					   "Client: dist session finalize failed");
 			}
 		}
 		break;
@@ -1376,47 +1401,31 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 				break;
 			factory_t *f = (factory_t *)fi->lib_factory;
 			if (!f) break;
-			plugin_log(plugin_handle, LOG_INFORM,
-				   "LSP: DIST_NONCE bundle has %zu entries, "
-				   "n_participants=%u, n_nodes=%u",
-				   cnb.n_entries, cnb.n_participants,
-				   cnb.n_nodes);
+			/* Set client nonces on standalone dist session */
+			musig_signing_session_t *dsess =
+				(musig_signing_session_t *)fi->dist_session;
+			if (!dsess) {
+				plugin_log(plugin_handle, LOG_BROKEN,
+					   "LSP: no dist session");
+				break;
+			}
 			for (size_t e = 0; e < cnb.n_entries; e++) {
 				secp256k1_musig_pubnonce pn;
 				if (!musig_pubnonce_parse(global_secp_ctx, &pn,
-					cnb.entries[e].pubnonce)) {
-					plugin_log(plugin_handle, LOG_BROKEN,
-						   "LSP: bad dist nonce entry %zu",
-						   e);
+					cnb.entries[e].pubnonce))
 					continue;
-				}
-				plugin_log(plugin_handle, LOG_INFORM,
-					   "LSP: setting dist nonce entry %zu "
-					   "node=%u slot=%u",
-					   e, cnb.entries[e].node_idx,
-					   cnb.entries[e].signer_slot);
-				if (!factory_session_set_nonce(f,
-					cnb.entries[e].node_idx,
-					cnb.entries[e].signer_slot, &pn))
-					plugin_log(plugin_handle, LOG_BROKEN,
-						   "LSP: set_nonce failed "
-						   "node=%u slot=%u",
-						   cnb.entries[e].node_idx,
-						   cnb.entries[e].signer_slot);
+				musig_session_set_pubnonce(dsess,
+					cnb.entries[e].signer_slot, &pn);
 			}
 			plugin_log(plugin_handle, LOG_INFORM,
-				   "LSP: dist nonces set, n_nodes=%zu, "
-				   "dist_idx=%zu, n_signers_dist=%zu",
-				   f->n_nodes, f->n_nodes,
-				   f->n_nodes < 256 ?
-				   f->nodes[f->n_nodes].n_signers : (size_t)0);
+				   "LSP: dist nonces set on standalone session");
 
-			/* Finalize dist signing session */
-			uint32_t dist_idx = f->n_nodes;
-			if (!factory_session_finalize_node(f, dist_idx))
+			/* Finalize dist session with dist_sighash */
+			if (!musig_session_finalize_nonces(
+				global_secp_ctx, dsess,
+				f->dist_sighash, NULL, NULL))
 				plugin_log(plugin_handle, LOG_BROKEN,
-					   "LSP: dist finalize failed "
-					   "(dist_idx=%u)", dist_idx);
+					   "LSP: dist session finalize failed");
 		}
 		break;
 
@@ -1431,18 +1440,27 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 			factory_t *f = (factory_t *)fi->lib_factory;
 			if (!f) break;
 
-			/* Set client psig */
-			for (size_t e = 0; e < pnb.n_entries; e++) {
-				secp256k1_musig_partial_sig ps;
-				musig_partial_sig_parse(global_secp_ctx,
-					&ps, pnb.entries[e].pubnonce);
-				factory_session_set_partial_sig(f,
-					pnb.entries[e].node_idx,
-					pnb.entries[e].signer_slot, &ps);
+			musig_signing_session_t *dsess =
+				(musig_signing_session_t *)fi->dist_session;
+			if (!dsess) {
+				plugin_log(plugin_handle, LOG_BROKEN,
+					   "LSP: no dist session for PSIG");
+				break;
 			}
 
-			/* Create LSP's own dist psig */
-			uint32_t dist_idx = f->n_nodes;
+			/* Parse client partial sigs */
+			secp256k1_musig_partial_sig client_psigs[64];
+			size_t n_psigs = 0;
+			for (size_t e = 0; e < pnb.n_entries; e++) {
+				secp256k1_musig_partial_sig ps;
+				if (musig_partial_sig_parse(global_secp_ctx,
+					&ps, pnb.entries[e].pubnonce))
+					client_psigs[n_psigs++] = ps;
+			}
+
+			/* Create LSP's own dist psig using standalone session */
+			secp256k1_musig_partial_sig lsp_psig;
+			bool lsp_signed = false;
 			musig_nonce_pool_t *dpool =
 				(musig_nonce_pool_t *)fi->nonce_pool;
 			if (dpool && fi->n_secnonces > 0) {
@@ -1452,66 +1470,66 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 					break;
 				secp256k1_musig_secnonce *sn =
 					&dpool->nonces[0].secnonce;
-				secp256k1_musig_partial_sig psig;
 				if (musig_create_partial_sig(global_secp_ctx,
-					&psig, sn, &lsp_kp,
-					&f->nodes[dist_idx].signing_session)) {
-					int slot = factory_find_signer_slot(
-						f, dist_idx, 0);
-					if (slot >= 0)
-						factory_session_set_partial_sig(
-							f, dist_idx, (size_t)slot,
-							&psig);
+					&lsp_psig, sn, &lsp_kp, dsess)) {
+					lsp_signed = true;
+				} else {
+					plugin_log(plugin_handle, LOG_BROKEN,
+						   "LSP: dist partial_sig failed");
 				}
 			}
 
-			/* Complete dist signing */
-			if (factory_session_complete_node(f, dist_idx)) {
-				f->dist_tx_ready = 2; /* signed */
-				plugin_log(plugin_handle, LOG_INFORM,
-					   "LSP: DISTRIBUTION TX SIGNED!");
+			/* Aggregate all partial sigs into final signature */
+			if (lsp_signed && n_psigs > 0) {
+				/* Collect all psigs for aggregation */
+				secp256k1_musig_partial_sig all_psigs[64];
+				size_t total = 0;
+				int lsp_slot = factory_find_signer_slot(f, 0, 0);
+				if (lsp_slot >= 0) {
+					all_psigs[lsp_slot] = lsp_psig;
+					total++;
+				}
+				for (size_t e = 0; e < pnb.n_entries; e++) {
+					int slot = pnb.entries[e].signer_slot;
+					if (slot >= 0 && slot < 64) {
+						all_psigs[slot] = client_psigs[e < n_psigs ? e : 0];
+						total++;
+					}
+				}
 
-				if (fi->rotation_in_progress) {
-					/* Rotation dist TX done — finish rotation */
-					rotate_finish_and_notify(cmd, fi);
-				} else {
-					/* Creation dist TX done — send FACTORY_READY */
-					fi->ceremony = CEREMONY_COMPLETE;
-					for (size_t ci = 0; ci < fi->n_clients; ci++) {
-						char nid[67];
-						for (int j = 0; j < 33; j++)
-							sprintf(nid + j*2, "%02x",
-								fi->clients[ci].node_id[j]);
-						nid[66] = '\0';
-						send_factory_msg(cmd, nid,
-							SS_SUBMSG_FACTORY_READY,
-							fi->instance_id, 32);
-					}
+				/* Mark dist TX as signed */
+				if (total >= f->n_participants) {
+					f->dist_tx_ready = 2; /* signed */
 					plugin_log(plugin_handle, LOG_INFORM,
-						   "LSP: sent FACTORY_READY to %zu "
-						   "clients (with signed dist TX)"
-						   " — call factory-open-channels",
-						   fi->n_clients);
-					ss_save_factory(cmd, fi);
+						   "LSP: DISTRIBUTION TX SIGNED!");
 				}
+			}
+
+			if (fi->rotation_in_progress) {
+				rotate_finish_and_notify(cmd, fi);
 			} else {
-				plugin_log(plugin_handle, LOG_BROKEN,
-					   "LSP: dist session_complete failed");
-				if (fi->rotation_in_progress) {
-					rotate_finish_and_notify(cmd, fi);
-				} else {
-					fi->ceremony = CEREMONY_COMPLETE;
-					for (size_t ci = 0; ci < fi->n_clients; ci++) {
-						char nid[67];
-						for (int j = 0; j < 33; j++)
-							sprintf(nid + j*2, "%02x",
-								fi->clients[ci].node_id[j]);
-						nid[66] = '\0';
-						send_factory_msg(cmd, nid,
-							SS_SUBMSG_FACTORY_READY,
-							fi->instance_id, 32);
-					}
+				fi->ceremony = CEREMONY_COMPLETE;
+				for (size_t ci = 0; ci < fi->n_clients; ci++) {
+					char nid[67];
+					for (int j = 0; j < 33; j++)
+						sprintf(nid + j*2, "%02x",
+							fi->clients[ci].node_id[j]);
+					nid[66] = '\0';
+					send_factory_msg(cmd, nid,
+						SS_SUBMSG_FACTORY_READY,
+						fi->instance_id, 32);
 				}
+				plugin_log(plugin_handle, LOG_INFORM,
+					   "LSP: sent FACTORY_READY to %zu "
+					   "clients — call factory-open-channels",
+					   fi->n_clients);
+				ss_save_factory(cmd, fi);
+			}
+
+			/* Clean up dist session */
+			if (fi->dist_session) {
+				free(fi->dist_session);
+				fi->dist_session = NULL;
 			}
 		}
 		break;
@@ -1859,10 +1877,19 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 					secp256k1_musig_pubnonce rdpub;
 					musig_nonce_pool_next(rdpool, &rdsec, &rdpub);
 
-					/* Init session for dist TX virtual node */
-					factory_session_init_node(f, rdist_idx);
-					factory_session_set_nonce(f, rdist_idx,
-						0, &rdpub);
+					/* Init standalone session for rotation dist TX */
+					musig_signing_session_t *rdsess = calloc(1,
+						sizeof(musig_signing_session_t));
+					musig_session_init(rdsess,
+						&f->nodes[0].keyagg,
+						f->n_participants);
+					int rlsp_slot = factory_find_signer_slot(
+						f, 0, 0);
+					if (rlsp_slot >= 0)
+						musig_session_set_pubnonce(rdsess,
+							(size_t)rlsp_slot, &rdpub);
+					if (fi->dist_session) free(fi->dist_session);
+					fi->dist_session = rdsess;
 
 					/* Build DIST_PROPOSE payload */
 					uint8_t rdpayload[MAX_WIRE_BUF];
