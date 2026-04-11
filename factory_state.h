@@ -15,16 +15,11 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include "ceremony.h"
+#include "nonce_exchange.h"
 
 /* Max participants in a single factory (LSP + clients).
  * Matches FACTORY_MAX_SIGNERS in libsuperscalar v0.1.9. */
 #define MAX_FACTORY_PARTICIPANTS 64
-
-/* Max nonce entries (must match nonce_exchange.h).
- * 128 keeps nonce_bundle_t stack-safe (~10KB). */
-#ifndef MAX_NONCE_ENTRIES
-#define MAX_NONCE_ENTRIES 128
-#endif
 
 /* Max concurrent factories */
 #define MAX_FACTORIES 32
