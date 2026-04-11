@@ -154,6 +154,10 @@ struct funding_ctx {
 	uint8_t funding_spk_len;
 };
 
+/* Forward declaration */
+static void continue_after_funding(struct command *cmd,
+				   struct funding_ctx *fctx);
+
 /* Callback after CLN's `withdraw` RPC returns the real funding TX.
  * Parses txid, finds our P2TR output vout, stores real funding data
  * on the factory instance, then continues the ceremony. */
@@ -1586,14 +1590,10 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 						musig_keyagg_t kagg;
 						musig_aggregate_keys(global_secp_ctx,
 							&kagg, apks, nt);
-						secp256k1_xonly_pubkey xonly;
-						secp256k1_keypair_xonly_pub(
-							global_secp_ctx, &xonly,
-							NULL, &kagg.keypair);
 						unsigned char xser[32];
 						secp256k1_xonly_pubkey_serialize(
 							global_secp_ctx, xser,
-							&xonly);
+							&kagg.agg_pubkey);
 
 						/* Build P2TR spk: OP_1 || 0x20 || xonly */
 						struct funding_ctx *fctx =
