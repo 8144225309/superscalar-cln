@@ -1490,6 +1490,7 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 						   "LSP: sent FACTORY_READY (no dist TX)");
 					ss_save_factory(cmd, fi);
 				}
+			}
 			free(pnb);
 		}
 		break;
