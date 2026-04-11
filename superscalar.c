@@ -14,6 +14,7 @@
 #include <common/features.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <time.h>
 #include <inttypes.h>
 #include <ccan/crypto/sha256/sha256.h>
 #include <secp256k1.h>
@@ -3895,6 +3896,23 @@ static const char *init(struct command *init_cmd,
 			const jsmntok_t *config UNUSED)
 {
 	plugin_handle = init_cmd->plugin;
+
+	/* Seed random() for factory instance_id generation.
+	 * Without this, default seed=1 → same instance_id every restart,
+	 * causing datastore-loaded factories to collide with new ones. */
+	{
+		unsigned int seed;
+		FILE *urandom = fopen("/dev/urandom", "rb");
+		if (urandom) {
+			if (fread(&seed, sizeof(seed), 1, urandom) != 1)
+				seed = (unsigned int)time(NULL);
+			fclose(urandom);
+		} else {
+			seed = (unsigned int)time(NULL);
+		}
+		srandom(seed);
+	}
+
 	ss_state_init(&ss_state);
 
 	global_secp_ctx = secp256k1_context_create(
