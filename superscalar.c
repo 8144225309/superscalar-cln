@@ -981,23 +981,13 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 			{
 				nonce_entry_t *cache =
 					(nonce_entry_t *)fi->cached_nonces;
-				size_t new_total = fi->n_cached_nonces
-					+ cnb.n_entries;
-				if (new_total > fi->cached_nonces_cap) {
-					size_t new_cap = new_total + 64;
-					cache = realloc(cache,
-						new_cap * sizeof(nonce_entry_t));
-					if (cache) {
-						fi->cached_nonces = cache;
-						fi->cached_nonces_cap = new_cap;
-					}
-				}
-				if (cache) {
+				if (cache && fi->n_cached_nonces + cnb.n_entries
+				    <= fi->cached_nonces_cap) {
 					memcpy(cache + fi->n_cached_nonces,
 					       cnb.entries,
 					       cnb.n_entries
 					       * sizeof(nonce_entry_t));
-					fi->n_cached_nonces = new_total;
+					fi->n_cached_nonces += cnb.n_entries;
 				}
 			}
 
@@ -3033,14 +3023,18 @@ static struct command_result *json_factory_create(struct command *cmd,
 				nb.n_entries++;
 			}
 
-			/* Cache LSP's nonce entries for ALL_NONCES round */
+			/* Cache LSP's nonce entries for ALL_NONCES round.
+			 * Pre-allocate for all participants × all nodes. */
 			if (fi->cached_nonces) free(fi->cached_nonces);
-			fi->cached_nonces = calloc(nb.n_entries,
+			fi->cached_nonces_cap = MAX_NONCE_ENTRIES;
+			fi->cached_nonces = calloc(fi->cached_nonces_cap,
 				sizeof(nonce_entry_t));
-			fi->n_cached_nonces = nb.n_entries;
-			fi->cached_nonces_cap = nb.n_entries;
-			memcpy(fi->cached_nonces, nb.entries,
-			       nb.n_entries * sizeof(nonce_entry_t));
+			fi->n_cached_nonces = 0;
+			if (fi->cached_nonces && nb.n_entries <= fi->cached_nonces_cap) {
+				memcpy(fi->cached_nonces, nb.entries,
+				       nb.n_entries * sizeof(nonce_entry_t));
+				fi->n_cached_nonces = nb.n_entries;
+			}
 
 			plugin_log(plugin_handle, LOG_INFORM,
 				   "MuSig2 nonces: %zu entries for %zu nodes",
