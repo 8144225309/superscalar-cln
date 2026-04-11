@@ -21,9 +21,9 @@
 #define MAX_FACTORY_PARTICIPANTS 64
 
 /* Max nonce entries (must match nonce_exchange.h).
- * 1024 supports factories up to ~10 participants. */
+ * 128 keeps nonce_bundle_t stack-safe (~10KB). */
 #ifndef MAX_NONCE_ENTRIES
-#define MAX_NONCE_ENTRIES 1024
+#define MAX_NONCE_ENTRIES 128
 #endif
 
 /* Max concurrent factories */

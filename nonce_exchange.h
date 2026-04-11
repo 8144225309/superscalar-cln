@@ -19,10 +19,10 @@
 #include <stddef.h>
 
 /* Max entries in a nonce bundle (n_nodes * n_signers).
- * Stack-allocated in nonce_bundle_t (~74 bytes per entry).
- * 1024 supports trees up to ~10 participants (128 nodes × 8 signers).
- * For larger factories, bundles would need heap allocation. */
-#define MAX_NONCE_ENTRIES 1024
+ * Stack-allocated in nonce_bundle_t (~76 bytes per entry).
+ * Keep small to avoid stack overflow — 128 entries = ~10KB.
+ * Supports factories up to ~8 participants (16 nodes × 8 signers). */
+#define MAX_NONCE_ENTRIES 128
 
 typedef struct {
 	uint32_t node_idx;
