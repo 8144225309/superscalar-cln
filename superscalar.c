@@ -4395,6 +4395,91 @@ static struct command_result *json_factory_force_close(struct command *cmd,
 	return command_finished(cmd, js);
 }
 
+/* Breach scan: callback after checkutxo returns for a factory's
+ * root funding UTXO. If the UTXO is spent, attempt penalty TXs. */
+struct breach_scan_ctx {
+	factory_instance_t *fi;
+	size_t factory_idx;
+};
+
+static struct command_result *breach_utxo_checked(struct command *cmd,
+						   const char *method,
+						   const char *buf,
+						   const jsmntok_t *result,
+						   void *arg)
+{
+	struct breach_scan_ctx *bctx = (struct breach_scan_ctx *)arg;
+	factory_instance_t *fi = bctx->fi;
+
+	const jsmntok_t *exists_tok = json_get_member(buf, result, "exists");
+	if (!exists_tok)
+		return notification_handled(cmd);
+
+	bool exists;
+	json_to_bool(buf, exists_tok, &exists);
+
+	if (!exists) {
+		/* Funding UTXO has been spent — potential breach.
+		 * Try building penalty TX for each revoked epoch. */
+		plugin_log(plugin_handle, LOG_UNUSUAL,
+			   "BREACH ALERT: factory %zu funding UTXO spent! "
+			   "Checking %zu revoked epochs...",
+			   bctx->factory_idx, fi->n_breach_epochs);
+
+		factory_t *f = (factory_t *)fi->lib_factory;
+		if (!f) {
+			plugin_log(plugin_handle, LOG_UNUSUAL,
+				   "Cannot build penalty: no lib_factory");
+			return notification_handled(cmd);
+		}
+
+		/* For each old epoch with a revocation secret,
+		 * build and broadcast a penalty TX. We use the root
+		 * node (kickoff) txid as the L-stock outpoint. */
+		for (size_t bi = 0; bi < fi->n_breach_epochs; bi++) {
+			epoch_breach_data_t *bd = &fi->breach_data[bi];
+			if (!bd->has_revocation)
+				continue;
+			if (bd->epoch >= fi->epoch)
+				continue; /* current epoch, not a breach */
+
+			tx_buf_t burn_tx;
+			tx_buf_init(&burn_tx, 256);
+
+			/* Use root node txid:0 as the L-stock outpoint.
+			 * Amount is the factory's total funding. */
+			if (factory_build_burn_tx(f, &burn_tx,
+						  f->nodes[0].txid, 0,
+						  f->funding_amount_sats,
+						  bd->epoch)) {
+				char *burn_hex = tal_arr(cmd, char,
+					burn_tx.len * 2 + 1);
+				for (size_t h = 0; h < burn_tx.len; h++)
+					sprintf(burn_hex + h*2, "%02x",
+						burn_tx.data[h]);
+
+				plugin_log(plugin_handle, LOG_UNUSUAL,
+					   "Broadcasting penalty TX for epoch "
+					   "%u (%zu bytes)",
+					   bd->epoch, burn_tx.len);
+
+				struct out_req *breq = jsonrpc_request_start(
+					cmd, "sendrawtransaction",
+					rpc_done, rpc_err, fi);
+				json_add_string(breq->js, "tx", burn_hex);
+				send_outreq(breq);
+			} else {
+				plugin_log(plugin_handle, LOG_UNUSUAL,
+					   "Failed to build penalty TX for "
+					   "epoch %u", bd->epoch);
+			}
+			tx_buf_free(&burn_tx);
+		}
+	}
+
+	return notification_handled(cmd);
+}
+
 /* Handle block_added notification — check for breach (old state on-chain).
  * For each factory with breach data, check if any old-epoch txids appeared. */
 static struct command_result *handle_block_added(struct command *cmd,
@@ -4434,6 +4519,36 @@ static struct command_result *handle_block_added(struct command *cmd,
 				   i, fi->expiry_block,
 				   ss_state.current_blockheight,
 				   fi->early_warning_time);
+		}
+
+		/* Breach scan: check if factory's funding UTXO is still
+		 * unspent. Only for factories with real (non-zero) funding
+		 * and at least one revoked epoch. */
+		bool has_real_funding = false;
+		for (int fb = 0; fb < 32; fb++) {
+			if (fi->funding_txid[fb] != 0) {
+				has_real_funding = true;
+				break;
+			}
+		}
+		if (has_real_funding && fi->n_breach_epochs > 0) {
+			char ftxid_hex[65];
+			for (int j = 0; j < 32; j++)
+				sprintf(ftxid_hex + j*2, "%02x",
+					fi->funding_txid[31-j]);
+			ftxid_hex[64] = '\0';
+
+			struct breach_scan_ctx *bctx =
+				tal(cmd, struct breach_scan_ctx);
+			bctx->fi = fi;
+			bctx->factory_idx = i;
+
+			struct out_req *req = jsonrpc_request_start(cmd,
+				"checkutxo", breach_utxo_checked,
+				rpc_err, bctx);
+			json_add_string(req->js, "txid", ftxid_hex);
+			json_add_u32(req->js, "vout", fi->funding_outnum);
+			send_outreq(req);
 		}
 	}
 
