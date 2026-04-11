@@ -285,14 +285,27 @@ static struct command_result *fundchannel_complete_ok(struct command *cmd,
 				cid[j] = (uint8_t)b;
 			}
 			factory_t *f = (factory_t *)fi->lib_factory;
+			uint32_t pi = (uint32_t)(ci + 1);
 			int leaf_idx = f ? factory_find_leaf_for_client(
-				f, (uint32_t)(ci + 1)) : (int)ci;
+				f, pi) : (int)ci;
 			if (leaf_idx < 0) leaf_idx = (int)ci;
-			ss_factory_map_channel(fi, cid, leaf_idx, 0);
+			/* Compute output index within leaf (leaf_side) */
+			int leaf_side = 0;
+			if (f && leaf_idx >= 0 &&
+			    (size_t)leaf_idx < f->n_nodes) {
+				factory_node_t *ln = &f->nodes[leaf_idx];
+				for (size_t s = 0; s < ln->n_signers; s++) {
+					if (ln->signer_indices[s] == pi)
+						break;
+					if (ln->signer_indices[s] != 0)
+						leaf_side++;
+				}
+			}
+			ss_factory_map_channel(fi, cid, leaf_idx, leaf_side);
 			plugin_log(plugin_handle, LOG_INFORM,
 				   "Mapped channel to leaf node %d "
-				   "(client %zu, participant %zu)",
-				   leaf_idx, ci, ci + 1);
+				   "output %d (client %zu, participant %u)",
+				   leaf_idx, leaf_side, ci, pi);
 		}
 	}
 
@@ -374,17 +387,33 @@ static struct command_result *fundchannel_start_ok(struct command *cmd,
 	 * funding outpoint references the actual tree transaction. */
 	factory_t *factory = (factory_t *)fi->lib_factory;
 	int leaf_node_idx = -1;
+	uint32_t leaf_outnum = 0;
 	char leaf_txid_hex[65] = {0};
 
 	if (factory) {
+		uint32_t participant_idx = (uint32_t)(ci + 1);
 		leaf_node_idx = factory_find_leaf_for_client(factory,
-							     (uint32_t)(ci + 1));
+							     participant_idx);
 		if (leaf_node_idx >= 0 &&
 		    (size_t)leaf_node_idx < factory->n_nodes) {
 			for (int j = 0; j < 32; j++)
 				sprintf(leaf_txid_hex + j*2, "%02x",
 					factory->nodes[leaf_node_idx].txid[31 - j]);
 			leaf_txid_hex[64] = '\0';
+
+			/* Compute output index: client's position among
+			 * non-LSP signers on this leaf node.
+			 * Signers are ordered by participant_idx; outputs
+			 * follow the same order (LSP L-stock is last). */
+			factory_node_t *ln = &factory->nodes[leaf_node_idx];
+			uint32_t client_pos = 0;
+			for (size_t s = 0; s < ln->n_signers; s++) {
+				if (ln->signer_indices[s] == participant_idx)
+					break;
+				if (ln->signer_indices[s] != 0) /* skip LSP */
+					client_pos++;
+			}
+			leaf_outnum = client_pos;
 		}
 	}
 
@@ -396,11 +425,11 @@ static struct command_result *fundchannel_start_ok(struct command *cmd,
 	json_add_psbt(req->js, "psbt", psbt);
 	if (leaf_txid_hex[0]) {
 		json_add_string(req->js, "factory_funding_txid", leaf_txid_hex);
-		json_add_u32(req->js, "factory_funding_outnum", 0);
+		json_add_u32(req->js, "factory_funding_outnum", leaf_outnum);
 		plugin_log(plugin_handle, LOG_INFORM,
 			   "fundchannel_complete: factory funding override "
-			   "leaf_node=%d txid=%s",
-			   leaf_node_idx, leaf_txid_hex);
+			   "leaf_node=%d outnum=%u txid=%s",
+			   leaf_node_idx, leaf_outnum, leaf_txid_hex);
 	}
 	send_outreq(req);
 
@@ -537,12 +566,15 @@ static void rotate_finish_and_notify(struct command *cmd,
 				rpc_done, rpc_err, fi);
 			json_add_string(creq->js, "channel_id", cid_hex);
 			json_add_string(creq->js, "new_funding_txid", txid_hex);
-			json_add_u32(creq->js, "new_funding_outnum", 0);
+			json_add_u32(creq->js, "new_funding_outnum",
+				     (uint32_t)fi->channels[ch].leaf_side);
 			send_outreq(creq);
 
 			plugin_log(plugin_handle, LOG_INFORM,
-				   "LSP: triggered factory-change on channel %zu",
-				   ch);
+				   "LSP: triggered factory-change on channel %zu"
+				   " (leaf=%d, outnum=%d)",
+				   ch, fi->channels[ch].leaf_index,
+				   fi->channels[ch].leaf_side);
 		}
 	}
 
