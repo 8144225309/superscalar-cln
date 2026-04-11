@@ -5201,10 +5201,11 @@ static struct command_result *json_factory_buy_liquidity(struct command *cmd,
 
 	/* Check L-stock has enough */
 	if (new_amts[lstock_out] < *amount_sats + 546) {
+		uint64_t avail = new_amts[lstock_out];
 		free(new_amts);
 		return command_fail(cmd, LIGHTNINGD,
 				    "Insufficient L-stock: %"PRIu64" < %"PRIu64,
-				    new_amts[lstock_out], *amount_sats);
+				    avail, *amount_sats);
 	}
 
 	/* Move amount from L-stock to client */
