@@ -837,74 +837,76 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 					 SS_SUBMSG_NONCE_BUNDLE,
 					 rbuf, rlen);
 
-			/* Client can finalize immediately — has all nonces */
-			if (!factory_sessions_finalize(factory)) {
-				plugin_log(plugin_handle, LOG_BROKEN,
-					   "Client: factory_sessions_finalize failed");
-			} else {
-				plugin_log(plugin_handle, LOG_INFORM,
-					   "Client: nonces finalized");
-
-				/* Create partial sigs and send PSIG_BUNDLE */
-				secp256k1_keypair kp;
-				if (!secp256k1_keypair_create(ctx, &kp, our_sec)) {
+			/* In 2-party mode, client has all nonces (its own +
+			 * LSP's) and can finalize + sign immediately.
+			 * In multi-client mode, wait for ALL_NONCES. */
+			if (nb.n_participants <= 2) {
+				if (!factory_sessions_finalize(factory)) {
 					plugin_log(plugin_handle, LOG_BROKEN,
-						   "Client: keypair create failed");
+						   "Client: factory_sessions_finalize failed");
 				} else {
-					nonce_bundle_t psig_nb;
-					memset(&psig_nb, 0, sizeof(psig_nb));
-					memcpy(psig_nb.instance_id, fi->instance_id, 32);
-					psig_nb.n_participants = nb.n_participants;
-					psig_nb.n_nodes = factory->n_nodes;
-					psig_nb.n_entries = 0;
+					plugin_log(plugin_handle, LOG_INFORM,
+						   "Client: nonces finalized (2-party fast path)");
 
-					/* Use stored secnonces from heap-allocated pool */
-					musig_nonce_pool_t *sp =
-						(musig_nonce_pool_t *)fi->nonce_pool;
+					/* Create partial sigs and send PSIG_BUNDLE */
+					secp256k1_keypair kp;
+					if (!secp256k1_keypair_create(ctx, &kp, our_sec)) {
+						plugin_log(plugin_handle, LOG_BROKEN,
+							   "Client: keypair create failed");
+					} else {
+						nonce_bundle_t psig_nb;
+						memset(&psig_nb, 0, sizeof(psig_nb));
+						memcpy(psig_nb.instance_id, fi->instance_id, 32);
+						psig_nb.n_participants = nb.n_participants;
+						psig_nb.n_nodes = factory->n_nodes;
+						psig_nb.n_entries = 0;
 
-					for (size_t si = 0; si < fi->n_secnonces; si++) {
-						uint32_t pi = fi->secnonce_pool_idx[si];
-						uint32_t ni = fi->secnonce_node_idx[si];
-						secp256k1_musig_secnonce *sn =
-							&sp->nonces[pi].secnonce;
+						musig_nonce_pool_t *sp =
+							(musig_nonce_pool_t *)fi->nonce_pool;
 
-						int slot = factory_find_signer_slot(
-							factory, ni, fi->our_participant_idx);
-						if (slot < 0) continue;
+						for (size_t si = 0; si < fi->n_secnonces; si++) {
+							uint32_t pi = fi->secnonce_pool_idx[si];
+							uint32_t ni = fi->secnonce_node_idx[si];
+							secp256k1_musig_secnonce *sn =
+								&sp->nonces[pi].secnonce;
 
-						secp256k1_musig_partial_sig psig;
-						if (!musig_create_partial_sig(
-							ctx, &psig, sn, &kp,
-							&factory->nodes[ni].signing_session)) {
-							plugin_log(plugin_handle, LOG_BROKEN,
-								   "Client: partial_sig failed node %u", ni);
-							continue;
+							int slot = factory_find_signer_slot(
+								factory, ni, fi->our_participant_idx);
+							if (slot < 0) continue;
+
+							secp256k1_musig_partial_sig psig;
+							if (!musig_create_partial_sig(
+								ctx, &psig, sn, &kp,
+								&factory->nodes[ni].signing_session))
+								continue;
+
+							musig_partial_sig_serialize(ctx,
+								psig_nb.entries[psig_nb.n_entries].pubnonce,
+								&psig);
+							psig_nb.entries[psig_nb.n_entries].node_idx = ni;
+							psig_nb.entries[psig_nb.n_entries].signer_slot = slot;
+							psig_nb.n_entries++;
 						}
 
-						musig_partial_sig_serialize(ctx,
-							psig_nb.entries[psig_nb.n_entries].pubnonce,
-							&psig);
-						psig_nb.entries[psig_nb.n_entries].node_idx = ni;
-						psig_nb.entries[psig_nb.n_entries].signer_slot = slot;
-						psig_nb.n_entries++;
+						uint8_t pbuf[MAX_WIRE_BUF];
+						size_t plen = nonce_bundle_serialize(
+							&psig_nb, pbuf, sizeof(pbuf));
+						send_factory_msg(cmd, peer_id,
+							SS_SUBMSG_PSIG_BUNDLE,
+							pbuf, plen);
+
+						plugin_log(plugin_handle, LOG_INFORM,
+							   "Client: sent PSIG_BUNDLE "
+							   "(%zu psigs)", psig_nb.n_entries);
 					}
-
-					plugin_log(plugin_handle, LOG_INFORM,
-						   "Client: created %zu partial sigs",
-						   psig_nb.n_entries);
-
-					/* Send PSIG_BUNDLE to LSP */
-					uint8_t pbuf[MAX_WIRE_BUF];
-					size_t plen = nonce_bundle_serialize(
-						&psig_nb, pbuf, sizeof(pbuf));
-					send_factory_msg(cmd, peer_id,
-						SS_SUBMSG_PSIG_BUNDLE,
-						pbuf, plen);
-
-					plugin_log(plugin_handle, LOG_INFORM,
-						   "Client: sent PSIG_BUNDLE (%zu bytes)",
-						   4 + plen);
 				}
+			} else {
+				/* Multi-client: wait for ALL_NONCES to get
+				 * other clients' nonces before finalizing */
+				plugin_log(plugin_handle, LOG_INFORM,
+					   "Client: sent NONCE_BUNDLE, waiting "
+					   "for ALL_NONCES (%u participants)",
+					   nb.n_participants);
 			}
 
 			fi->ceremony = CEREMONY_PROPOSED;
@@ -975,6 +977,30 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 				nonces_set++;
 			}
 
+			/* Cache this client's nonce entries for ALL_NONCES */
+			{
+				nonce_entry_t *cache =
+					(nonce_entry_t *)fi->cached_nonces;
+				size_t new_total = fi->n_cached_nonces
+					+ cnb.n_entries;
+				if (new_total > fi->cached_nonces_cap) {
+					size_t new_cap = new_total + 64;
+					cache = realloc(cache,
+						new_cap * sizeof(nonce_entry_t));
+					if (cache) {
+						fi->cached_nonces = cache;
+						fi->cached_nonces_cap = new_cap;
+					}
+				}
+				if (cache) {
+					memcpy(cache + fi->n_cached_nonces,
+					       cnb.entries,
+					       cnb.n_entries
+					       * sizeof(nonce_entry_t));
+					fi->n_cached_nonces = new_total;
+				}
+			}
+
 			/* Find which client sent this */
 			client_state_t *cl = NULL;
 			if (strlen(peer_id) == 66) {
@@ -1034,15 +1060,65 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 				/* For 2-party mode, the client already sent
 				 * both nonces AND psigs together, skipping
 				 * the ALL_NONCES round. For 3+ participants,
-				 * we need to broadcast ALL_NONCES so clients
-				 * can finalize and create partial sigs.
-				 * Multi-client ALL_NONCES needs nonce caching
-				 * in the NONCE_BUNDLE handler — pending. */
+				 * broadcast ALL_NONCES from cache so clients
+				 * can finalize and create partial sigs. */
 				if (fi->n_clients > 1) {
-					plugin_log(plugin_handle, LOG_UNUSUAL,
-						   "LSP: multi-client ALL_NONCES "
-						   "round not yet implemented "
-						   "(%zu clients)", fi->n_clients);
+					nonce_entry_t *cache =
+						(nonce_entry_t *)fi->cached_nonces;
+					if (!cache || fi->n_cached_nonces == 0) {
+						plugin_log(plugin_handle, LOG_BROKEN,
+							   "LSP: no cached nonces "
+							   "for ALL_NONCES");
+					} else {
+						nonce_bundle_t all_nb;
+						memset(&all_nb, 0, sizeof(all_nb));
+						memcpy(all_nb.instance_id,
+							fi->instance_id, 32);
+						all_nb.n_participants =
+							1 + fi->n_clients;
+						factory_t *af =
+							(factory_t *)fi->lib_factory;
+						all_nb.n_nodes = af ?
+							af->n_nodes : 0;
+
+						/* Copy cached entries */
+						size_t n = fi->n_cached_nonces;
+						if (n > MAX_NONCE_ENTRIES)
+							n = MAX_NONCE_ENTRIES;
+						memcpy(all_nb.entries, cache,
+						       n * sizeof(nonce_entry_t));
+						all_nb.n_entries = n;
+
+						uint8_t anbuf[MAX_WIRE_BUF];
+						size_t anlen =
+							nonce_bundle_serialize(
+								&all_nb, anbuf,
+								sizeof(anbuf));
+
+						for (size_t ci = 0;
+						     ci < fi->n_clients; ci++) {
+							char nid[67];
+							for (int j = 0; j < 33; j++)
+								sprintf(nid + j*2,
+									"%02x",
+									fi->clients[ci].node_id[j]);
+							nid[66] = '\0';
+							send_factory_msg(cmd, nid,
+								SS_SUBMSG_ALL_NONCES,
+								anbuf, anlen);
+						}
+						plugin_log(plugin_handle,
+							   LOG_INFORM,
+							   "LSP: sent ALL_NONCES "
+							   "to %zu clients "
+							   "(%zu entries)",
+							   fi->n_clients, n);
+					}
+
+					/* Free nonce cache */
+					free(fi->cached_nonces);
+					fi->cached_nonces = NULL;
+					fi->n_cached_nonces = 0;
 				}
 			}
 
@@ -1184,7 +1260,30 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 				   "LSP: set %zu/%zu client partial sigs",
 				   psigs_set, pnb.n_entries);
 
-			/* Create LSP's own partial sigs using stored secnonces */
+			/* Track which client sent this */
+			if (strlen(peer_id) == 66) {
+				uint8_t pid[33];
+				for (int j = 0; j < 33; j++) {
+					unsigned int b;
+					sscanf(peer_id + j*2, "%02x", &b);
+					pid[j] = (uint8_t)b;
+				}
+				client_state_t *pcl =
+					ss_factory_find_client(fi, pid);
+				if (pcl)
+					pcl->psig_received = true;
+				else if (fi->n_clients == 1)
+					fi->clients[0].psig_received = true;
+			}
+
+			/* Wait for ALL clients before LSP signs + completes */
+			if (!ss_factory_all_psigs_received(fi)) {
+				plugin_log(plugin_handle, LOG_INFORM,
+					   "LSP: waiting for more PSIG_BUNDLEs");
+				break;
+			}
+
+			/* All clients have sent psigs — create LSP's own */
 			{
 				secp256k1_keypair lsp_kp;
 				if (!secp256k1_keypair_create(global_secp_ctx,
@@ -2933,6 +3032,15 @@ static struct command_result *json_factory_create(struct command *cmd,
 				nb.entries[nb.n_entries].signer_slot = slot;
 				nb.n_entries++;
 			}
+
+			/* Cache LSP's nonce entries for ALL_NONCES round */
+			if (fi->cached_nonces) free(fi->cached_nonces);
+			fi->cached_nonces = calloc(nb.n_entries,
+				sizeof(nonce_entry_t));
+			fi->n_cached_nonces = nb.n_entries;
+			fi->cached_nonces_cap = nb.n_entries;
+			memcpy(fi->cached_nonces, nb.entries,
+			       nb.n_entries * sizeof(nonce_entry_t));
 
 			plugin_log(plugin_handle, LOG_INFORM,
 				   "MuSig2 nonces: %zu entries for %zu nodes",

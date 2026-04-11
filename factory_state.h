@@ -20,7 +20,8 @@
  * Matches FACTORY_MAX_SIGNERS in libsuperscalar v0.1.9. */
 #define MAX_FACTORY_PARTICIPANTS 64
 
-/* Max nonce entries (must match nonce_exchange.h) */
+/* Max nonce entries (must match nonce_exchange.h).
+ * 1024 supports factories up to ~10 participants. */
 #ifndef MAX_NONCE_ENTRIES
 #define MAX_NONCE_ENTRIES 1024
 #endif
@@ -114,6 +115,14 @@ typedef struct factory_instance {
 	/* Distribution TX standalone MuSig2 signing session.
 	 * Separate from tree node sessions — uses root keyagg. */
 	void *dist_session;  /* musig_signing_session_t* */
+
+	/* Cached nonce entries for ALL_NONCES broadcast (multi-client).
+	 * Populated during FACTORY_PROPOSE (LSP's own nonces) and
+	 * NONCE_BUNDLE (each client's nonces). Sent as ALL_NONCES
+	 * when all clients have responded. Heap-allocated. */
+	void *cached_nonces;     /* nonce_entry_t* array */
+	size_t n_cached_nonces;
+	size_t cached_nonces_cap;
 
 	/* MuSig2 nonce pool (heap-allocated, secnonces live inside) */
 	void *nonce_pool;
