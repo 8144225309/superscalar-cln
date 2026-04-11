@@ -687,17 +687,29 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 		/* Client side: deserialize nonce bundle, init factory,
 		 * generate our nonces, respond with NONCE_BUNDLE. */
 		{
-			nonce_bundle_t nb;
-			if (!nonce_bundle_deserialize(&nb, data, len)) {
+			/* Heap-allocate: 79KB with MAX_NONCE_ENTRIES=1024 */
+			nonce_bundle_t *nb = calloc(1, sizeof(*nb));
+			if (!nb) break;
+
+			/* Payload = nonce_bundle || 4-byte participant_idx */
+			if (len < 4 || !nonce_bundle_deserialize(nb, data, len - 4)) {
 				plugin_log(plugin_handle, LOG_UNUSUAL,
 					   "Bad FACTORY_PROPOSE payload");
+				free(nb);
 				break;
 			}
 
-			fi = ss_factory_new(&ss_state, nb.instance_id);
+			/* Read participant index from last 4 bytes */
+			uint32_t our_pidx = ((uint32_t)data[len-4] << 24) |
+					    ((uint32_t)data[len-3] << 16) |
+					    ((uint32_t)data[len-2] << 8)  |
+					     (uint32_t)data[len-1];
+
+			fi = ss_factory_new(&ss_state, nb->instance_id);
 			if (!fi) {
 				plugin_log(plugin_handle, LOG_UNUSUAL,
 					   "Failed to create factory");
+				free(nb);
 				break;
 			}
 			fi->is_lsp = false;
@@ -713,32 +725,35 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 
 			/* Use pubkeys from the bundle (same as LSP's) */
 			secp256k1_context *ctx = global_secp_ctx;
-			secp256k1_pubkey *pubkeys = calloc(nb.n_participants,
+			secp256k1_pubkey *pubkeys = calloc(nb->n_participants,
 				sizeof(secp256k1_pubkey));
 
-			for (uint32_t pk = 0; pk < nb.n_participants; pk++) {
+			for (uint32_t pk = 0; pk < nb->n_participants; pk++) {
 				if (!secp256k1_ec_pubkey_parse(ctx,
 					&pubkeys[pk],
-					nb.pubkeys[pk], 33)) {
+					nb->pubkeys[pk], 33)) {
 					plugin_log(plugin_handle, LOG_BROKEN,
 						   "Bad pubkey %u in propose", pk);
 					free(pubkeys);
+					free(nb);
 					break;
 				}
 			}
 
-			/* Derive our keypair deterministically from instance_id.
-			 * We're participant 1 (first client). */
+			/* Derive our keypair from instance_id using our participant index. */
 			unsigned char our_sec[32];
-			int our_idx = 1;
-			derive_factory_seckey(our_sec, nb.instance_id, our_idx);
+			int our_idx = (int)our_pidx;
+			derive_factory_seckey(our_sec, nb->instance_id, our_idx);
+			plugin_log(plugin_handle, LOG_INFORM,
+				   "Client: FACTORY_PROPOSE, our_participant_idx=%d",
+				   our_idx);
 
 			/* Init and build tree with LSP's pubkeys */
 			factory_t *factory = calloc(1, sizeof(factory_t));
 			factory_init_from_pubkeys(factory, ctx,
-				pubkeys, nb.n_participants,
+				pubkeys, nb->n_participants,
 				DW_STEP_BLOCKS, 16);
-			if (nb.n_participants <= 2)
+			if (nb->n_participants <= 2)
 				factory_set_arity(factory, FACTORY_ARITY_1);
 			else
 				factory_set_arity(factory, FACTORY_ARITY_2);
@@ -756,6 +771,7 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 					   "Client: factory_build_tree failed");
 				free(factory);
 				free(pubkeys);
+				free(nb);
 				break;
 			}
 			factory_sessions_init(factory);
@@ -766,13 +782,13 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 				   (size_t)factory->n_nodes);
 
 			/* Set LSP nonces on our sessions */
-			for (size_t e = 0; e < nb.n_entries; e++) {
+			for (size_t e = 0; e < nb->n_entries; e++) {
 				secp256k1_musig_pubnonce pn;
 				musig_pubnonce_parse(ctx, &pn,
-					nb.entries[e].pubnonce);
+					nb->entries[e].pubnonce);
 				factory_session_set_nonce(factory,
-					nb.entries[e].node_idx,
-					nb.entries[e].signer_slot,
+					nb->entries[e].node_idx,
+					nb->entries[e].signer_slot,
 					&pn);
 			}
 
@@ -799,7 +815,7 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 				break;
 			}
 			memcpy(resp->instance_id, fi->instance_id, 32);
-			resp->n_participants = nb.n_participants;
+			resp->n_participants = nb->n_participants;
 			resp->n_nodes = factory->n_nodes;
 			resp->n_entries = 0;
 
@@ -856,7 +872,7 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 			/* In 2-party mode, client has all nonces (its own +
 			 * LSP's) and can finalize + sign immediately.
 			 * In multi-client mode, wait for ALL_NONCES. */
-			if (nb.n_participants <= 2) {
+			if (nb->n_participants <= 2) {
 				if (!factory_sessions_finalize(factory)) {
 					plugin_log(plugin_handle, LOG_BROKEN,
 						   "Client: factory_sessions_finalize failed");
@@ -873,7 +889,7 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 						nonce_bundle_t psig_nb;
 						memset(&psig_nb, 0, sizeof(psig_nb));
 						memcpy(psig_nb.instance_id, fi->instance_id, 32);
-						psig_nb.n_participants = nb.n_participants;
+						psig_nb.n_participants = nb->n_participants;
 						psig_nb.n_nodes = factory->n_nodes;
 						psig_nb.n_entries = 0;
 
@@ -922,11 +938,12 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 				plugin_log(plugin_handle, LOG_INFORM,
 					   "Client: sent NONCE_BUNDLE, waiting "
 					   "for ALL_NONCES (%u participants)",
-					   nb.n_participants);
+					   nb->n_participants);
 			}
 
 			fi->ceremony = CEREMONY_PROPOSED;
 			free(pubkeys);
+			free(nb);
 			plugin_log(plugin_handle, LOG_INFORM,
 				   "Client: sent NONCE_BUNDLE (%zu bytes)",
 				   4 + rlen);
@@ -3116,19 +3133,33 @@ static struct command_result *json_factory_create(struct command *cmd,
 
 			fi->ceremony = CEREMONY_PROPOSED;
 
-			/* Send FACTORY_PROPOSE to each client via piggyback */
+			/* Send FACTORY_PROPOSE to each client.
+			 * Append participant index (4 bytes, big-endian) so
+			 * clients know their slot (LSP=0, clients 1..n). */
 			for (size_t ci = 0; ci < fi->n_clients; ci++) {
 				char client_hex[67];
 				for (int h = 0; h < 33; h++)
 					sprintf(client_hex + h*2, "%02x",
 						fi->clients[ci].node_id[h]);
+
+				/* Build per-client buffer: nonce bundle + 4-byte idx */
+				uint32_t pidx = (uint32_t)(ci + 1); /* LSP=0, clients=1+ */
+				uint8_t *cbuf = calloc(1, blen + 4);
+				memcpy(cbuf, nbuf, blen);
+				cbuf[blen]     = (pidx >> 24) & 0xFF;
+				cbuf[blen + 1] = (pidx >> 16) & 0xFF;
+				cbuf[blen + 2] = (pidx >> 8)  & 0xFF;
+				cbuf[blen + 3] =  pidx         & 0xFF;
+
 				send_factory_msg(cmd, client_hex,
 					SS_SUBMSG_FACTORY_PROPOSE,
-					nbuf, blen);
+					cbuf, blen + 4);
+				free(cbuf);
 
 				plugin_log(plugin_handle, LOG_INFORM,
 					   "Sent FACTORY_PROPOSE to client %zu "
-					   "(%zu bytes)", ci, blen);
+					   "(%zu bytes, participant_idx=%u)",
+					   ci, blen + 4, pidx);
 			}
 			free(nbuf);
 		}
