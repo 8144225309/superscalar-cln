@@ -274,8 +274,9 @@ static struct command_result *fundchannel_complete_ok(struct command *cmd,
 			   "Factory channel opened for client %zu: "
 			   "channel_id=%s", ci, cid_hex ? cid_hex : "?");
 
-		/* Map channel to factory leaf.
-		 * leaf_index = client index (each client gets one leaf). */
+		/* Map channel to its DW tree leaf node.
+		 * Use factory_find_leaf_for_client to get the correct
+		 * node index (ci+1 is the participant index for this client). */
 		if (cid_hex && strlen(cid_hex) == 64) {
 			uint8_t cid[32];
 			for (int j = 0; j < 32; j++) {
@@ -283,7 +284,15 @@ static struct command_result *fundchannel_complete_ok(struct command *cmd,
 				sscanf(cid_hex + j*2, "%02x", &b);
 				cid[j] = (uint8_t)b;
 			}
-			ss_factory_map_channel(fi, cid, (int)ci, 0);
+			factory_t *f = (factory_t *)fi->lib_factory;
+			int leaf_idx = f ? factory_find_leaf_for_client(
+				f, (uint32_t)(ci + 1)) : (int)ci;
+			if (leaf_idx < 0) leaf_idx = (int)ci;
+			ss_factory_map_channel(fi, cid, leaf_idx, 0);
+			plugin_log(plugin_handle, LOG_INFORM,
+				   "Mapped channel to leaf node %d "
+				   "(client %zu, participant %zu)",
+				   leaf_idx, ci, ci + 1);
 		}
 	}
 
@@ -361,12 +370,38 @@ static struct command_result *fundchannel_start_ok(struct command *cmd,
 		sprintf(nid + j*2, "%02x", fi->clients[ci].node_id[j]);
 	nid[66] = '\0';
 
-	/* Call fundchannel_complete with the PSBT */
+	/* Look up the real DW leaf node for this client so the channel's
+	 * funding outpoint references the actual tree transaction. */
+	factory_t *factory = (factory_t *)fi->lib_factory;
+	int leaf_node_idx = -1;
+	char leaf_txid_hex[65] = {0};
+
+	if (factory) {
+		leaf_node_idx = factory_find_leaf_for_client(factory,
+							     (uint32_t)(ci + 1));
+		if (leaf_node_idx >= 0 &&
+		    (size_t)leaf_node_idx < factory->n_nodes) {
+			for (int j = 0; j < 32; j++)
+				sprintf(leaf_txid_hex + j*2, "%02x",
+					factory->nodes[leaf_node_idx].txid[31 - j]);
+			leaf_txid_hex[64] = '\0';
+		}
+	}
+
+	/* Call fundchannel_complete with the PSBT + factory funding override */
 	struct out_req *req = jsonrpc_request_start(cmd,
 		"fundchannel_complete",
 		fundchannel_complete_ok, rpc_err, ctx);
 	json_add_string(req->js, "id", nid);
 	json_add_psbt(req->js, "psbt", psbt);
+	if (leaf_txid_hex[0]) {
+		json_add_string(req->js, "factory_funding_txid", leaf_txid_hex);
+		json_add_u32(req->js, "factory_funding_outnum", 0);
+		plugin_log(plugin_handle, LOG_INFORM,
+			   "fundchannel_complete: factory funding override "
+			   "leaf_node=%d txid=%s",
+			   leaf_node_idx, leaf_txid_hex);
+	}
 	send_outreq(req);
 
 	plugin_log(plugin_handle, LOG_INFORM,
