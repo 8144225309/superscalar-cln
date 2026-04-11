@@ -219,7 +219,7 @@ static struct command_result *withdraw_funding_ok(struct command *cmd,
 	 * finalize sessions, send ALL_NONCES. */
 	continue_after_funding(cmd, fctx);
 
-	return command_still_pending(cmd);
+	return command_hook_success(cmd);
 }
 
 static struct command_result *withdraw_funding_err(struct command *cmd,
@@ -233,7 +233,7 @@ static struct command_result *withdraw_funding_err(struct command *cmd,
 	const char *err_str = json_strdup(tmpctx, buf, result);
 	plugin_log(plugin_handle, LOG_BROKEN,
 		   "withdraw failed: %s", err_str ? err_str : "unknown");
-	return notification_handled(cmd);
+	return command_hook_success(cmd);
 }
 
 /* Send a SuperScalar message wrapped in factory_piggyback (submsg 4).
@@ -3905,6 +3905,14 @@ static struct command_result *handle_custommsg(struct command *cmd,
 	submsg_id = (payload[2] << 8) | payload[3];
 	dispatch_blip56_submsg(cmd, peer_id, submsg_id,
 			       payload + 4, tal_bytelen(payload) - 4);
+
+	/* If a factory entered CEREMONY_FUNDING_PENDING, an async RPC
+	 * (withdraw) is in flight. Don't destroy cmd yet — the callback
+	 * will call command_hook_success when done. */
+	for (size_t i = 0; i < ss_state.n_factories; i++) {
+		if (ss_state.factories[i]->ceremony == CEREMONY_FUNDING_PENDING)
+			return command_still_pending(cmd);
+	}
 
 	return command_hook_success(cmd);
 }
