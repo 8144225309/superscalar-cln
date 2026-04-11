@@ -944,50 +944,53 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 			   fi ? "found" : "NULL",
 			   fi ? fi->is_lsp : -1);
 		if (fi && fi->is_lsp) {
-			nonce_bundle_t cnb;
-			if (!nonce_bundle_deserialize(&cnb, data, len)) {
+			/* Heap-allocate: 79KB with MAX_NONCE_ENTRIES=1024 */
+			nonce_bundle_t *cnb = calloc(1, sizeof(*cnb));
+			if (!cnb) break;
+			if (!nonce_bundle_deserialize(cnb, data, len)) {
 				plugin_log(plugin_handle, LOG_UNUSUAL,
 					   "Bad NONCE_BUNDLE");
+				free(cnb);
 				break;
 			}
 
 			factory_t *f = (factory_t *)fi->lib_factory;
-			if (!f) break;
+			if (!f) { free(cnb); break; }
 
 			secp256k1_context *ctx = global_secp_ctx;
 
 			/* Set client nonces on sessions */
 			size_t nonces_set = 0;
-			for (size_t e = 0; e < cnb.n_entries; e++) {
+			for (size_t e = 0; e < cnb->n_entries; e++) {
 				secp256k1_musig_pubnonce pn;
 				if (!musig_pubnonce_parse(ctx, &pn,
-					cnb.entries[e].pubnonce)) {
+					cnb->entries[e].pubnonce)) {
 					/* Dump first 8 bytes for debug */
 					plugin_log(plugin_handle, LOG_BROKEN,
 						   "LSP: bad pubnonce entry %zu "
 						   "node=%u slot=%u "
 						   "bytes=%02x%02x%02x%02x%02x%02x%02x%02x",
-						   e, cnb.entries[e].node_idx,
-						   cnb.entries[e].signer_slot,
-						   cnb.entries[e].pubnonce[0],
-						   cnb.entries[e].pubnonce[1],
-						   cnb.entries[e].pubnonce[2],
-						   cnb.entries[e].pubnonce[3],
-						   cnb.entries[e].pubnonce[4],
-						   cnb.entries[e].pubnonce[5],
-						   cnb.entries[e].pubnonce[6],
-						   cnb.entries[e].pubnonce[7]);
+						   e, cnb->entries[e].node_idx,
+						   cnb->entries[e].signer_slot,
+						   cnb->entries[e].pubnonce[0],
+						   cnb->entries[e].pubnonce[1],
+						   cnb->entries[e].pubnonce[2],
+						   cnb->entries[e].pubnonce[3],
+						   cnb->entries[e].pubnonce[4],
+						   cnb->entries[e].pubnonce[5],
+						   cnb->entries[e].pubnonce[6],
+						   cnb->entries[e].pubnonce[7]);
 					continue;
 				}
 				if (!factory_session_set_nonce(f,
-					cnb.entries[e].node_idx,
-					cnb.entries[e].signer_slot,
+					cnb->entries[e].node_idx,
+					cnb->entries[e].signer_slot,
 					&pn)) {
 					plugin_log(plugin_handle, LOG_BROKEN,
 						   "LSP: set_nonce failed "
 						   "node=%u slot=%u",
-						   cnb.entries[e].node_idx,
-						   cnb.entries[e].signer_slot);
+						   cnb->entries[e].node_idx,
+						   cnb->entries[e].signer_slot);
 					continue;
 				}
 				nonces_set++;
@@ -997,13 +1000,13 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 			{
 				nonce_entry_t *cache =
 					(nonce_entry_t *)fi->cached_nonces;
-				if (cache && fi->n_cached_nonces + cnb.n_entries
+				if (cache && fi->n_cached_nonces + cnb->n_entries
 				    <= fi->cached_nonces_cap) {
 					memcpy(cache + fi->n_cached_nonces,
-					       cnb.entries,
-					       cnb.n_entries
+					       cnb->entries,
+					       cnb->n_entries
 					       * sizeof(nonce_entry_t));
-					fi->n_cached_nonces += cnb.n_entries;
+					fi->n_cached_nonces += cnb->n_entries;
 				}
 			}
 
@@ -1035,7 +1038,7 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 
 			plugin_log(plugin_handle, LOG_INFORM,
 				   "LSP: set %zu/%zu client nonces",
-				   nonces_set, cnb.n_entries);
+				   nonces_set, cnb->n_entries);
 
 			/* Debug: log session state before finalize */
 			for (size_t di = 0; di < f->n_nodes; di++) {
@@ -1056,6 +1059,7 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 				if (!factory_sessions_finalize(f)) {
 					plugin_log(plugin_handle, LOG_BROKEN,
 						   "factory_sessions_finalize failed");
+					free(cnb);
 					break;
 				}
 
@@ -1076,50 +1080,53 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 							   "LSP: no cached nonces "
 							   "for ALL_NONCES");
 					} else {
-						nonce_bundle_t all_nb;
-						memset(&all_nb, 0, sizeof(all_nb));
-						memcpy(all_nb.instance_id,
-							fi->instance_id, 32);
-						all_nb.n_participants =
-							1 + fi->n_clients;
-						factory_t *af =
-							(factory_t *)fi->lib_factory;
-						all_nb.n_nodes = af ?
-							af->n_nodes : 0;
+						/* Heap-allocate: 79KB with 1024 entries */
+						nonce_bundle_t *all_nb = calloc(1, sizeof(*all_nb));
+						if (all_nb) {
+							memcpy(all_nb->instance_id,
+								fi->instance_id, 32);
+							all_nb->n_participants =
+								1 + fi->n_clients;
+							factory_t *af =
+								(factory_t *)fi->lib_factory;
+							all_nb->n_nodes = af ?
+								af->n_nodes : 0;
 
-						/* Copy cached entries */
-						size_t n = fi->n_cached_nonces;
-						if (n > MAX_NONCE_ENTRIES)
-							n = MAX_NONCE_ENTRIES;
-						memcpy(all_nb.entries, cache,
-						       n * sizeof(nonce_entry_t));
-						all_nb.n_entries = n;
+							/* Copy cached entries */
+							size_t n = fi->n_cached_nonces;
+							if (n > MAX_NONCE_ENTRIES)
+								n = MAX_NONCE_ENTRIES;
+							memcpy(all_nb->entries, cache,
+							       n * sizeof(nonce_entry_t));
+							all_nb->n_entries = n;
 
-						uint8_t *anbuf = calloc(1, MAX_WIRE_BUF);
-						size_t anlen =
-							nonce_bundle_serialize(
-								&all_nb, anbuf,
-								MAX_WIRE_BUF);
+							uint8_t *anbuf = calloc(1, MAX_WIRE_BUF);
+							size_t anlen =
+								nonce_bundle_serialize(
+									all_nb, anbuf,
+									MAX_WIRE_BUF);
+							free(all_nb);
 
-						for (size_t ci = 0;
-						     ci < fi->n_clients; ci++) {
-							char nid[67];
-							for (int j = 0; j < 33; j++)
-								sprintf(nid + j*2,
-									"%02x",
-									fi->clients[ci].node_id[j]);
-							nid[66] = '\0';
-							send_factory_msg(cmd, nid,
-								SS_SUBMSG_ALL_NONCES,
-								anbuf, anlen);
+							for (size_t ci = 0;
+							     ci < fi->n_clients; ci++) {
+								char nid[67];
+								for (int j = 0; j < 33; j++)
+									sprintf(nid + j*2,
+										"%02x",
+										fi->clients[ci].node_id[j]);
+								nid[66] = '\0';
+								send_factory_msg(cmd, nid,
+									SS_SUBMSG_ALL_NONCES,
+									anbuf, anlen);
+							}
+							free(anbuf);
+							plugin_log(plugin_handle,
+								   LOG_INFORM,
+								   "LSP: sent ALL_NONCES "
+								   "to %zu clients "
+								   "(%zu entries)",
+								   fi->n_clients, n);
 						}
-						free(anbuf);
-						plugin_log(plugin_handle,
-							   LOG_INFORM,
-							   "LSP: sent ALL_NONCES "
-							   "to %zu clients "
-							   "(%zu entries)",
-							   fi->n_clients, n);
 					}
 
 					/* Free nonce cache */
@@ -1129,6 +1136,7 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 				}
 			}
 
+			free(cnb);
 			/* ctx is global */
 		}
 		break;
@@ -1140,34 +1148,39 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 		/* Client: LSP sent all aggregated nonces. Set missing nonces
 		 * on our sessions, finalize, create partial sigs, respond. */
 		if (fi && !fi->is_lsp) {
-			nonce_bundle_t anb;
-			if (!nonce_bundle_deserialize(&anb, data, len))
+			/* Heap-allocate both bundles: 79KB each with 1024 entries */
+			nonce_bundle_t *anb = calloc(1, sizeof(*anb));
+			if (!anb) break;
+			if (!nonce_bundle_deserialize(anb, data, len)) {
+				free(anb);
 				break;
+			}
 			factory_t *f = (factory_t *)fi->lib_factory;
-			if (!f) break;
+			if (!f) { free(anb); break; }
 			secp256k1_context *ctx = global_secp_ctx;
 
 			/* Set all nonces from the bundle */
 			size_t set_count = 0;
-			for (size_t e = 0; e < anb.n_entries; e++) {
+			for (size_t e = 0; e < anb->n_entries; e++) {
 				secp256k1_musig_pubnonce pn;
 				if (!musig_pubnonce_parse(ctx, &pn,
-					anb.entries[e].pubnonce))
+					anb->entries[e].pubnonce))
 					continue;
 				factory_session_set_nonce(f,
-					anb.entries[e].node_idx,
-					anb.entries[e].signer_slot, &pn);
+					anb->entries[e].node_idx,
+					anb->entries[e].signer_slot, &pn);
 				set_count++;
 			}
 
 			plugin_log(plugin_handle, LOG_INFORM,
 				   "Client: set %zu/%zu nonces from ALL_NONCES",
-				   set_count, anb.n_entries);
+				   set_count, anb->n_entries);
 
 			/* Finalize all sessions */
 			if (!factory_sessions_finalize(f)) {
 				plugin_log(plugin_handle, LOG_BROKEN,
 					   "Client: finalize after ALL_NONCES failed");
+				free(anb);
 				break;
 			}
 
@@ -1178,15 +1191,17 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 			derive_factory_seckey(our_sec, fi->instance_id,
 				fi->our_participant_idx);
 			secp256k1_keypair kp;
-			if (!secp256k1_keypair_create(ctx, &kp, our_sec))
+			if (!secp256k1_keypair_create(ctx, &kp, our_sec)) {
+				free(anb);
 				break;
+			}
 
-			nonce_bundle_t psig_nb;
-			memset(&psig_nb, 0, sizeof(psig_nb));
-			memcpy(psig_nb.instance_id, fi->instance_id, 32);
-			psig_nb.n_participants = anb.n_participants;
-			psig_nb.n_nodes = f->n_nodes;
-			psig_nb.n_entries = 0;
+			nonce_bundle_t *psig_nb = calloc(1, sizeof(*psig_nb));
+			if (!psig_nb) { free(anb); break; }
+			memcpy(psig_nb->instance_id, fi->instance_id, 32);
+			psig_nb->n_participants = anb->n_participants;
+			psig_nb->n_nodes = f->n_nodes;
+			psig_nb->n_entries = 0;
 
 			musig_nonce_pool_t *sp =
 				(musig_nonce_pool_t *)fi->nonce_pool;
@@ -1207,23 +1222,28 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 					continue;
 
 				musig_partial_sig_serialize(ctx,
-					psig_nb.entries[psig_nb.n_entries].pubnonce,
+					psig_nb->entries[psig_nb->n_entries].pubnonce,
 					&psig);
-				psig_nb.entries[psig_nb.n_entries].node_idx = ni;
-				psig_nb.entries[psig_nb.n_entries].signer_slot = slot;
-				psig_nb.n_entries++;
+				psig_nb->entries[psig_nb->n_entries].node_idx = ni;
+				psig_nb->entries[psig_nb->n_entries].signer_slot = slot;
+				psig_nb->n_entries++;
 			}
 
-			uint8_t pbuf[MAX_WIRE_BUF];
-			size_t plen = nonce_bundle_serialize(
-				&psig_nb, pbuf, sizeof(pbuf));
+			uint8_t *pbuf = calloc(1, MAX_WIRE_BUF);
+			size_t plen = 0;
+			if (pbuf)
+				plen = nonce_bundle_serialize(
+					psig_nb, pbuf, MAX_WIRE_BUF);
 			send_factory_msg(cmd, peer_id,
 				SS_SUBMSG_PSIG_BUNDLE, pbuf, plen);
 
 			plugin_log(plugin_handle, LOG_INFORM,
 				   "Client: sent PSIG_BUNDLE from ALL_NONCES "
 				   "(%zu partial sigs, %zu bytes)",
-				   psig_nb.n_entries, plen);
+				   psig_nb->n_entries, plen);
+			free(pbuf);
+			free(psig_nb);
+			free(anb);
 		}
 		break;
 
@@ -1232,29 +1252,32 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 			   "PSIG_BUNDLE from %s (len=%zu)",
 			   peer_id, len);
 		if (fi && fi->is_lsp) {
-			nonce_bundle_t pnb;
-			if (!nonce_bundle_deserialize(&pnb, data, len)) {
+			/* Heap-allocate: 79KB with MAX_NONCE_ENTRIES=1024 */
+			nonce_bundle_t *pnb = calloc(1, sizeof(*pnb));
+			if (!pnb) break;
+			if (!nonce_bundle_deserialize(pnb, data, len)) {
 				plugin_log(plugin_handle, LOG_UNUSUAL,
 					   "Bad PSIG_BUNDLE");
+				free(pnb);
 				break;
 			}
 
 			factory_t *f = (factory_t *)fi->lib_factory;
-			if (!f) break;
+			if (!f) { free(pnb); break; }
 
 			/* Set client partial sigs */
 			size_t psigs_set = 0;
-			for (size_t e = 0; e < pnb.n_entries; e++) {
+			for (size_t e = 0; e < pnb->n_entries; e++) {
 				secp256k1_musig_partial_sig ps;
 				if (!musig_partial_sig_parse(global_secp_ctx,
-					&ps, pnb.entries[e].pubnonce)) {
+					&ps, pnb->entries[e].pubnonce)) {
 					plugin_log(plugin_handle, LOG_BROKEN,
 						   "LSP: bad psig entry %zu", e);
 					continue;
 				}
 				if (!factory_session_set_partial_sig(f,
-					pnb.entries[e].node_idx,
-					pnb.entries[e].signer_slot,
+					pnb->entries[e].node_idx,
+					pnb->entries[e].signer_slot,
 					&ps)) {
 					plugin_log(plugin_handle, LOG_BROKEN,
 						   "LSP: set_partial_sig failed %zu", e);
@@ -1265,7 +1288,7 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 
 			plugin_log(plugin_handle, LOG_INFORM,
 				   "LSP: set %zu/%zu client partial sigs",
-				   psigs_set, pnb.n_entries);
+				   psigs_set, pnb->n_entries);
 
 			/* Track which client sent this */
 			if (strlen(peer_id) == 66) {
@@ -1287,6 +1310,7 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 			if (!ss_factory_all_psigs_received(fi)) {
 				plugin_log(plugin_handle, LOG_INFORM,
 					   "LSP: waiting for more PSIG_BUNDLEs");
+				free(pnb);
 				break;
 			}
 
@@ -1297,6 +1321,7 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 					&lsp_kp, fi->our_seckey)) {
 					plugin_log(plugin_handle, LOG_BROKEN,
 						   "LSP: keypair create failed");
+					free(pnb);
 					break;
 				}
 
@@ -1365,8 +1390,10 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 					unsigned char lsp_sk[32];
 					derive_factory_seckey(lsp_sk, fi->instance_id, 0);
 					secp256k1_pubkey lsp_pk;
-					if (!secp256k1_ec_pubkey_create(dctx, &lsp_pk, lsp_sk))
+					if (!secp256k1_ec_pubkey_create(dctx, &lsp_pk, lsp_sk)) {
+						free(pnb);
 						break;
+					}
 
 					musig_nonce_pool_t *dpool = calloc(1,
 						sizeof(musig_nonce_pool_t));
@@ -1463,7 +1490,7 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 						   "LSP: sent FACTORY_READY (no dist TX)");
 					ss_save_factory(cmd, fi);
 				}
-			}
+			free(pnb);
 		}
 		break;
 
