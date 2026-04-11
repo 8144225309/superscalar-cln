@@ -1405,11 +1405,11 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 						   cnb.entries[e].signer_slot);
 			}
 			plugin_log(plugin_handle, LOG_INFORM,
-				   "LSP: dist nonces set, n_nodes=%u, "
-				   "dist_idx=%u, n_signers_dist=%u",
+				   "LSP: dist nonces set, n_nodes=%zu, "
+				   "dist_idx=%zu, n_signers_dist=%zu",
 				   f->n_nodes, f->n_nodes,
 				   f->n_nodes < 256 ?
-				   f->nodes[f->n_nodes].n_signers : 0);
+				   f->nodes[f->n_nodes].n_signers : (size_t)0);
 
 			/* Finalize dist signing session */
 			uint32_t dist_idx = f->n_nodes;
