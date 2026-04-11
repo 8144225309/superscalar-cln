@@ -41,12 +41,46 @@ The plugin exposes seven JSON-RPC methods through CLN's standard interface:
 | Method | Parameters | Description |
 |--------|-----------|-------------|
 | `factory-create` | `funding_sats`, `clients` (array of node IDs) | Create a new factory: builds DW tree, generates MuSig2 nonces, sends `FACTORY_PROPOSE` to all clients |
-| `factory-list` | (none) | List all factories with full status: instance ID, epoch, lifecycle, ceremony state, channels, tree nodes, breach data, distribution TX status |
+| `factory-list` | (none) | List all factories with full status (see response schema below) |
 | `factory-rotate` | `instance_id` | Advance the Decker-Wattenhofer epoch: rebuilds tree transactions with new nonces, sends `ROTATE_PROPOSE` |
 | `factory-close` | `instance_id` | Initiate cooperative close: computes distribution outputs, sends `CLOSE_PROPOSE` |
 | `factory-force-close` | `instance_id` | Broadcast all signed DW tree transactions for unilateral exit, force-closes associated LN channels |
 | `factory-check-breach` | `instance_id`, `txid`, `vout`, `amount_sats`, `epoch` | Build and broadcast a penalty/burn transaction for a detected breach (old-epoch state on-chain) |
 | `factory-open-channels` | `instance_id` | Open Lightning channels inside the factory via `fundchannel_start`/`fundchannel_complete` with factory TLVs |
+
+### `factory-list` Response Schema
+
+```json
+{
+  "factories": [{
+    "instance_id": "hex",       // 32-byte factory identifier
+    "is_lsp": true,             // whether this node is the LSP
+    "n_clients": 3,             // number of client participants
+    "epoch": 0,                 // current DW epoch (increments on rotation)
+    "n_channels": 3,            // number of open LN channels in factory
+    "lifecycle": "active",      // init | active | dying | expired
+    "ceremony": "complete",     // idle | proposed | nonces_collected | psigs_collected | complete | rotating | rotate_complete | revoked | failed
+    "max_epochs": 256,          // total DW states before factory exhaustion
+    "creation_block": 14195,    // block height when factory was created
+    "expiry_block": 18515,      // absolute block height of factory CLTV timeout
+    "rotation_in_progress": false,
+    "n_breach_epochs": 0,       // number of stored breach/revocation records
+    "dist_tx_status": "signed", // none | unsigned | signed | unknown
+    "tree_nodes": 6,            // total nodes in DW tree (persisted across restarts)
+    "funding_txid": "hex",      // factory-level synthetic funding UTXO
+    "funding_outnum": 0,
+    "channels": [{
+      "channel_id": "hex",      // CLN channel_id
+      "leaf_index": 3,          // DW tree node index for this channel's leaf
+      "leaf_side": 0,           // output index within the leaf (for arity-2 shared leaves)
+      "funding_txid": "hex",    // real DW leaf node txid (the on-chain enforceable outpoint)
+      "funding_outnum": 0       // output index on the leaf transaction
+    }]
+  }]
+}
+```
+
+The wallet can cross-reference `channels[].channel_id` against CLN's `listpeerchannels` to get per-channel spendable/receivable balances, connection state, and creation timestamps.
 
 ## Architecture
 
