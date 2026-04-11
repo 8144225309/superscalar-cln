@@ -487,7 +487,7 @@ static void ss_save_factory(struct command *cmd, factory_instance_t *fi)
 	len = ss_persist_serialize_meta(fi, &buf);
 	if (len > 0 && buf) {
 		jsonrpc_set_datastore_binary(cmd, key, buf, len,
-			"create-or-replace", NULL, NULL, NULL);
+			"create-or-replace", rpc_done, rpc_err, fi);
 		free(buf);
 	}
 
@@ -497,7 +497,7 @@ static void ss_save_factory(struct command *cmd, factory_instance_t *fi)
 		len = ss_persist_serialize_channels(fi, &buf);
 		if (len > 0 && buf) {
 			jsonrpc_set_datastore_binary(cmd, key, buf, len,
-				"create-or-replace", NULL, NULL, NULL);
+				"create-or-replace", rpc_done, rpc_err, fi);
 			free(buf);
 		}
 	}
@@ -509,7 +509,7 @@ static void ss_save_factory(struct command *cmd, factory_instance_t *fi)
 		len = ss_persist_serialize_breach(&fi->breach_data[i], &buf);
 		if (len > 0 && buf) {
 			jsonrpc_set_datastore_binary(cmd, key, buf, len,
-				"create-or-replace", NULL, NULL, NULL);
+				"create-or-replace", rpc_done, rpc_err, fi);
 			free(buf);
 		}
 	}
