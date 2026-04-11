@@ -1585,28 +1585,51 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 					}
 
 					if (agg_ok) {
-						/* Aggregate → x-only → P2TR address */
-						musig_keyagg_t kagg;
-						musig_aggregate_keys(global_secp_ctx,
-							&kagg, apks, nt);
-						unsigned char xser[32];
-						secp256k1_xonly_pubkey_serialize(
-							global_secp_ctx, xser,
-							&kagg.agg_pubkey);
+						/* Build a temporary tree with placeholder
+						 * funding to get the TWEAKED P2TR key
+						 * for the root kickoff node. The library
+						 * applies a BIP-341 taproot tweak to the
+						 * aggregate key — the on-chain UTXO must
+						 * be locked to this tweaked key, not the
+						 * plain aggregate. */
+						factory_t *tmp_f = calloc(1, sizeof(factory_t));
+						factory_init_from_pubkeys(tmp_f,
+							global_secp_ctx,
+							apks, nt,
+							DW_STEP_BLOCKS, 16);
+						factory_set_arity(tmp_f,
+							nt <= 2 ? FACTORY_ARITY_1
+								: FACTORY_ARITY_2);
+						uint8_t ph_txid[32], ph_spk[34];
+						for (int j = 0; j < 32; j++)
+							ph_txid[j] = j + 1;
+						ph_spk[0] = 0x51; ph_spk[1] = 0x20;
+						memset(ph_spk + 2, 0xAA, 32);
+						factory_set_funding(tmp_f, ph_txid, 0,
+							fi->funding_amount_sats,
+							ph_spk, 34);
+						factory_build_tree(tmp_f);
 
-						/* Build P2TR spk: OP_1 || 0x20 || xonly */
+						/* Extract the root node's tweaked P2TR
+						 * scriptPubKey — this is what the
+						 * on-chain UTXO must be locked to. */
 						struct funding_ctx *fctx =
 							tal(cmd, struct funding_ctx);
 						fctx->fi = fi;
-						fctx->funding_spk[0] = 0x51;
-						fctx->funding_spk[1] = 0x20;
-						memcpy(fctx->funding_spk + 2, xser, 32);
-						fctx->funding_spk_len = 34;
+						memcpy(fctx->funding_spk,
+						       tmp_f->nodes[0].spending_spk,
+						       tmp_f->nodes[0].spending_spk_len);
+						fctx->funding_spk_len =
+							tmp_f->nodes[0].spending_spk_len;
 
-						/* Encode bech32m address */
+						/* Encode bech32m address from tweaked key
+						 * (skip OP_1 0x20 prefix = bytes 2-33) */
 						char addr[100];
-						segwit_addr_encode(addr, "bcrt",
-							1, xser, 32);
+						segwit_addr_encode(addr, "bcrt", 1,
+							fctx->funding_spk + 2, 32);
+
+						factory_free(tmp_f);
+						free(tmp_f);
 
 						plugin_log(plugin_handle, LOG_INFORM,
 							   "Creating funding TX: "
