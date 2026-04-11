@@ -109,6 +109,9 @@ typedef struct factory_instance {
 	/* Funding info */
 	uint8_t funding_txid[32];
 	uint32_t funding_outnum;
+	uint64_t funding_amount_sats;
+	uint8_t funding_spk[34];
+	uint8_t funding_spk_len;
 
 	/* Cached tree node count (persisted so factory-list works after restart
 	 * even when lib_factory hasn't been rebuilt yet). */

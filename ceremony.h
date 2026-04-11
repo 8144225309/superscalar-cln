@@ -67,6 +67,7 @@
 typedef enum {
 	CEREMONY_IDLE,
 	CEREMONY_PROPOSED,	/* Sent FACTORY_PROPOSE, waiting for nonces */
+	CEREMONY_FUNDING_PENDING,   /* All nonces received, creating funding TX */
 	CEREMONY_NONCES_COLLECTED,  /* All nonces received, sent ALL_NONCES */
 	CEREMONY_PSIGS_COLLECTED,   /* All partial sigs received */
 	CEREMONY_COMPLETE,	/* Factory tree fully signed */

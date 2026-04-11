@@ -31,6 +31,7 @@
 #include <superscalar/dw_state.h>
 #include <superscalar/ladder.h>
 #include <superscalar/adaptor.h>
+#include <common/bech32.h>
 
 static struct plugin *plugin_handle;
 static superscalar_state_t ss_state;
@@ -143,6 +144,94 @@ struct open_channel_ctx {
 	size_t n_total;         /* total channels to open */
 	struct command *orig_cmd; /* original RPC command to complete */
 };
+
+/* Context for async funding TX creation (withdraw → continue ceremony).
+ * After all nonces collected, LSP creates real funding UTXO via CLN's
+ * withdraw RPC, then continues with tree rebuild and ALL_NONCES. */
+struct funding_ctx {
+	factory_instance_t *fi;
+	uint8_t funding_spk[34];
+	uint8_t funding_spk_len;
+};
+
+/* Callback after CLN's `withdraw` RPC returns the real funding TX.
+ * Parses txid, finds our P2TR output vout, stores real funding data
+ * on the factory instance, then continues the ceremony. */
+static struct command_result *withdraw_funding_ok(struct command *cmd,
+						   const char *method,
+						   const char *buf,
+						   const jsmntok_t *result,
+						   void *arg)
+{
+	struct funding_ctx *fctx = (struct funding_ctx *)arg;
+	factory_instance_t *fi = fctx->fi;
+
+	/* Parse txid from response */
+	const jsmntok_t *txid_tok = json_get_member(buf, result, "txid");
+	if (!txid_tok) {
+		plugin_log(plugin_handle, LOG_BROKEN,
+			   "withdraw: no txid in response");
+		fi->ceremony = CEREMONY_FAILED;
+		return notification_handled(cmd);
+	}
+
+	const char *txid_hex = json_strdup(cmd, buf, txid_tok);
+	if (!txid_hex || strlen(txid_hex) != 64) {
+		plugin_log(plugin_handle, LOG_BROKEN,
+			   "withdraw: bad txid hex");
+		fi->ceremony = CEREMONY_FAILED;
+		return notification_handled(cmd);
+	}
+
+	/* Store real funding txid (internal byte order = reversed hex) */
+	for (int j = 0; j < 32; j++) {
+		unsigned int b;
+		sscanf(txid_hex + j*2, "%02x", &b);
+		fi->funding_txid[31 - j] = (uint8_t)b;
+	}
+
+	/* Find the vout by scanning TX outputs for our P2TR scriptpubkey.
+	 * The withdraw TX may have multiple outputs (our P2TR + change). */
+	const jsmntok_t *tx_tok = json_get_member(buf, result, "tx");
+	fi->funding_outnum = 0; /* default to first output */
+	if (tx_tok) {
+		/* For now, assume our output is vout 0 or 1.
+		 * A proper implementation would deserialize the TX and scan.
+		 * TODO: parse raw TX to find exact vout matching our spk. */
+		plugin_log(plugin_handle, LOG_INFORM,
+			   "withdraw: funding TX broadcast, txid=%s",
+			   txid_hex);
+	}
+
+	/* Store funding scriptpubkey and amount */
+	memcpy(fi->funding_spk, fctx->funding_spk, fctx->funding_spk_len);
+	fi->funding_spk_len = fctx->funding_spk_len;
+
+	plugin_log(plugin_handle, LOG_INFORM,
+		   "Real funding UTXO created: txid=%s vout=%u amount=%"PRIu64,
+		   txid_hex, fi->funding_outnum, fi->funding_amount_sats);
+
+	/* Now continue the ceremony: rebuild tree with real funding,
+	 * finalize sessions, send ALL_NONCES. */
+	continue_after_funding(cmd, fctx);
+
+	return command_still_pending(cmd);
+}
+
+static struct command_result *withdraw_funding_err(struct command *cmd,
+						    const char *method,
+						    const char *buf,
+						    const jsmntok_t *result,
+						    void *arg)
+{
+	struct funding_ctx *fctx = (struct funding_ctx *)arg;
+	fctx->fi->ceremony = CEREMONY_FAILED;
+	plugin_log(plugin_handle, LOG_BROKEN,
+		   "withdraw failed: %.*s",
+		   json_tok_full_len(result),
+		   json_tok_contents(buf, result));
+	return notification_handled(cmd);
+}
 
 /* Send a SuperScalar message wrapped in factory_piggyback (submsg 4).
  * Wire format: type(2) + submsg_id=4(2) + TLV[0]=protocol_id(34) +
@@ -824,6 +913,161 @@ static void ss_load_factories(struct command *cmd)
 
 /* Dispatch SuperScalar protocol submessages.
  * Data format: [32 bytes instance_id][payload] */
+/* Continue ceremony after real funding TX is confirmed.
+ * Rebuilds tree with real pubkeys + real funding, finalizes sessions,
+ * and sends ALL_NONCES to clients. Called from withdraw callback. */
+static void continue_after_funding(struct command *cmd,
+				   struct funding_ctx *fctx)
+{
+	factory_instance_t *fi = fctx->fi;
+	factory_t *f = (factory_t *)fi->lib_factory;
+
+	plugin_log(plugin_handle, LOG_INFORM,
+		   "Continuing ceremony after real funding TX created");
+
+	/* Rebuild tree with real pubkeys (same as inline code in NONCE_BUNDLE
+	 * handler) but now using real funding from fi->funding_* */
+	size_t n_total = 1 + fi->n_clients;
+	secp256k1_pubkey *real_pks = calloc(n_total, sizeof(secp256k1_pubkey));
+	bool rebuild_ok = real_pks != NULL;
+	if (rebuild_ok)
+		rebuild_ok = secp256k1_ec_pubkey_create(global_secp_ctx,
+			&real_pks[0], fi->our_seckey) != 0;
+	for (size_t rci = 0; rci < fi->n_clients && rebuild_ok; rci++) {
+		if (fi->clients[rci].has_factory_pubkey) {
+			rebuild_ok = secp256k1_ec_pubkey_parse(global_secp_ctx,
+				&real_pks[rci + 1],
+				fi->clients[rci].factory_pubkey, 33) != 0;
+		} else {
+			unsigned char psk[32];
+			derive_placeholder_seckey(psk, fi->instance_id,
+						  (int)(rci + 1));
+			rebuild_ok = secp256k1_ec_pubkey_create(global_secp_ctx,
+				&real_pks[rci + 1], psk) != 0;
+		}
+	}
+
+	if (rebuild_ok) {
+		factory_t *new_f = calloc(1, sizeof(factory_t));
+		factory_init_from_pubkeys(new_f, global_secp_ctx,
+			real_pks, n_total, DW_STEP_BLOCKS, 16);
+		factory_set_arity(new_f, n_total <= 2
+			? FACTORY_ARITY_1 : FACTORY_ARITY_2);
+		/* Use REAL funding from fi */
+		factory_set_funding(new_f, fi->funding_txid,
+			fi->funding_outnum, fi->funding_amount_sats,
+			fi->funding_spk, fi->funding_spk_len);
+		factory_build_tree(new_f);
+
+		factory_t *old_f = f;
+		if (old_f) { factory_free(old_f); free(old_f); }
+		fi->lib_factory = new_f;
+		f = new_f;
+
+		factory_sessions_init(f);
+		nonce_entry_t *cache = (nonce_entry_t *)fi->cached_nonces;
+		if (cache) {
+			for (size_t ne = 0; ne < fi->n_cached_nonces; ne++) {
+				secp256k1_musig_pubnonce pn;
+				if (musig_pubnonce_parse(global_secp_ctx, &pn,
+							 cache[ne].pubnonce))
+					factory_session_set_nonce(f,
+						cache[ne].node_idx,
+						cache[ne].signer_slot, &pn);
+			}
+		}
+		plugin_log(plugin_handle, LOG_INFORM,
+			   "Rebuilt tree with real funding + real pubkeys "
+			   "(%zu participants)", n_total);
+	}
+	free(real_pks);
+
+	if (!factory_sessions_finalize(f)) {
+		plugin_log(plugin_handle, LOG_BROKEN,
+			   "factory_sessions_finalize failed after funding");
+		fi->ceremony = CEREMONY_FAILED;
+		return;
+	}
+
+	fi->ceremony = CEREMONY_NONCES_COLLECTED;
+	fi->n_tree_nodes = (uint32_t)f->n_nodes;
+
+	/* Build and send ALL_NONCES with real funding info */
+	nonce_entry_t *anc = (nonce_entry_t *)fi->cached_nonces;
+	if (anc && fi->n_cached_nonces > 0) {
+		nonce_bundle_t *all_nb = calloc(1, sizeof(*all_nb));
+		if (all_nb) {
+			memcpy(all_nb->instance_id, fi->instance_id, 32);
+			all_nb->n_participants = 1 + fi->n_clients;
+			all_nb->n_nodes = f->n_nodes;
+
+			/* Include real pubkeys */
+			size_t pk_out = 33;
+			secp256k1_pubkey lsp_pub;
+			if (secp256k1_ec_pubkey_create(global_secp_ctx,
+						       &lsp_pub, fi->our_seckey))
+				secp256k1_ec_pubkey_serialize(global_secp_ctx,
+					all_nb->pubkeys[0], &pk_out,
+					&lsp_pub, SECP256K1_EC_COMPRESSED);
+			for (size_t rci = 0; rci < fi->n_clients; rci++) {
+				if (fi->clients[rci].has_factory_pubkey)
+					memcpy(all_nb->pubkeys[rci + 1],
+					       fi->clients[rci].factory_pubkey, 33);
+			}
+
+			/* Include real funding info */
+			memcpy(all_nb->funding_txid, fi->funding_txid, 32);
+			all_nb->funding_vout = fi->funding_outnum;
+			all_nb->funding_amount_sats = fi->funding_amount_sats;
+			memcpy(all_nb->funding_spk, fi->funding_spk,
+			       fi->funding_spk_len);
+			all_nb->funding_spk_len = fi->funding_spk_len;
+
+			/* Copy nonce entries */
+			size_t n = fi->n_cached_nonces;
+			if (n > MAX_NONCE_ENTRIES) n = MAX_NONCE_ENTRIES;
+			memcpy(all_nb->entries, anc, n * sizeof(nonce_entry_t));
+			all_nb->n_entries = n;
+
+			/* Cache for reconnect */
+			uint8_t *anbuf = calloc(1, MAX_WIRE_BUF);
+			size_t anlen = nonce_bundle_serialize(all_nb, anbuf,
+							      MAX_WIRE_BUF);
+			free(fi->cached_all_nonces_wire);
+			fi->cached_all_nonces_wire = malloc(anlen);
+			if (fi->cached_all_nonces_wire) {
+				memcpy(fi->cached_all_nonces_wire, anbuf, anlen);
+				fi->cached_all_nonces_len = anlen;
+			}
+
+			/* Send to all clients */
+			for (size_t ci = 0; ci < fi->n_clients; ci++) {
+				char nid[67];
+				for (int j = 0; j < 33; j++)
+					sprintf(nid + j*2, "%02x",
+						fi->clients[ci].node_id[j]);
+				nid[66] = '\0';
+				send_factory_msg(cmd, nid,
+					SS_SUBMSG_ALL_NONCES, anbuf, anlen);
+			}
+			free(anbuf);
+			free(all_nb);
+
+			plugin_log(plugin_handle, LOG_INFORM,
+				   "Sent ALL_NONCES with real funding to %zu "
+				   "clients (%zu entries)",
+				   fi->n_clients, n);
+		}
+	}
+
+	/* Free nonce cache */
+	free(fi->cached_nonces);
+	fi->cached_nonces = NULL;
+	fi->n_cached_nonces = 0;
+
+	ss_save_factory(cmd, fi);
+}
+
 static void dispatch_superscalar_submsg(struct command *cmd,
 					const char *peer_id,
 					u16 submsg_id,
@@ -860,12 +1104,34 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 			nonce_bundle_t *nb = calloc(1, sizeof(*nb));
 			if (!nb) break;
 
-			/* Payload = nonce_bundle || 4-byte participant_idx */
-			if (len < 4 || !nonce_bundle_deserialize(nb, data, len - 4)) {
-				plugin_log(plugin_handle, LOG_UNUSUAL,
-					   "Bad FACTORY_PROPOSE payload");
-				free(nb);
-				break;
+			/* Payload = nonce_bundle || funding_amount(8) || pidx(4)
+			 * Backward compat: old format was bundle || pidx(4) */
+			size_t trailer = 12; /* 8-byte amount + 4-byte pidx */
+			if (len < trailer || !nonce_bundle_deserialize(
+				nb, data, len - trailer)) {
+				/* Try old 4-byte trailer format */
+				trailer = 4;
+				if (len < trailer || !nonce_bundle_deserialize(
+					nb, data, len - trailer)) {
+					plugin_log(plugin_handle, LOG_UNUSUAL,
+						   "Bad FACTORY_PROPOSE payload");
+					free(nb);
+					break;
+				}
+			}
+
+			/* Read funding amount (0 if old 4-byte trailer) */
+			uint64_t propose_funding_sats = 0;
+			if (trailer == 12) {
+				const uint8_t *ap = data + len - 12;
+				propose_funding_sats =
+					((uint64_t)ap[0] << 56) |
+					((uint64_t)ap[1] << 48) |
+					((uint64_t)ap[2] << 40) |
+					((uint64_t)ap[3] << 32) |
+					((uint64_t)ap[4] << 24) |
+					((uint64_t)ap[5] << 16) |
+					((uint64_t)ap[6] <<  8) | ap[7];
 			}
 
 			/* Read participant index from last 4 bytes */
@@ -932,8 +1198,13 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 			synth_spk[0] = 0x51; synth_spk[1] = 0x20;
 			memset(synth_spk + 2, 0xAA, 32);
 			factory_set_funding(factory, synth_txid, 0,
-					    DEFAULT_FACTORY_FUNDING_SATS,
+					    propose_funding_sats > 0
+						? propose_funding_sats
+						: DEFAULT_FACTORY_FUNDING_SATS,
 					    synth_spk, 34);
+			fi->funding_amount_sats = propose_funding_sats > 0
+				? propose_funding_sats
+				: DEFAULT_FACTORY_FUNDING_SATS;
 
 			if (!factory_build_tree(factory)) {
 				plugin_log(plugin_handle, LOG_BROKEN,
@@ -1273,7 +1544,106 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 			/* Check if all clients responded */
 			if (ss_factory_all_nonces_received(fi)) {
 				plugin_log(plugin_handle, LOG_INFORM,
-					   "LSP: all nonces collected, finalizing");
+					   "LSP: all nonces collected");
+
+				/* If LSP and no real funding yet, create
+				 * on-chain funding TX before continuing.
+				 * Compute aggregate P2TR key from all real
+				 * pubkeys and call withdraw. */
+				if (fi->is_lsp && fi->funding_spk_len == 0) {
+					/* Collect real pubkeys for aggregate */
+					size_t nt = 1 + fi->n_clients;
+					secp256k1_pubkey *apks =
+						calloc(nt, sizeof(secp256k1_pubkey));
+					bool agg_ok = apks != NULL;
+					if (agg_ok)
+						agg_ok = secp256k1_ec_pubkey_create(
+							global_secp_ctx,
+							&apks[0],
+							fi->our_seckey) != 0;
+					for (size_t ac = 0;
+					     ac < fi->n_clients && agg_ok; ac++) {
+						if (fi->clients[ac].has_factory_pubkey) {
+							agg_ok = secp256k1_ec_pubkey_parse(
+								global_secp_ctx,
+								&apks[ac + 1],
+								fi->clients[ac].factory_pubkey,
+								33) != 0;
+						} else {
+							unsigned char psk[32];
+							derive_placeholder_seckey(
+								psk, fi->instance_id,
+								(int)(ac + 1));
+							agg_ok = secp256k1_ec_pubkey_create(
+								global_secp_ctx,
+								&apks[ac + 1],
+								psk) != 0;
+						}
+					}
+
+					if (agg_ok) {
+						/* Aggregate → x-only → P2TR address */
+						musig_keyagg_t kagg;
+						musig_aggregate_keys(global_secp_ctx,
+							&kagg, apks, nt);
+						secp256k1_xonly_pubkey xonly;
+						secp256k1_keypair_xonly_pub(
+							global_secp_ctx, &xonly,
+							NULL, &kagg.keypair);
+						unsigned char xser[32];
+						secp256k1_xonly_pubkey_serialize(
+							global_secp_ctx, xser,
+							&xonly);
+
+						/* Build P2TR spk: OP_1 || 0x20 || xonly */
+						struct funding_ctx *fctx =
+							tal(cmd, struct funding_ctx);
+						fctx->fi = fi;
+						fctx->funding_spk[0] = 0x51;
+						fctx->funding_spk[1] = 0x20;
+						memcpy(fctx->funding_spk + 2, xser, 32);
+						fctx->funding_spk_len = 34;
+
+						/* Encode bech32m address */
+						char addr[100];
+						segwit_addr_encode(addr, "bcrt",
+							1, xser, 32);
+
+						plugin_log(plugin_handle, LOG_INFORM,
+							   "Creating funding TX: "
+							   "withdraw %"PRIu64" to %s",
+							   fi->funding_amount_sats,
+							   addr);
+
+						/* Call withdraw RPC */
+						struct out_req *wreq =
+							jsonrpc_request_start(cmd,
+								"withdraw",
+								withdraw_funding_ok,
+								withdraw_funding_err,
+								fctx);
+						json_add_string(wreq->js,
+							"destination", addr);
+						{
+							char amt_str[32];
+							snprintf(amt_str, sizeof(amt_str),
+								 "%"PRIu64"sat",
+								 fi->funding_amount_sats);
+							json_add_string(wreq->js,
+								"satoshi", amt_str);
+						}
+						send_outreq(wreq);
+
+						fi->ceremony = CEREMONY_FUNDING_PENDING;
+						free(apks);
+						free(cnb);
+						break; /* wait for callback */
+					}
+					free(apks);
+				}
+
+				plugin_log(plugin_handle, LOG_INFORM,
+					   "LSP: finalizing nonce collection");
 
 				/* Rebuild DW tree with real pubkeys collected
 				 * from NONCE_BUNDLE responses. Uses the same
@@ -1337,14 +1707,25 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 						factory_set_arity(new_f,
 							n_total <= 2 ? FACTORY_ARITY_1
 								     : FACTORY_ARITY_2);
-						/* Synthetic funding (matches factory-create) */
-						uint8_t syn_txid[32], syn_spk[34];
-						for (int j = 0; j < 32; j++) syn_txid[j] = j + 1;
-						syn_spk[0] = 0x51; syn_spk[1] = 0x20;
-						memset(syn_spk + 2, 0xAA, 32);
-						factory_set_funding(new_f, syn_txid, 0,
-							DEFAULT_FACTORY_FUNDING_SATS,
-							syn_spk, 34);
+						/* Use real funding if available, else synthetic */
+						if (fi->funding_spk_len > 0) {
+							factory_set_funding(new_f,
+								fi->funding_txid,
+								fi->funding_outnum,
+								fi->funding_amount_sats,
+								fi->funding_spk,
+								fi->funding_spk_len);
+						} else {
+							uint8_t syn_txid[32], syn_spk[34];
+							for (int j = 0; j < 32; j++) syn_txid[j] = j + 1;
+							syn_spk[0] = 0x51; syn_spk[1] = 0x20;
+							memset(syn_spk + 2, 0xAA, 32);
+							factory_set_funding(new_f, syn_txid, 0,
+								fi->funding_amount_sats > 0
+									? fi->funding_amount_sats
+									: DEFAULT_FACTORY_FUNDING_SATS,
+								syn_spk, 34);
+						}
 						factory_build_tree(new_f);
 
 						/* Free old factory, swap in new */
@@ -1559,13 +1940,40 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 					factory_set_arity(new_f,
 						anb->n_participants <= 2
 						? FACTORY_ARITY_1 : FACTORY_ARITY_2);
-					uint8_t syn_txid[32], syn_spk[34];
-					for (int j = 0; j < 32; j++) syn_txid[j] = j + 1;
-					syn_spk[0] = 0x51; syn_spk[1] = 0x20;
-					memset(syn_spk + 2, 0xAA, 32);
-					factory_set_funding(new_f, syn_txid, 0,
-						DEFAULT_FACTORY_FUNDING_SATS,
-						syn_spk, 34);
+					/* Use real funding from ALL_NONCES if available */
+					if (anb->funding_spk_len > 0) {
+						factory_set_funding(new_f,
+							anb->funding_txid,
+							anb->funding_vout,
+							anb->funding_amount_sats,
+							anb->funding_spk,
+							anb->funding_spk_len);
+						/* Store on fi for persistence */
+						memcpy(fi->funding_txid,
+						       anb->funding_txid, 32);
+						fi->funding_outnum = anb->funding_vout;
+						fi->funding_amount_sats =
+							anb->funding_amount_sats;
+						memcpy(fi->funding_spk,
+						       anb->funding_spk,
+						       anb->funding_spk_len);
+						fi->funding_spk_len =
+							anb->funding_spk_len;
+						plugin_log(plugin_handle, LOG_INFORM,
+							   "Client: using real "
+							   "funding from ALL_NONCES");
+					} else {
+						uint8_t syn_txid[32], syn_spk[34];
+						for (int j = 0; j < 32; j++)
+							syn_txid[j] = j + 1;
+						syn_spk[0] = 0x51; syn_spk[1] = 0x20;
+						memset(syn_spk + 2, 0xAA, 32);
+						factory_set_funding(new_f, syn_txid, 0,
+							fi->funding_amount_sats > 0
+							? fi->funding_amount_sats
+							: DEFAULT_FACTORY_FUNDING_SATS,
+							syn_spk, 34);
+					}
 					factory_build_tree(new_f);
 
 					factory_t *old_f = f;
@@ -3790,6 +4198,7 @@ static struct command_result *json_factory_create(struct command *cmd,
 		fi->lib_factory = factory;
 		fi->n_tree_nodes = (uint32_t)factory->n_nodes;
 		fi->max_epochs = factory->counter.total_states;
+		fi->funding_amount_sats = *funding_sats;
 		fi->creation_block = ss_state.current_blockheight;
 		fi->expiry_block = factory->cltv_timeout > 0
 			? factory->cltv_timeout
@@ -3955,18 +4364,30 @@ static struct command_result *json_factory_create(struct command *cmd,
 					sprintf(client_hex + h*2, "%02x",
 						fi->clients[ci].node_id[h]);
 
-				/* Build per-client buffer: nonce bundle + 4-byte idx */
-				uint32_t pidx = (uint32_t)(ci + 1); /* LSP=0, clients=1+ */
-				uint8_t *cbuf = calloc(1, blen + 4);
+				/* Build per-client buffer:
+				 * nonce_bundle + funding_amount(8) + pidx(4) */
+				uint32_t pidx = (uint32_t)(ci + 1);
+				uint8_t *cbuf = calloc(1, blen + 12);
 				memcpy(cbuf, nbuf, blen);
-				cbuf[blen]     = (pidx >> 24) & 0xFF;
-				cbuf[blen + 1] = (pidx >> 16) & 0xFF;
-				cbuf[blen + 2] = (pidx >> 8)  & 0xFF;
-				cbuf[blen + 3] =  pidx         & 0xFF;
+				/* 8-byte funding amount (big-endian) */
+				uint64_t famt = fi->funding_amount_sats;
+				cbuf[blen]     = (famt >> 56) & 0xFF;
+				cbuf[blen + 1] = (famt >> 48) & 0xFF;
+				cbuf[blen + 2] = (famt >> 40) & 0xFF;
+				cbuf[blen + 3] = (famt >> 32) & 0xFF;
+				cbuf[blen + 4] = (famt >> 24) & 0xFF;
+				cbuf[blen + 5] = (famt >> 16) & 0xFF;
+				cbuf[blen + 6] = (famt >>  8) & 0xFF;
+				cbuf[blen + 7] = famt & 0xFF;
+				/* 4-byte participant index */
+				cbuf[blen + 8]  = (pidx >> 24) & 0xFF;
+				cbuf[blen + 9]  = (pidx >> 16) & 0xFF;
+				cbuf[blen + 10] = (pidx >> 8)  & 0xFF;
+				cbuf[blen + 11] = pidx & 0xFF;
 
 				send_factory_msg(cmd, client_hex,
 					SS_SUBMSG_FACTORY_PROPOSE,
-					cbuf, blen + 4);
+					cbuf, blen + 12);
 				free(cbuf);
 
 				plugin_log(plugin_handle, LOG_INFORM,

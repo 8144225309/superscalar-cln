@@ -75,8 +75,8 @@ size_t ss_persist_serialize_meta(const factory_instance_t *fi, uint8_t **out)
 	uint8_t *buf = NULL;
 	size_t len = 0, cap = 0;
 
-	/* Version byte (2 adds n_tree_nodes) */
-	buf_u8(&buf, &len, &cap, 2);
+	/* Version byte (3 adds funding_amount/spk) */
+	buf_u8(&buf, &len, &cap, 3);
 
 	/* Identity */
 	buf_append(&buf, &len, &cap, fi->instance_id, 32);
@@ -109,6 +109,20 @@ size_t ss_persist_serialize_meta(const factory_instance_t *fi, uint8_t **out)
 	/* v2: tree node count */
 	buf_u32(&buf, &len, &cap, fi->n_tree_nodes);
 
+	/* v3: full funding info */
+	{
+		uint8_t amt_bytes[8];
+		uint64_t a = fi->funding_amount_sats;
+		amt_bytes[0] = (a >> 56) & 0xFF; amt_bytes[1] = (a >> 48) & 0xFF;
+		amt_bytes[2] = (a >> 40) & 0xFF; amt_bytes[3] = (a >> 32) & 0xFF;
+		amt_bytes[4] = (a >> 24) & 0xFF; amt_bytes[5] = (a >> 16) & 0xFF;
+		amt_bytes[6] = (a >>  8) & 0xFF; amt_bytes[7] = a & 0xFF;
+		buf_append(&buf, &len, &cap, amt_bytes, 8);
+	}
+	buf_u8(&buf, &len, &cap, fi->funding_spk_len);
+	if (fi->funding_spk_len > 0)
+		buf_append(&buf, &len, &cap, fi->funding_spk, fi->funding_spk_len);
+
 	*out = buf;
 	return len;
 }
@@ -122,7 +136,7 @@ bool ss_persist_deserialize_meta(factory_instance_t *fi,
 	uint8_t version, tmp8;
 	uint16_t tmp16;
 
-	if (!read_u8(&p, &rem, &version) || (version != 1 && version != 2))
+	if (!read_u8(&p, &rem, &version) || version < 1 || version > 3)
 		return false;
 
 	if (!read_bytes(&p, &rem, fi->instance_id, 32)) return false;
@@ -159,6 +173,28 @@ bool ss_persist_deserialize_meta(factory_instance_t *fi,
 	/* v2 fields */
 	if (version >= 2) {
 		if (!read_u32(&p, &rem, &fi->n_tree_nodes)) return false;
+	}
+
+	/* v3 fields: full funding info */
+	if (version >= 3) {
+		uint8_t amt_bytes[8];
+		if (!read_bytes(&p, &rem, amt_bytes, 8)) return false;
+		fi->funding_amount_sats =
+			((uint64_t)amt_bytes[0] << 56) |
+			((uint64_t)amt_bytes[1] << 48) |
+			((uint64_t)amt_bytes[2] << 40) |
+			((uint64_t)amt_bytes[3] << 32) |
+			((uint64_t)amt_bytes[4] << 24) |
+			((uint64_t)amt_bytes[5] << 16) |
+			((uint64_t)amt_bytes[6] <<  8) |
+			amt_bytes[7];
+		uint8_t spk_len;
+		if (!read_u8(&p, &rem, &spk_len)) return false;
+		fi->funding_spk_len = spk_len;
+		if (spk_len > 0 && spk_len <= 34) {
+			if (!read_bytes(&p, &rem, fi->funding_spk, spk_len))
+				return false;
+		}
 	}
 
 	return true;

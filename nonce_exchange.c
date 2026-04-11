@@ -22,7 +22,10 @@ size_t nonce_bundle_serialize(const nonce_bundle_t *nb,
 	/* Header: instance_id(32) + n_participants(4) + n_nodes(4) + n_entries(4)
 	 *        + pubkeys(n_participants * 33) */
 	/* Per entry: node_idx(4) + signer_slot(4) + pubnonce(66) = 74 */
-	size_t needed = 44 + nb->n_participants * 33 + nb->n_entries * 74;
+	size_t funding_trailer = 1 + (nb->funding_spk_len > 0
+		? 32 + 4 + 8 + nb->funding_spk_len : 0);
+	size_t needed = 44 + nb->n_participants * 33
+		+ nb->n_entries * 74 + funding_trailer;
 	if (out_max < needed)
 		return 0;
 
@@ -42,6 +45,23 @@ size_t nonce_bundle_serialize(const nonce_bundle_t *nb,
 		put_u32(p, nb->entries[i].node_idx); p += 4;
 		put_u32(p, nb->entries[i].signer_slot); p += 4;
 		memcpy(p, nb->entries[i].pubnonce, 66); p += 66;
+	}
+
+	/* Funding info trailer (backward-compatible: old readers stop here).
+	 * funding_spk_len=0 means no funding data present. */
+	*p++ = nb->funding_spk_len;
+	if (nb->funding_spk_len > 0) {
+		memcpy(p, nb->funding_txid, 32); p += 32;
+		put_u32(p, nb->funding_vout); p += 4;
+		/* 8-byte amount, big-endian */
+		uint64_t amt = nb->funding_amount_sats;
+		p[0] = (amt >> 56) & 0xFF; p[1] = (amt >> 48) & 0xFF;
+		p[2] = (amt >> 40) & 0xFF; p[3] = (amt >> 32) & 0xFF;
+		p[4] = (amt >> 24) & 0xFF; p[5] = (amt >> 16) & 0xFF;
+		p[6] = (amt >>  8) & 0xFF; p[7] = amt & 0xFF;
+		p += 8;
+		memcpy(p, nb->funding_spk, nb->funding_spk_len);
+		p += nb->funding_spk_len;
 	}
 
 	return (size_t)(p - out);
@@ -73,6 +93,28 @@ int nonce_bundle_deserialize(nonce_bundle_t *nb,
 		nb->entries[i].node_idx = get_u32(p); p += 4;
 		nb->entries[i].signer_slot = get_u32(p); p += 4;
 		memcpy(nb->entries[i].pubnonce, p, 66); p += 66;
+	}
+
+	/* Read optional funding info trailer (backward-compatible) */
+	size_t consumed = (size_t)(p - data);
+	nb->funding_spk_len = 0;
+	if (consumed < len) {
+		nb->funding_spk_len = *p++;
+		if (nb->funding_spk_len > 0 &&
+		    nb->funding_spk_len <= 34 &&
+		    consumed + 1 + 32 + 4 + 8 + nb->funding_spk_len <= len) {
+			memcpy(nb->funding_txid, p, 32); p += 32;
+			nb->funding_vout = get_u32(p); p += 4;
+			nb->funding_amount_sats =
+				((uint64_t)p[0] << 56) | ((uint64_t)p[1] << 48) |
+				((uint64_t)p[2] << 40) | ((uint64_t)p[3] << 32) |
+				((uint64_t)p[4] << 24) | ((uint64_t)p[5] << 16) |
+				((uint64_t)p[6] <<  8) | p[7];
+			p += 8;
+			memcpy(nb->funding_spk, p, nb->funding_spk_len);
+		} else {
+			nb->funding_spk_len = 0;
+		}
 	}
 
 	return 1;

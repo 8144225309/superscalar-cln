@@ -41,6 +41,14 @@ typedef struct {
 	uint8_t pubkeys[MAX_PARTICIPANTS][33];
 	nonce_entry_t entries[MAX_NONCE_ENTRIES];
 	size_t n_entries;
+
+	/* Funding UTXO info (populated in ALL_NONCES by LSP, zeroed otherwise).
+	 * funding_spk_len > 0 indicates real funding data is present. */
+	uint8_t  funding_txid[32];
+	uint32_t funding_vout;
+	uint64_t funding_amount_sats;
+	uint8_t  funding_spk[34];
+	uint8_t  funding_spk_len;
 } nonce_bundle_t;
 
 /* Serialize nonce bundle to binary */
