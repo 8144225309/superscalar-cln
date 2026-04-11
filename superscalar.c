@@ -3041,10 +3041,10 @@ static struct command_result *json_factory_create(struct command *cmd,
 				   nb.n_entries,
 				   (size_t)factory->n_nodes);
 
-			/* Serialize the nonce bundle */
-			uint8_t nbuf[MAX_WIRE_BUF];
+			/* Serialize the nonce bundle (heap to avoid stack overflow) */
+			uint8_t *nbuf = calloc(1, MAX_WIRE_BUF);
 			size_t blen = nonce_bundle_serialize(&nb, nbuf,
-							     sizeof(nbuf));
+							     MAX_WIRE_BUF);
 			plugin_log(plugin_handle, LOG_INFORM,
 				   "Nonce bundle serialized: %zu bytes",
 				   blen);
@@ -3067,6 +3067,7 @@ static struct command_result *json_factory_create(struct command *cmd,
 			}
 		}
 
+		free(nbuf);
 		free(pubkeys);
 	}
 
