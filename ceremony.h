@@ -48,7 +48,8 @@
 /* Distribution TX ceremony (signed after tree, before FACTORY_READY) */
 #define SS_SUBMSG_DIST_PROPOSE		0x010D
 #define SS_SUBMSG_DIST_NONCE		0x010E
-#define SS_SUBMSG_DIST_PSIG		0x010F
+#define SS_SUBMSG_DIST_ALL_NONCES	0x010F	/* LSP broadcasts all dist nonces */
+#define SS_SUBMSG_DIST_PSIG		0x0115
 
 /* Close ceremony */
 #define SS_SUBMSG_CLOSE_PROPOSE		0x0110

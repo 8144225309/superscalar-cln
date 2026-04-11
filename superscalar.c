@@ -1443,6 +1443,28 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 					if (fi->dist_session) free(fi->dist_session);
 					fi->dist_session = dsess;
 
+					/* For n>2 parties: cache all dist nonces
+					 * (LSP's first) so we can broadcast
+					 * DIST_ALL_NONCES after collecting clients'. */
+					if (fi->n_clients > 1) {
+						if (fi->cached_nonces)
+							free(fi->cached_nonces);
+						fi->cached_nonces_cap = MAX_NONCE_ENTRIES;
+						fi->cached_nonces = calloc(
+							fi->cached_nonces_cap,
+							sizeof(nonce_entry_t));
+						fi->n_cached_nonces = 0;
+						if (fi->cached_nonces && lsp_slot >= 0) {
+							nonce_entry_t *cache =
+								(nonce_entry_t *)fi->cached_nonces;
+							musig_pubnonce_serialize(dctx,
+								cache[0].pubnonce, &dpub);
+							cache[0].node_idx = f->n_nodes;
+							cache[0].signer_slot = lsp_slot;
+							fi->n_cached_nonces = 1;
+						}
+					}
+
 					/* Build DIST_PROPOSE payload:
 					 * instance_id(32) + dist_tx_hex_len(4)
 					 * + dist_tx_hex(var) + nonce(66) */
@@ -1655,8 +1677,10 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 						   "Client: sent DIST_NONCE + DIST_PSIG");
 				}
 			} else {
-				plugin_log(plugin_handle, LOG_BROKEN,
-					   "Client: dist session finalize failed");
+				/* n>2: can't finalize yet (missing other clients'
+				 * nonces). LSP will broadcast DIST_ALL_NONCES. */
+				plugin_log(plugin_handle, LOG_INFORM,
+					   "Client: waiting for DIST_ALL_NONCES");
 			}
 		}
 		break;
@@ -1664,81 +1688,276 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 	case SS_SUBMSG_DIST_NONCE:
 		plugin_log(plugin_handle, LOG_INFORM,
 			   "DIST_NONCE from %s (len=%zu)", peer_id, len);
-		/* LSP: client sent dist nonce — set on session */
+		/* LSP: client sent dist nonce — set on session, track reception */
 		if (fi && fi->is_lsp) {
-			nonce_bundle_t cnb;
-			if (!nonce_bundle_deserialize(&cnb, data, len))
-				break;
+			nonce_bundle_t *cnb = calloc(1, sizeof(*cnb));
+			if (!cnb) break;
+			if (!nonce_bundle_deserialize(cnb, data, len)) {
+				free(cnb); break;
+			}
 			factory_t *f = (factory_t *)fi->lib_factory;
-			if (!f) break;
-			/* Set client nonces on standalone dist session */
+			if (!f) { free(cnb); break; }
 			musig_signing_session_t *dsess =
 				(musig_signing_session_t *)fi->dist_session;
 			if (!dsess) {
 				plugin_log(plugin_handle, LOG_BROKEN,
 					   "LSP: no dist session");
-				break;
+				free(cnb); break;
 			}
-			for (size_t e = 0; e < cnb.n_entries; e++) {
+
+			/* Set nonces on session and cache for DIST_ALL_NONCES */
+			for (size_t e = 0; e < cnb->n_entries; e++) {
 				secp256k1_musig_pubnonce pn;
 				if (!musig_pubnonce_parse(global_secp_ctx, &pn,
-					cnb.entries[e].pubnonce))
+					cnb->entries[e].pubnonce))
 					continue;
 				musig_session_set_pubnonce(dsess,
-					cnb.entries[e].signer_slot, &pn);
+					cnb->entries[e].signer_slot, &pn);
+				/* Cache for DIST_ALL_NONCES broadcast */
+				if (fi->n_clients > 1 && fi->cached_nonces) {
+					nonce_entry_t *cache =
+						(nonce_entry_t *)fi->cached_nonces;
+					if (fi->n_cached_nonces <
+					    fi->cached_nonces_cap) {
+						cache[fi->n_cached_nonces] =
+							cnb->entries[e];
+						fi->n_cached_nonces++;
+					}
+				}
 			}
-			plugin_log(plugin_handle, LOG_INFORM,
-				   "LSP: dist nonces set on standalone session");
 
-			/* Finalize dist session with dist_sighash */
-			if (!musig_session_finalize_nonces(
-				global_secp_ctx, dsess,
-				f->dist_sighash, NULL, NULL))
+			/* Mark client as responded */
+			if (strlen(peer_id) == 66) {
+				uint8_t pid[33];
+				for (int j = 0; j < 33; j++) {
+					unsigned int b;
+					sscanf(peer_id + j*2, "%02x", &b);
+					pid[j] = (uint8_t)b;
+				}
+				client_state_t *cl =
+					ss_factory_find_client(fi, pid);
+				if (cl) cl->nonce_received = true;
+				else if (fi->n_clients == 1)
+					fi->clients[0].nonce_received = true;
+			}
+
+			/* When all clients responded, finalize and
+			 * broadcast DIST_ALL_NONCES (n>2) or wait
+			 * for DIST_PSIG (n=2, client sends both together) */
+			if (ss_factory_all_nonces_received(fi)) {
+				if (!musig_session_finalize_nonces(
+					global_secp_ctx, dsess,
+					f->dist_sighash, NULL, NULL)) {
+					plugin_log(plugin_handle, LOG_BROKEN,
+						   "LSP: dist session finalize "
+						   "failed after all nonces");
+					free(cnb); break;
+				}
+				plugin_log(plugin_handle, LOG_INFORM,
+					   "LSP: dist session finalized");
+				if (fi->n_clients > 1) {
+					/* Broadcast all dist nonces to clients */
+					nonce_bundle_t *all_nb =
+						calloc(1, sizeof(*all_nb));
+					if (all_nb) {
+						memcpy(all_nb->instance_id,
+							fi->instance_id, 32);
+						all_nb->n_participants =
+							1 + fi->n_clients;
+						all_nb->n_nodes = 1;
+						nonce_entry_t *cache =
+							(nonce_entry_t *)fi->cached_nonces;
+						size_t nc = fi->n_cached_nonces;
+						if (nc > MAX_NONCE_ENTRIES)
+							nc = MAX_NONCE_ENTRIES;
+						memcpy(all_nb->entries, cache,
+							nc * sizeof(nonce_entry_t));
+						all_nb->n_entries = nc;
+						uint8_t *anbuf =
+							calloc(1, MAX_WIRE_BUF);
+						if (anbuf) {
+							size_t anlen =
+								nonce_bundle_serialize(
+									all_nb, anbuf,
+									MAX_WIRE_BUF);
+							for (size_t ci = 0;
+							     ci < fi->n_clients;
+							     ci++) {
+								char nid[67];
+								for (int j = 0;
+								     j < 33; j++)
+									sprintf(
+										nid+j*2,
+										"%02x",
+										fi->clients[ci].node_id[j]);
+								nid[66] = '\0';
+								send_factory_msg(
+									cmd, nid,
+									SS_SUBMSG_DIST_ALL_NONCES,
+									anbuf, anlen);
+							}
+							plugin_log(plugin_handle,
+								LOG_INFORM,
+								"LSP: sent DIST_ALL_NONCES "
+								"to %zu clients (%zu entries)",
+								fi->n_clients, nc);
+							free(anbuf);
+						}
+						free(all_nb);
+					}
+					free(fi->cached_nonces);
+					fi->cached_nonces = NULL;
+					fi->n_cached_nonces = 0;
+				}
+			} else {
+				plugin_log(plugin_handle, LOG_INFORM,
+					   "LSP: dist nonce cached, waiting for more");
+			}
+			free(cnb);
+		}
+		break;
+
+	case SS_SUBMSG_DIST_ALL_NONCES:
+		plugin_log(plugin_handle, LOG_INFORM,
+			   "DIST_ALL_NONCES from %s (len=%zu)", peer_id, len);
+		/* Client: LSP broadcast all dist nonces. Finalize and send PSIG. */
+		if (fi && !fi->is_lsp) {
+			nonce_bundle_t *anb = calloc(1, sizeof(*anb));
+			if (!anb) break;
+			if (!nonce_bundle_deserialize(anb, data, len)) {
+				free(anb); break;
+			}
+			factory_t *f = (factory_t *)fi->lib_factory;
+			if (!f) { free(anb); break; }
+			musig_signing_session_t *dsess =
+				(musig_signing_session_t *)fi->dist_session;
+			if (!dsess) { free(anb); break; }
+
+			/* Re-init to reset nonces_collected (same fix as ALL_NONCES) */
+			musig_session_init(dsess, &f->nodes[0].keyagg,
+				f->n_participants);
+
+			/* Set all nonces from bundle */
+			for (size_t e = 0; e < anb->n_entries; e++) {
+				secp256k1_musig_pubnonce pn;
+				if (!musig_pubnonce_parse(global_secp_ctx, &pn,
+					anb->entries[e].pubnonce))
+					continue;
+				musig_session_set_pubnonce(dsess,
+					anb->entries[e].signer_slot, &pn);
+			}
+
+			if (!musig_session_finalize_nonces(global_secp_ctx,
+				dsess, f->dist_sighash, NULL, NULL)) {
 				plugin_log(plugin_handle, LOG_BROKEN,
-					   "LSP: dist session finalize failed");
+					   "Client: dist finalize after ALL failed");
+				free(anb); break;
+			}
+
+			/* Create partial sig and send DIST_PSIG */
+			int our_idx = fi->our_participant_idx;
+			unsigned char our_sec[32];
+			derive_factory_seckey(our_sec, fi->instance_id, our_idx);
+			secp256k1_keypair kp;
+			if (!secp256k1_keypair_create(global_secp_ctx, &kp, our_sec)) {
+				free(anb); break;
+			}
+			musig_nonce_pool_t *pool =
+				(musig_nonce_pool_t *)fi->nonce_pool;
+			if (!pool || fi->n_secnonces == 0) {
+				free(anb); break;
+			}
+			secp256k1_musig_secnonce *sec =
+				&pool->nonces[fi->secnonce_pool_idx[0]].secnonce;
+
+			secp256k1_musig_partial_sig psig;
+			if (!musig_create_partial_sig(global_secp_ctx, &psig,
+				sec, &kp, dsess)) {
+				free(anb); break;
+			}
+
+			nonce_bundle_t *presp = calloc(1, sizeof(*presp));
+			if (!presp) { free(anb); break; }
+			memcpy(presp->instance_id, fi->instance_id, 32);
+			presp->n_participants = anb->n_participants;
+			presp->n_nodes = 1;
+			presp->n_entries = 1;
+			presp->entries[0].node_idx = f->n_nodes;
+			presp->entries[0].signer_slot = our_idx;
+			musig_partial_sig_serialize(global_secp_ctx,
+				presp->entries[0].pubnonce, &psig);
+
+			uint8_t *pbuf = calloc(1, MAX_WIRE_BUF);
+			if (pbuf) {
+				size_t plen = nonce_bundle_serialize(presp, pbuf,
+					MAX_WIRE_BUF);
+				send_factory_msg(cmd, peer_id,
+					SS_SUBMSG_DIST_PSIG, pbuf, plen);
+				plugin_log(plugin_handle, LOG_INFORM,
+					   "Client: sent DIST_PSIG after ALL");
+				free(pbuf);
+			}
+			free(presp);
+			free(anb);
 		}
 		break;
 
 	case SS_SUBMSG_DIST_PSIG:
 		plugin_log(plugin_handle, LOG_INFORM,
 			   "DIST_PSIG from %s (len=%zu)", peer_id, len);
-		/* LSP: client sent dist partial sig — complete and send FACTORY_READY */
+		/* LSP: client sent dist partial sig.
+		 * Track with psig_received. Fire FACTORY_READY once all respond. */
 		if (fi && fi->is_lsp) {
-			nonce_bundle_t pnb;
-			if (!nonce_bundle_deserialize(&pnb, data, len))
-				break;
+			nonce_bundle_t *pnb = calloc(1, sizeof(*pnb));
+			if (!pnb) break;
+			if (!nonce_bundle_deserialize(pnb, data, len)) {
+				free(pnb); break;
+			}
 			factory_t *f = (factory_t *)fi->lib_factory;
-			if (!f) break;
+			if (!f) { free(pnb); break; }
 
 			musig_signing_session_t *dsess =
 				(musig_signing_session_t *)fi->dist_session;
 			if (!dsess) {
 				plugin_log(plugin_handle, LOG_BROKEN,
 					   "LSP: no dist session for PSIG");
-				break;
+				free(pnb); break;
 			}
 
-			/* Count valid client partial sigs */
-			size_t n_psigs = 0;
-			for (size_t e = 0; e < pnb.n_entries; e++) {
-				secp256k1_musig_partial_sig ps;
-				if (musig_partial_sig_parse(global_secp_ctx,
-					&ps, pnb.entries[e].pubnonce))
-					n_psigs++;
+			/* Mark this client as responded */
+			if (strlen(peer_id) == 66) {
+				uint8_t pid[33];
+				for (int j = 0; j < 33; j++) {
+					unsigned int b;
+					sscanf(peer_id + j*2, "%02x", &b);
+					pid[j] = (uint8_t)b;
+				}
+				client_state_t *cl =
+					ss_factory_find_client(fi, pid);
+				if (cl) cl->psig_received = true;
+				else if (fi->n_clients == 1)
+					fi->clients[0].psig_received = true;
 			}
 
-			/* Create LSP's own dist psig using standalone session */
-			secp256k1_musig_partial_sig lsp_psig;
+			if (!ss_factory_all_psigs_received(fi)) {
+				plugin_log(plugin_handle, LOG_INFORM,
+					   "LSP: waiting for more DIST_PSIGs");
+				free(pnb); break;
+			}
+
+			/* All client PSIGs received. Create LSP's own. */
 			bool lsp_signed = false;
 			musig_nonce_pool_t *dpool =
 				(musig_nonce_pool_t *)fi->nonce_pool;
 			if (dpool && fi->n_secnonces > 0) {
 				secp256k1_keypair lsp_kp;
 				if (!secp256k1_keypair_create(global_secp_ctx,
-					&lsp_kp, fi->our_seckey))
-					break;
+					&lsp_kp, fi->our_seckey)) {
+					free(pnb); break;
+				}
 				secp256k1_musig_secnonce *sn =
 					&dpool->nonces[0].secnonce;
+				secp256k1_musig_partial_sig lsp_psig;
 				if (musig_create_partial_sig(global_secp_ctx,
 					&lsp_psig, sn, &lsp_kp, dsess)) {
 					lsp_signed = true;
@@ -1748,16 +1967,11 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 				}
 			}
 
-			/* Both sides signed — mark dist TX as complete.
-			 * Full signature aggregation (combine_partial_sigs)
-			 * would be needed to produce the final Schnorr sig
-			 * for broadcasting. For now, the signed status
-			 * indicates the safety net is in place. */
-			if (lsp_signed && n_psigs > 0) {
+			if (lsp_signed) {
 				f->dist_tx_ready = 2; /* signed */
 				plugin_log(plugin_handle, LOG_INFORM,
 					   "LSP: DISTRIBUTION TX SIGNED! "
-					   "(%zu client psigs + LSP)", n_psigs);
+					   "(%zu clients + LSP)", fi->n_clients);
 			}
 
 			if (fi->rotation_in_progress) {
@@ -1786,6 +2000,7 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 				free(fi->dist_session);
 				fi->dist_session = NULL;
 			}
+			free(pnb);
 		}
 		break;
 
