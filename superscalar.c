@@ -3639,6 +3639,7 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 						cmd, "sendrawtransaction",
 						rpc_done, rpc_err, fi);
 					json_add_string(btx->js, "tx", ctx_hex);
+					json_add_bool(btx->js, "allowhighfees", true);
 					send_outreq(btx);
 					plugin_log(plugin_handle, LOG_INFORM,
 						   "LSP: broadcast cooperative close TX");
@@ -5033,6 +5034,7 @@ static struct command_result *json_factory_force_close(struct command *cmd,
 			cmd, "sendrawtransaction",
 			rpc_done, rpc_err, fi);
 		json_add_string(breq->js, "tx", tx_hex);
+		json_add_bool(breq->js, "allowhighfees", true);
 		send_outreq(breq);
 		plugin_log(plugin_handle, LOG_INFORM,
 			   "force-close: broadcast node %zu (txid=%s)",
@@ -5168,6 +5170,7 @@ static struct command_result *breach_utxo_checked(struct command *cmd,
 					cmd, "sendrawtransaction",
 					rpc_done, rpc_err, fi);
 				json_add_string(breq->js, "tx", burn_hex);
+				json_add_bool(breq->js, "allowhighfees", true);
 				send_outreq(breq);
 			} else {
 				plugin_log(plugin_handle, LOG_UNUSUAL,
@@ -5356,6 +5359,7 @@ static struct command_result *json_factory_check_breach(struct command *cmd,
 		cmd, "sendrawtransaction",
 		rpc_done, rpc_err, fi);
 	json_add_string(breq->js, "tx", burn_hex);
+	json_add_bool(breq->js, "allowhighfees", true);
 	send_outreq(breq);
 	plugin_log(plugin_handle, LOG_INFORM,
 		   "Breach penalty tx broadcast for epoch %u", *epoch);
