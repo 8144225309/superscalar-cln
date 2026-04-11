@@ -1176,6 +1176,13 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 			if (!f) { free(anb); break; }
 			secp256k1_context *ctx = global_secp_ctx;
 
+			/* Re-init sessions: musig_session_set_pubnonce blindly
+			 * increments nonces_collected on every call. FACTORY_PROPOSE
+			 * already set LSP+own nonces, so nonces_collected is already
+			 * 2 for some nodes. Re-init resets the counter to 0 so we
+			 * can set all 18 nonces cleanly from ALL_NONCES. */
+			factory_sessions_init(f);
+
 			/* Set all nonces from the bundle */
 			size_t set_count = 0;
 			for (size_t e = 0; e < anb->n_entries; e++) {
