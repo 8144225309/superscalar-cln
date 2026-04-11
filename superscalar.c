@@ -96,6 +96,9 @@ static void derive_factory_seckey(unsigned char seckey[32],
 	if (seckey[0] == 0) seckey[0] = 0x01;
 }
 
+/* Forward declarations */
+static void ss_save_factory(struct command *cmd, factory_instance_t *fi);
+
 /* Forward declarations for RPC callbacks */
 static struct command_result *rpc_done(struct command *cmd,
 				       const char *method,
