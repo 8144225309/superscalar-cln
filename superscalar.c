@@ -892,7 +892,11 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 			 * This is sent in the NONCE_BUNDLE so the LSP can
 			 * rebuild the DW tree with real pubkeys. */
 			secp256k1_pubkey our_real_pub;
-			secp256k1_ec_pubkey_create(ctx, &our_real_pub, our_sec);
+			if (!secp256k1_ec_pubkey_create(ctx, &our_real_pub, our_sec)) {
+				plugin_log(plugin_handle, LOG_BROKEN,
+					   "Client: ec_pubkey_create failed");
+				free(pubkeys); free(nb); break;
+			}
 
 			/* Generate our nonces */
 			size_t our_node_count =
@@ -1211,14 +1215,13 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 					bool rebuild_ok = false;
 					if (real_pks) {
 						/* LSP pubkey from our_seckey */
-						secp256k1_ec_pubkey_create(
+						rebuild_ok = secp256k1_ec_pubkey_create(
 							global_secp_ctx,
 							&real_pks[0],
-							fi->our_seckey);
+							fi->our_seckey) != 0;
 						/* Client pubkeys */
-						rebuild_ok = true;
 						for (size_t rci = 0;
-						     rci < fi->n_clients; rci++) {
+						     rci < fi->n_clients && rebuild_ok; rci++) {
 							if (!fi->clients[rci].has_factory_pubkey) {
 								plugin_log(plugin_handle,
 									   LOG_UNUSUAL,
@@ -1230,10 +1233,10 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 								derive_placeholder_seckey(
 									psk, fi->instance_id,
 									(int)(rci + 1));
-								secp256k1_ec_pubkey_create(
+								rebuild_ok = secp256k1_ec_pubkey_create(
 									global_secp_ctx,
 									&real_pks[rci + 1],
-									psk);
+									psk) != 0;
 							} else {
 								if (!secp256k1_ec_pubkey_parse(
 									global_secp_ctx,
@@ -1354,15 +1357,15 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 							{
 								size_t pk_out = 33;
 								secp256k1_pubkey lsp_pub;
-								secp256k1_ec_pubkey_create(
+								if (secp256k1_ec_pubkey_create(
 									global_secp_ctx,
 									&lsp_pub,
-									fi->our_seckey);
-								secp256k1_ec_pubkey_serialize(
-									global_secp_ctx,
-									all_nb->pubkeys[0],
-									&pk_out, &lsp_pub,
-									SECP256K1_EC_COMPRESSED);
+									fi->our_seckey))
+									secp256k1_ec_pubkey_serialize(
+										global_secp_ctx,
+										all_nb->pubkeys[0],
+										&pk_out, &lsp_pub,
+										SECP256K1_EC_COMPRESSED);
 								for (size_t rci = 0;
 								     rci < fi->n_clients; rci++) {
 									if (fi->clients[rci].has_factory_pubkey)
@@ -1457,8 +1460,9 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 						derive_placeholder_seckey(
 							psk, fi->instance_id,
 							(int)rpi);
-						secp256k1_ec_pubkey_create(
-							ctx, &real_pks[rpi], psk);
+						if (!secp256k1_ec_pubkey_create(
+							ctx, &real_pks[rpi], psk))
+							all_valid = false;
 					} else if (!secp256k1_ec_pubkey_parse(
 						ctx, &real_pks[rpi],
 						anb->pubkeys[rpi], 33)) {
