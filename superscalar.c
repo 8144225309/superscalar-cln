@@ -791,18 +791,31 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 			fi->our_participant_idx = our_idx;
 			fi->n_secnonces = 0;
 
-			nonce_bundle_t resp;
-			memset(&resp, 0, sizeof(resp));
-			memcpy(resp.instance_id, fi->instance_id, 32);
-			resp.n_participants = nb.n_participants;
-			resp.n_nodes = factory->n_nodes;
-			resp.n_entries = 0;
+			/* Heap-allocate: nonce_bundle_t is ~79KB with 1024 entries */
+			nonce_bundle_t *resp = calloc(1, sizeof(nonce_bundle_t));
+			if (!resp) {
+				free(pool);
+				break;
+			}
+			memcpy(resp->instance_id, fi->instance_id, 32);
+			resp->n_participants = nb.n_participants;
+			resp->n_nodes = factory->n_nodes;
+			resp->n_entries = 0;
 
 			size_t pool_entry = 0;
 			for (size_t ni = 0; ni < factory->n_nodes; ni++) {
 				int slot = factory_find_signer_slot(
 					factory, ni, our_idx);
 				if (slot < 0) continue;
+
+				if (resp->n_entries >= MAX_NONCE_ENTRIES ||
+				    fi->n_secnonces >= MAX_NONCE_ENTRIES) {
+					plugin_log(plugin_handle, LOG_BROKEN,
+						   "Client: nonce entries exceeded"
+						   " MAX_NONCE_ENTRIES at node %zu",
+						   ni);
+					break;
+				}
 
 				secp256k1_musig_secnonce *sec;
 				secp256k1_musig_pubnonce pub;
@@ -818,24 +831,26 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 				factory_session_set_nonce(factory, ni,
 							  (size_t)slot, &pub);
 				musig_pubnonce_serialize(ctx,
-					resp.entries[resp.n_entries].pubnonce,
+					resp->entries[resp->n_entries].pubnonce,
 					&pub);
-				resp.entries[resp.n_entries].node_idx = ni;
-				resp.entries[resp.n_entries].signer_slot = slot;
-				resp.n_entries++;
+				resp->entries[resp->n_entries].node_idx = ni;
+				resp->entries[resp->n_entries].signer_slot = slot;
+				resp->n_entries++;
 			}
 
 			plugin_log(plugin_handle, LOG_INFORM,
 				   "Client: generated %zu nonce entries",
-				   resp.n_entries);
+				   resp->n_entries);
 
 			/* Serialize and send NONCE_BUNDLE back to LSP */
-			uint8_t rbuf[MAX_WIRE_BUF];
-			size_t rlen = nonce_bundle_serialize(&resp,
-				rbuf, sizeof(rbuf));
+			uint8_t *rbuf = calloc(1, MAX_WIRE_BUF);
+			size_t rlen = nonce_bundle_serialize(resp,
+				rbuf, MAX_WIRE_BUF);
+			free(resp);
 			send_factory_msg(cmd, peer_id,
 					 SS_SUBMSG_NONCE_BUNDLE,
 					 rbuf, rlen);
+			free(rbuf);
 
 			/* In 2-party mode, client has all nonces (its own +
 			 * LSP's) and can finalize + sign immediately.
@@ -1079,11 +1094,11 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 						       n * sizeof(nonce_entry_t));
 						all_nb.n_entries = n;
 
-						uint8_t anbuf[MAX_WIRE_BUF];
+						uint8_t *anbuf = calloc(1, MAX_WIRE_BUF);
 						size_t anlen =
 							nonce_bundle_serialize(
 								&all_nb, anbuf,
-								sizeof(anbuf));
+								MAX_WIRE_BUF);
 
 						for (size_t ci = 0;
 						     ci < fi->n_clients; ci++) {
@@ -1097,6 +1112,7 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 								SS_SUBMSG_ALL_NONCES,
 								anbuf, anlen);
 						}
+						free(anbuf);
 						plugin_log(plugin_handle,
 							   LOG_INFORM,
 							   "LSP: sent ALL_NONCES "
@@ -2968,19 +2984,29 @@ static struct command_result *json_factory_create(struct command *cmd,
 			}
 			fi->nonce_pool = pool;
 
-			/* Extract nonces for each node */
-			nonce_bundle_t nb;
-			memset(&nb, 0, sizeof(nb));
-			memcpy(nb.instance_id, fi->instance_id, 32);
-			nb.n_participants = n_total;
-			nb.n_nodes = factory->n_nodes;
-			nb.n_entries = 0;
+			/* Extract nonces for each node.
+			 * Heap-allocate: with 1024 entries nonce_bundle_t is ~79KB */
+			nonce_bundle_t *nb = calloc(1, sizeof(nonce_bundle_t));
+			if (!nb) {
+				free(pool);
+				free(pubkeys);
+				return command_fail(cmd, LIGHTNINGD,
+						    "OOM allocating nonce bundle");
+			}
+			memcpy(nb->instance_id, fi->instance_id, 32);
+			nb->n_participants = n_total;
+			nb->n_nodes = factory->n_nodes;
+			nb->n_entries = 0;
+
+			plugin_log(plugin_handle, LOG_INFORM,
+				   "factory-create: n_nodes=%zu lsp_node_count=%zu",
+				   (size_t)factory->n_nodes, lsp_node_count);
 
 			/* Include all pubkeys so client can reconstruct */
 			for (size_t pk = 0; pk < n_total && pk < MAX_PARTICIPANTS; pk++) {
 				size_t pklen = 33;
 				secp256k1_ec_pubkey_serialize(secp_ctx,
-					nb.pubkeys[pk], &pklen,
+					nb->pubkeys[pk], &pklen,
 					&pubkeys[pk],
 					SECP256K1_EC_COMPRESSED);
 			}
@@ -2990,6 +3016,15 @@ static struct command_result *json_factory_create(struct command *cmd,
 				int slot = factory_find_signer_slot(
 					factory, ni, 0);
 				if (slot < 0) continue;
+
+				if (nb->n_entries >= MAX_NONCE_ENTRIES ||
+				    fi->n_secnonces >= MAX_NONCE_ENTRIES) {
+					plugin_log(plugin_handle, LOG_BROKEN,
+						   "Nonce entries exceeded MAX_NONCE_ENTRIES"
+						   " (%d) at node %zu — increase limit",
+						   MAX_NONCE_ENTRIES, ni);
+					break;
+				}
 
 				secp256k1_musig_secnonce *secnonce;
 				secp256k1_musig_pubnonce pubnonce;
@@ -3016,35 +3051,36 @@ static struct command_result *json_factory_create(struct command *cmd,
 
 				/* Serialize for sending */
 				musig_pubnonce_serialize(secp_ctx,
-					nb.entries[nb.n_entries].pubnonce,
+					nb->entries[nb->n_entries].pubnonce,
 					&pubnonce);
-				nb.entries[nb.n_entries].node_idx = ni;
-				nb.entries[nb.n_entries].signer_slot = slot;
-				nb.n_entries++;
+				nb->entries[nb->n_entries].node_idx = ni;
+				nb->entries[nb->n_entries].signer_slot = slot;
+				nb->n_entries++;
 			}
 
-			/* Cache LSP's nonce entries for ALL_NONCES round.
-			 * Pre-allocate for all participants × all nodes. */
+			/* Cache LSP's nonce entries for ALL_NONCES round. */
 			if (fi->cached_nonces) free(fi->cached_nonces);
 			fi->cached_nonces_cap = MAX_NONCE_ENTRIES;
 			fi->cached_nonces = calloc(fi->cached_nonces_cap,
 				sizeof(nonce_entry_t));
 			fi->n_cached_nonces = 0;
-			if (fi->cached_nonces && nb.n_entries <= fi->cached_nonces_cap) {
-				memcpy(fi->cached_nonces, nb.entries,
-				       nb.n_entries * sizeof(nonce_entry_t));
-				fi->n_cached_nonces = nb.n_entries;
+			if (fi->cached_nonces && nb->n_entries <= fi->cached_nonces_cap) {
+				memcpy(fi->cached_nonces, nb->entries,
+				       nb->n_entries * sizeof(nonce_entry_t));
+				fi->n_cached_nonces = nb->n_entries;
 			}
 
 			plugin_log(plugin_handle, LOG_INFORM,
 				   "MuSig2 nonces: %zu entries for %zu nodes",
-				   nb.n_entries,
+				   nb->n_entries,
 				   (size_t)factory->n_nodes);
 
-			/* Serialize the nonce bundle (heap to avoid stack overflow) */
+			/* Serialize the nonce bundle */
 			uint8_t *nbuf = calloc(1, MAX_WIRE_BUF);
-			size_t blen = nonce_bundle_serialize(&nb, nbuf,
+			size_t blen = nonce_bundle_serialize(nb, nbuf,
 							     MAX_WIRE_BUF);
+			free(nb);
+
 			plugin_log(plugin_handle, LOG_INFORM,
 				   "Nonce bundle serialized: %zu bytes",
 				   blen);
