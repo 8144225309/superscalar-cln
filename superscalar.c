@@ -29,10 +29,16 @@
 #include <superscalar/factory.h>
 #include <superscalar/musig.h>
 #include <superscalar/dw_state.h>
+#include <superscalar/ladder.h>
+#include <superscalar/adaptor.h>
 
 static struct plugin *plugin_handle;
 static superscalar_state_t ss_state;
 static secp256k1_context *global_secp_ctx;
+
+/* Ladder state: manages multi-factory lifecycle with staggered expiry.
+ * NULL until initialized (requires LSP mode + HSM key). */
+static ladder_t *ss_ladder;
 
 
 /* bLIP-56 factory message type */
@@ -4552,6 +4558,29 @@ static struct command_result *handle_block_added(struct command *cmd,
 		}
 	}
 
+	/* Ladder lifecycle: advance block, evict expired factories,
+	 * log dying factories that need client migration. */
+	if (ss_ladder && ss_ladder->n_factories > 0) {
+		ladder_advance_block(ss_ladder, ss_state.current_blockheight);
+
+		/* Log factories entering DYING state */
+		ladder_factory_t *dying = ladder_get_dying(ss_ladder);
+		if (dying && dying->cached_state == FACTORY_DYING) {
+			plugin_log(plugin_handle, LOG_UNUSUAL,
+				   "LADDER: factory %u entered DYING state "
+				   "at block %u — client migration needed",
+				   dying->factory_id,
+				   ss_state.current_blockheight);
+		}
+
+		/* Evict expired factories */
+		size_t evicted = ladder_evict_expired(ss_ladder);
+		if (evicted > 0)
+			plugin_log(plugin_handle, LOG_INFORM,
+				   "LADDER: evicted %zu expired factories",
+				   evicted);
+	}
+
 	return notification_handled(cmd);
 }
 
@@ -4894,12 +4923,91 @@ static const char *init(struct command *init_cmd,
 	/* Load persisted factories from datastore */
 	ss_load_factories(init_cmd);
 
+	/* Initialize ladder (multi-factory lifecycle manager).
+	 * Uses LSP keypair derived from HSM master key. */
+	{
+		secp256k1_keypair lsp_kp;
+		unsigned char lsp_sk[32];
+		/* Use master key directly as LSP ladder key */
+		memcpy(lsp_sk, ss_state.factory_master_key, 32);
+		if (secp256k1_keypair_create(global_secp_ctx, &lsp_kp, lsp_sk)) {
+			ss_ladder = calloc(1, sizeof(ladder_t));
+			if (ss_ladder) {
+				ladder_init(ss_ladder, global_secp_ctx,
+					    &lsp_kp,
+					    4320,  /* active: ~30 days */
+					    432);  /* dying: ~3 days */
+				ss_ladder->current_block =
+					ss_state.current_blockheight;
+				plugin_log(plugin_handle, LOG_INFORM,
+					   "Ladder initialized (active=%u, "
+					   "dying=%u blocks)",
+					   ss_ladder->active_blocks,
+					   ss_ladder->dying_blocks);
+			}
+		}
+	}
+
 	plugin_log(plugin_handle, LOG_INFORM,
 		   "SuperScalar factory plugin initialized "
 		   "(blockheight=%u, factories=%zu)",
 		   ss_state.current_blockheight,
 		   ss_state.n_factories);
 	return NULL;
+}
+
+/* factory-ladder-status RPC — show ladder lifecycle state */
+static struct command_result *json_factory_ladder_status(struct command *cmd,
+							  const char *buf,
+							  const jsmntok_t *params)
+{
+	if (!param(cmd, buf, params, NULL))
+		return command_param_failed();
+
+	struct json_stream *js = jsonrpc_stream_success(cmd);
+
+	if (!ss_ladder) {
+		json_add_bool(js, "initialized", false);
+		return command_finished(cmd, js);
+	}
+
+	json_add_bool(js, "initialized", true);
+	json_add_u32(js, "n_factories", ss_ladder->n_factories);
+	json_add_u32(js, "next_factory_id", ss_ladder->next_factory_id);
+	json_add_u32(js, "active_blocks", ss_ladder->active_blocks);
+	json_add_u32(js, "dying_blocks", ss_ladder->dying_blocks);
+	json_add_u32(js, "current_block", ss_ladder->current_block);
+
+	json_array_start(js, "factories");
+	for (size_t i = 0; i < ss_ladder->n_factories; i++) {
+		ladder_factory_t *lf = &ss_ladder->factories[i];
+		json_object_start(js, NULL);
+		json_add_u32(js, "factory_id", lf->factory_id);
+		json_add_string(js, "state",
+			lf->cached_state == FACTORY_ACTIVE ? "active" :
+			lf->cached_state == FACTORY_DYING ? "dying" :
+			lf->cached_state == FACTORY_EXPIRED ? "expired" :
+			"unknown");
+		json_add_bool(js, "is_funded", lf->is_funded != 0);
+		json_add_bool(js, "is_initialized", lf->is_initialized != 0);
+		json_add_u32(js, "n_participants",
+			lf->factory.n_participants);
+		json_add_u32(js, "n_departed", lf->n_departed);
+		json_add_u32(js, "n_nodes", lf->factory.n_nodes);
+
+		uint32_t blocks_left = factory_blocks_until_dying(
+			&lf->factory, ss_ladder->current_block);
+		json_add_u32(js, "blocks_until_dying", blocks_left);
+
+		uint32_t blocks_exp = factory_blocks_until_expired(
+			&lf->factory, ss_ladder->current_block);
+		json_add_u32(js, "blocks_until_expired", blocks_exp);
+
+		json_object_end(js);
+	}
+	json_array_end(js);
+
+	return command_finished(cmd, js);
 }
 
 static const struct plugin_hook hooks[] = {
@@ -4935,6 +5043,10 @@ static const struct plugin_command commands[] = {
 	{
 		"factory-open-channels",
 		json_factory_open_channels,
+	},
+	{
+		"factory-ladder-status",
+		json_factory_ladder_status,
 	},
 };
 
