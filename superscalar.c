@@ -1859,7 +1859,6 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 						   "(%zu outputs)", n_rdist);
 
 					/* Generate nonce for dist TX */
-					uint32_t rdist_idx = f->n_nodes;
 					secp256k1_context *rdctx = global_secp_ctx;
 					unsigned char rlsp_sk[32];
 					derive_factory_seckey(rlsp_sk, fi->instance_id, 0);
