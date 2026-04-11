@@ -121,6 +121,12 @@ typedef struct factory_instance {
 	size_t n_cached_nonces;
 	size_t cached_nonces_cap;
 
+	/* Cached serialized ALL_NONCES wire payload for reconnect recovery.
+	 * Populated when ALL_NONCES is first sent; freed after PSIG phase.
+	 * Allows re-sending ALL_NONCES if a client disconnects mid-ceremony. */
+	uint8_t *cached_all_nonces_wire;
+	size_t cached_all_nonces_len;
+
 	/* MuSig2 nonce pool (heap-allocated, secnonces live inside) */
 	void *nonce_pool;
 	/* Per-entry: which pool index maps to which tree node */

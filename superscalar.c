@@ -1390,6 +1390,15 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 									MAX_WIRE_BUF);
 							free(all_nb);
 
+							/* Cache wire payload for reconnect recovery */
+							free(fi->cached_all_nonces_wire);
+							fi->cached_all_nonces_wire = malloc(anlen);
+							if (fi->cached_all_nonces_wire) {
+								memcpy(fi->cached_all_nonces_wire,
+								       anbuf, anlen);
+								fi->cached_all_nonces_len = anlen;
+							}
+
 							for (size_t ci = 0;
 							     ci < fi->n_clients; ci++) {
 								char nid[67];
@@ -1831,6 +1840,10 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 					/* Reset ceremony tracking for dist round */
 					ss_factory_reset_ceremony(fi);
 					fi->ceremony = CEREMONY_PSIGS_COLLECTED;
+					/* No longer need all_nonces cache */
+					free(fi->cached_all_nonces_wire);
+					fi->cached_all_nonces_wire = NULL;
+					fi->cached_all_nonces_len = 0;
 
 					plugin_log(plugin_handle, LOG_INFORM,
 						   "LSP: sent DIST_PROPOSE to %zu "
@@ -1843,6 +1856,9 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 						   "LSP: distribution TX build "
 						   "failed, proceeding without");
 					fi->ceremony = CEREMONY_COMPLETE;
+					free(fi->cached_all_nonces_wire);
+					fi->cached_all_nonces_wire = NULL;
+					fi->cached_all_nonces_len = 0;
 					for (size_t ci = 0; ci < fi->n_clients; ci++) {
 						char nid[67];
 						for (int j = 0; j < 33; j++)
@@ -4443,6 +4459,123 @@ static struct command_result *handle_connect(struct command *cmd,
 
 	/* Send our supported protocols to the newly connected peer */
 	send_supported_protocols(cmd, peer_id);
+
+	/* Recovery: if we're the LSP and this peer is a factory client
+	 * who disconnected mid-ceremony, re-send FACTORY_PROPOSE so the
+	 * ceremony can continue without manual intervention. */
+	if (!ss_state.is_lsp || strlen(peer_id) != 66)
+		return notification_handled(cmd);
+
+	uint8_t pid[33];
+	for (int pj = 0; pj < 33; pj++) {
+		unsigned int pb;
+		if (sscanf(peer_id + pj*2, "%02x", &pb) != 1)
+			return notification_handled(cmd);
+		pid[pj] = (uint8_t)pb;
+	}
+
+	for (size_t fi_i = 0; fi_i < ss_state.n_factories; fi_i++) {
+		factory_instance_t *fi = ss_state.factories[fi_i];
+		if (!fi) continue;
+
+		bool is_propose = (fi->ceremony == CEREMONY_PROPOSED &&
+				   fi->lib_factory &&
+				   fi->n_cached_nonces > 0);
+		bool is_nonces  = (fi->ceremony == CEREMONY_NONCES_COLLECTED &&
+				   fi->cached_all_nonces_wire &&
+				   fi->cached_all_nonces_len > 0);
+		if (!is_propose && !is_nonces)
+			continue;
+
+		for (size_t ci = 0; ci < fi->n_clients; ci++) {
+			if (memcmp(fi->clients[ci].node_id, pid, 33) != 0)
+				continue;
+
+			if (is_propose && !fi->clients[ci].nonce_received) {
+				/* Re-send FACTORY_PROPOSE so client can respond
+				 * with its NONCE_BUNDLE. Build nonce bundle from
+				 * the cached LSP nonce entries. */
+				factory_t *factory = (factory_t *)fi->lib_factory;
+				nonce_bundle_t *nb = calloc(1, sizeof(nonce_bundle_t));
+				if (!nb) break;
+
+				memcpy(nb->instance_id, fi->instance_id, 32);
+				nb->n_participants = (uint32_t)(fi->n_clients + 1);
+				nb->n_nodes = factory->n_nodes;
+				nb->n_entries = fi->n_cached_nonces;
+				memcpy(nb->entries, fi->cached_nonces,
+				       fi->n_cached_nonces * sizeof(nonce_entry_t));
+
+				/* Slot 0: LSP real pubkey; rest: placeholders */
+				secp256k1_context *ctx = global_secp_ctx;
+				secp256k1_pubkey lsp_pub;
+				if (secp256k1_ec_pubkey_create(ctx, &lsp_pub,
+							       fi->our_seckey)) {
+					size_t pklen = 33;
+					secp256k1_ec_pubkey_serialize(ctx,
+						nb->pubkeys[0], &pklen,
+						&lsp_pub, SECP256K1_EC_COMPRESSED);
+				}
+				for (size_t pk = 1;
+				     pk < nb->n_participants &&
+				     pk < MAX_PARTICIPANTS; pk++) {
+					unsigned char psk[32];
+					derive_placeholder_seckey(psk,
+						fi->instance_id, (int)pk);
+					secp256k1_pubkey ph_pub;
+					if (secp256k1_ec_pubkey_create(ctx,
+								       &ph_pub,
+								       psk)) {
+						size_t pklen = 33;
+						secp256k1_ec_pubkey_serialize(ctx,
+							nb->pubkeys[pk], &pklen,
+							&ph_pub,
+							SECP256K1_EC_COMPRESSED);
+					}
+				}
+
+				uint8_t *nbuf = calloc(1, MAX_WIRE_BUF);
+				if (!nbuf) { free(nb); break; }
+				size_t blen = nonce_bundle_serialize(nb, nbuf,
+								     MAX_WIRE_BUF);
+				free(nb);
+
+				uint32_t pidx = (uint32_t)(ci + 1);
+				uint8_t *cbuf = calloc(1, blen + 4);
+				if (!cbuf) { free(nbuf); break; }
+				memcpy(cbuf, nbuf, blen);
+				cbuf[blen]     = (pidx >> 24) & 0xFF;
+				cbuf[blen + 1] = (pidx >> 16) & 0xFF;
+				cbuf[blen + 2] = (pidx >> 8)  & 0xFF;
+				cbuf[blen + 3] =  pidx         & 0xFF;
+				free(nbuf);
+
+				send_factory_msg(cmd, peer_id,
+						 SS_SUBMSG_FACTORY_PROPOSE,
+						 cbuf, blen + 4);
+				free(cbuf);
+
+				plugin_log(plugin_handle, LOG_INFORM,
+					   "Reconnect recovery: re-sent"
+					   " FACTORY_PROPOSE to client %zu"
+					   " (participant_idx=%u)", ci, pidx);
+
+			} else if (is_nonces && !fi->clients[ci].psig_received) {
+				/* Re-send ALL_NONCES so client can respond with
+				 * its PSIG_BUNDLE. Use the cached wire payload. */
+				send_factory_msg(cmd, peer_id,
+						 SS_SUBMSG_ALL_NONCES,
+						 fi->cached_all_nonces_wire,
+						 fi->cached_all_nonces_len);
+
+				plugin_log(plugin_handle, LOG_INFORM,
+					   "Reconnect recovery: re-sent"
+					   " ALL_NONCES to client %zu", ci);
+			}
+
+			break; /* peer occupies at most one slot per factory */
+		}
+	}
 
 	return notification_handled(cmd);
 }
