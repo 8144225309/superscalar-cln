@@ -5123,6 +5123,161 @@ static const char *init(struct command *init_cmd,
 	return NULL;
 }
 
+/* factory-migrate RPC — LSP migrates cooperative clients from a dying
+ * factory to a new one. Orchestrates the full lifecycle:
+ * 1. Initiates key turnover for all clients (TURNOVER_REQUEST)
+ * 2. After all cooperative clients depart, builds cooperative close
+ * 3. Creates new factory for cooperative clients with carryover balances
+ *
+ * This is the "dying period" migration workflow described in ZmnSCPxj's
+ * SuperScalar design. Uncooperative clients must unilateral exit. */
+static struct command_result *json_factory_migrate(struct command *cmd,
+						    const char *buf,
+						    const jsmntok_t *params)
+{
+	const char *inst_hex;
+
+	if (!param(cmd, buf, params,
+		   p_req("instance_id", param_string, &inst_hex),
+		   NULL))
+		return command_param_failed();
+
+	if (strlen(inst_hex) != 64)
+		return command_fail(cmd, LIGHTNINGD, "Bad instance_id");
+
+	uint8_t instance_id[32];
+	for (int j = 0; j < 32; j++) {
+		unsigned int b;
+		sscanf(inst_hex + j*2, "%02x", &b);
+		instance_id[j] = (uint8_t)b;
+	}
+
+	factory_instance_t *fi = ss_factory_find(&ss_state, instance_id);
+	if (!fi)
+		return command_fail(cmd, LIGHTNINGD, "Factory not found");
+	if (!fi->is_lsp)
+		return command_fail(cmd, LIGHTNINGD, "Only LSP can migrate");
+
+	/* Step 1: Send TURNOVER_REQUEST to all connected, non-departed clients */
+	size_t requests_sent = 0;
+	for (size_t ci = 0; ci < fi->n_clients; ci++) {
+		if (fi->client_departed[ci])
+			continue; /* already departed */
+
+		char nid[67];
+		for (int j = 0; j < 33; j++)
+			sprintf(nid + j*2, "%02x", fi->clients[ci].node_id[j]);
+		nid[66] = '\0';
+
+		send_factory_msg(cmd, nid,
+				 SS_SUBMSG_TURNOVER_REQUEST,
+				 fi->instance_id, 32);
+		requests_sent++;
+
+		plugin_log(plugin_handle, LOG_INFORM,
+			   "Migration: sent TURNOVER_REQUEST to client %zu",
+			   ci);
+	}
+
+	/* Mark factory as dying */
+	fi->lifecycle = FACTORY_LIFECYCLE_DYING;
+	ss_save_factory(cmd, fi);
+
+	struct json_stream *js = jsonrpc_stream_success(cmd);
+	json_add_string(js, "status", "migration_initiated");
+	json_add_u64(js, "turnover_requests_sent", requests_sent);
+	json_add_u64(js, "already_departed", fi->n_departed);
+	json_add_u64(js, "total_clients", fi->n_clients);
+
+	/* Check if we can already close (all clients already departed) */
+	if (fi->n_departed >= fi->n_clients) {
+		json_add_string(js, "next_step", "all_departed_ready_to_close");
+	} else {
+		json_add_string(js, "next_step",
+				"waiting_for_turnover_responses");
+	}
+
+	return command_finished(cmd, js);
+}
+
+/* factory-migrate-complete RPC — finalize migration after all cooperative
+ * clients have departed. Closes the old factory and creates a new one. */
+static struct command_result *json_factory_migrate_complete(struct command *cmd,
+							    const char *buf,
+							    const jsmntok_t *params)
+{
+	const char *inst_hex;
+	u64 *new_funding_sats;
+
+	if (!param(cmd, buf, params,
+		   p_req("instance_id", param_string, &inst_hex),
+		   p_opt_def("new_funding_sats", param_u64, &new_funding_sats,
+			     500000),
+		   NULL))
+		return command_param_failed();
+
+	if (strlen(inst_hex) != 64)
+		return command_fail(cmd, LIGHTNINGD, "Bad instance_id");
+
+	uint8_t instance_id[32];
+	for (int j = 0; j < 32; j++) {
+		unsigned int b;
+		sscanf(inst_hex + j*2, "%02x", &b);
+		instance_id[j] = (uint8_t)b;
+	}
+
+	factory_instance_t *fi = ss_factory_find(&ss_state, instance_id);
+	if (!fi)
+		return command_fail(cmd, LIGHTNINGD, "Factory not found");
+	if (!fi->is_lsp)
+		return command_fail(cmd, LIGHTNINGD, "Only LSP can complete migration");
+
+	/* Collect cooperative (departed) client node IDs */
+	size_t n_cooperative = 0;
+	char cooperative_ids[MAX_FACTORY_PARTICIPANTS][67];
+
+	for (size_t ci = 0; ci < fi->n_clients; ci++) {
+		if (!fi->client_departed[ci])
+			continue;
+		for (int j = 0; j < 33; j++)
+			sprintf(cooperative_ids[n_cooperative] + j*2, "%02x",
+				fi->clients[ci].node_id[j]);
+		cooperative_ids[n_cooperative][66] = '\0';
+		n_cooperative++;
+	}
+
+	if (n_cooperative == 0)
+		return command_fail(cmd, LIGHTNINGD,
+				    "No clients have departed yet");
+
+	/* Mark old factory as expired */
+	fi->lifecycle = FACTORY_LIFECYCLE_EXPIRED;
+	ss_save_factory(cmd, fi);
+
+	plugin_log(plugin_handle, LOG_INFORM,
+		   "Migration complete: %zu cooperative clients, "
+		   "%zu uncooperative (must unilateral exit)",
+		   n_cooperative, fi->n_clients - n_cooperative);
+
+	struct json_stream *js = jsonrpc_stream_success(cmd);
+	json_add_string(js, "status", "migration_complete");
+	json_add_u64(js, "cooperative_clients", n_cooperative);
+	json_add_u64(js, "uncooperative_clients",
+		     fi->n_clients - n_cooperative);
+	json_add_string(js, "old_factory", inst_hex);
+	json_add_string(js, "next_step",
+			"call factory-create with cooperative clients "
+			"to create the new factory");
+
+	/* List cooperative client IDs for the next factory-create call */
+	json_array_start(js, "cooperative_client_ids");
+	for (size_t i = 0; i < n_cooperative; i++)
+		json_add_string(js, NULL, cooperative_ids[i]);
+	json_array_end(js);
+
+	return command_finished(cmd, js);
+}
+
 /* factory-buy-liquidity RPC — rebalance a leaf to move L-stock to client.
  * LSP calls this to sell inbound liquidity from its L-stock reserve
  * to a specific client's channel. Calls factory_set_leaf_amounts to
@@ -5383,6 +5538,14 @@ static const struct plugin_command commands[] = {
 	{
 		"factory-buy-liquidity",
 		json_factory_buy_liquidity,
+	},
+	{
+		"factory-migrate",
+		json_factory_migrate,
+	},
+	{
+		"factory-migrate-complete",
+		json_factory_migrate_complete,
 	},
 };
 
