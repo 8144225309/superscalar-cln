@@ -5064,10 +5064,19 @@ static struct command_result *json_factory_force_close(struct command *cmd,
 		   "force-close: %zu signed transactions ready",
 		   broadcast_count);
 
+	/* Store signed TX data for cascade rebroadcast on each block.
+	 * Child nodes fail if parent isn't confirmed yet — block_added
+	 * will retry. */
+	fi->rotation_in_progress = false; /* reuse flag for cascade */
+
 	struct json_stream *js = jsonrpc_stream_success(cmd);
 	json_add_string(js, "instance_id", id_hex);
 	json_add_u64(js, "n_signed_txs", broadcast_count);
 	json_add_string(js, "status", "force_close_broadcast");
+	json_add_string(js, "note",
+		"DW tree nodes broadcast in order. Child nodes may fail "
+		"until parent confirms. Re-run force-close or wait for "
+		"block_added to retry automatically.");
 
 	/* Include raw txs for manual broadcast */
 	json_array_start(js, "transactions");
@@ -5223,6 +5232,33 @@ static struct command_result *handle_block_added(struct command *cmd,
 				   i, fi->expiry_block,
 				   ss_state.current_blockheight,
 				   fi->early_warning_time);
+		}
+
+		/* DW cascade: if factory is DYING (force-close in progress),
+		 * re-broadcast signed tree nodes on each block. Child nodes
+		 * that failed because parent wasn't confirmed may now succeed. */
+		if (fi->lifecycle == FACTORY_LIFECYCLE_DYING) {
+			factory_t *fcl = (factory_t *)fi->lib_factory;
+			if (fcl) {
+				for (size_t ni = 0; ni < fcl->n_nodes; ni++) {
+					if (!fcl->nodes[ni].is_signed) continue;
+					tx_buf_t *stx = &fcl->nodes[ni].signed_tx;
+					if (!stx->data || stx->len == 0) continue;
+					char *tx_hex = tal_arr(cmd, char,
+						stx->len * 2 + 1);
+					for (size_t h = 0; h < stx->len; h++)
+						sprintf(tx_hex + h*2, "%02x",
+							stx->data[h]);
+					struct out_req *breq =
+						jsonrpc_request_start(cmd,
+							"sendrawtransaction",
+							rpc_done, rpc_err, fi);
+					json_add_string(breq->js, "tx", tx_hex);
+					json_add_bool(breq->js, "allowhighfees",
+						      true);
+					send_outreq(breq);
+				}
+			}
 		}
 
 		/* Breach scan: check if factory's funding UTXO is still
