@@ -1376,22 +1376,47 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 				break;
 			factory_t *f = (factory_t *)fi->lib_factory;
 			if (!f) break;
+			plugin_log(plugin_handle, LOG_INFORM,
+				   "LSP: DIST_NONCE bundle has %zu entries, "
+				   "n_participants=%u, n_nodes=%u",
+				   cnb.n_entries, cnb.n_participants,
+				   cnb.n_nodes);
 			for (size_t e = 0; e < cnb.n_entries; e++) {
 				secp256k1_musig_pubnonce pn;
-				musig_pubnonce_parse(global_secp_ctx, &pn,
-					cnb.entries[e].pubnonce);
-				factory_session_set_nonce(f,
+				if (!musig_pubnonce_parse(global_secp_ctx, &pn,
+					cnb.entries[e].pubnonce)) {
+					plugin_log(plugin_handle, LOG_BROKEN,
+						   "LSP: bad dist nonce entry %zu",
+						   e);
+					continue;
+				}
+				plugin_log(plugin_handle, LOG_INFORM,
+					   "LSP: setting dist nonce entry %zu "
+					   "node=%u slot=%u",
+					   e, cnb.entries[e].node_idx,
+					   cnb.entries[e].signer_slot);
+				if (!factory_session_set_nonce(f,
 					cnb.entries[e].node_idx,
-					cnb.entries[e].signer_slot, &pn);
+					cnb.entries[e].signer_slot, &pn))
+					plugin_log(plugin_handle, LOG_BROKEN,
+						   "LSP: set_nonce failed "
+						   "node=%u slot=%u",
+						   cnb.entries[e].node_idx,
+						   cnb.entries[e].signer_slot);
 			}
 			plugin_log(plugin_handle, LOG_INFORM,
-				   "LSP: dist nonces set");
+				   "LSP: dist nonces set, n_nodes=%u, "
+				   "dist_idx=%u, n_signers_dist=%u",
+				   f->n_nodes, f->n_nodes,
+				   f->n_nodes < 256 ?
+				   f->nodes[f->n_nodes].n_signers : 0);
 
 			/* Finalize dist signing session */
 			uint32_t dist_idx = f->n_nodes;
 			if (!factory_session_finalize_node(f, dist_idx))
 				plugin_log(plugin_handle, LOG_BROKEN,
-					   "LSP: dist finalize failed");
+					   "LSP: dist finalize failed "
+					   "(dist_idx=%u)", dist_idx);
 		}
 		break;
 
