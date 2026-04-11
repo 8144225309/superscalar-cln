@@ -40,5 +40,6 @@ void ss_persist_key_meta(const factory_instance_t *fi, char *out, size_t len);
 void ss_persist_key_channels(const factory_instance_t *fi, char *out, size_t len);
 void ss_persist_key_breach(const factory_instance_t *fi, uint32_t epoch,
 			   char *out, size_t len);
+void ss_persist_key_breach_index(const factory_instance_t *fi, char *out, size_t len);
 
 #endif /* SUPERSCALAR_PERSIST_H */

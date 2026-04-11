@@ -541,6 +541,28 @@ static void ss_save_factory(struct command *cmd, factory_instance_t *fi)
 		}
 	}
 
+	/* Save breach index: count(2) + epoch0(4) + epoch1(4) + ...
+	 * Lets ss_load_factories enumerate saved epochs without listdatastore. */
+	if (fi->n_breach_epochs > 0) {
+		size_t bi_len = 2 + fi->n_breach_epochs * 4;
+		uint8_t *bi_buf = malloc(bi_len);
+		if (bi_buf) {
+			bi_buf[0] = (fi->n_breach_epochs >> 8) & 0xFF;
+			bi_buf[1] = fi->n_breach_epochs & 0xFF;
+			for (size_t i = 0; i < fi->n_breach_epochs; i++) {
+				uint32_t ep = fi->breach_data[i].epoch;
+				bi_buf[2 + i*4]     = (ep >> 24) & 0xFF;
+				bi_buf[2 + i*4 + 1] = (ep >> 16) & 0xFF;
+				bi_buf[2 + i*4 + 2] = (ep >>  8) & 0xFF;
+				bi_buf[2 + i*4 + 3] = ep & 0xFF;
+			}
+			ss_persist_key_breach_index(fi, key, sizeof(key));
+			jsonrpc_set_datastore_binary(cmd, key, bi_buf, bi_len,
+				"create-or-replace", rpc_done, rpc_err, fi);
+			free(bi_buf);
+		}
+	}
+
 	/* Update factory index — list of all known instance IDs.
 	 * Format: count(2) + instance_ids(32 each) */
 	size_t idx_len = 2 + ss_state.n_factories * 32;
@@ -637,12 +659,71 @@ static void ss_load_factories(struct command *cmd)
 						chdata, tal_bytelen(chdata));
 				}
 
+				/* Load breach data */
+				char bi_path[128];
+				snprintf(bi_path, sizeof(bi_path),
+					 "superscalar/factories/%s/breach-index",
+					 id_hex);
+				u8 *bidata = NULL;
+				if (!rpc_scan_datastore_hex(tmpctx, cmd,
+						bi_path,
+						JSON_SCAN_TAL(tmpctx,
+							json_tok_bin_from_hex,
+							&bidata))
+				    && bidata) {
+					size_t bi_len = tal_bytelen(bidata);
+					if (bi_len >= 2) {
+						uint16_t bn = ((uint16_t)bidata[0] << 8)
+								| bidata[1];
+						for (uint16_t bi = 0;
+						     bi < bn
+						     && bi_len >= (size_t)(2 + (bi+1)*4);
+						     bi++) {
+							uint32_t ep =
+							    ((uint32_t)bidata[2+bi*4] << 24)
+							    | ((uint32_t)bidata[2+bi*4+1] << 16)
+							    | ((uint32_t)bidata[2+bi*4+2] << 8)
+							    | bidata[2+bi*4+3];
+							char breach_path[128];
+							snprintf(breach_path,
+								 sizeof(breach_path),
+								 "superscalar/factories/%s/breach/%u",
+								 id_hex, ep);
+							u8 *bdata = NULL;
+							if (!rpc_scan_datastore_hex(tmpctx, cmd,
+									breach_path,
+									JSON_SCAN_TAL(tmpctx,
+										json_tok_bin_from_hex,
+										&bdata))
+							    && bdata) {
+								epoch_breach_data_t bd;
+								memset(&bd, 0, sizeof(bd));
+								if (ss_persist_deserialize_breach(
+									&bd, bdata,
+									tal_bytelen(bdata))) {
+									ss_factory_add_breach_data(
+										fi, bd.epoch,
+										bd.has_revocation
+										  ? bd.revocation_secret
+										  : NULL,
+										bd.commitment_data,
+										bd.commitment_data_len);
+								}
+								if (bd.commitment_data)
+									free(bd.commitment_data);
+							}
+						}
+					}
+				}
+
 				loaded++;
 				plugin_log(plugin_handle, LOG_INFORM,
 					   "Loaded factory %s (epoch=%u, "
-					   "channels=%zu, lifecycle=%d)",
+					   "channels=%zu, breach_epochs=%zu, "
+					   "lifecycle=%d)",
 					   id_hex, fi->epoch,
-					   fi->n_channels, fi->lifecycle);
+					   fi->n_channels, fi->n_breach_epochs,
+					   fi->lifecycle);
 
 				p += 32; rem -= 32;
 			}

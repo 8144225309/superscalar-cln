@@ -282,3 +282,10 @@ void ss_persist_key_breach(const factory_instance_t *fi, uint32_t epoch,
 	snprintf(out, len, "superscalar/factories/%s/breach/%u",
 		 id_hex, epoch);
 }
+
+void ss_persist_key_breach_index(const factory_instance_t *fi, char *out, size_t len)
+{
+	char id_hex[65];
+	hex32(fi->instance_id, id_hex);
+	snprintf(out, len, "superscalar/factories/%s/breach-index", id_hex);
+}
