@@ -3080,6 +3080,11 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 					plugin_log(plugin_handle, LOG_BROKEN,
 						   "LSP: rotate finalize failed");
 				} else {
+					/* Mark rotation in progress BEFORE
+					 * sending ALL_NONCES. The subsequent
+					 * PSIG_BUNDLE (via initial ceremony
+					 * path) will check this flag. */
+					fi->rotation_in_progress = true;
 					plugin_log(plugin_handle, LOG_INFORM,
 						   "LSP: rotate nonces finalized");
 
