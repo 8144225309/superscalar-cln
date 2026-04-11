@@ -3613,8 +3613,14 @@ static struct command_result *json_factory_create(struct command *cmd,
 			   "Factory tree built: %zu participants",
 			   n_total);
 
-		/* Store factory handle */
+		/* Store factory handle + populate metadata from tree */
 		fi->lib_factory = factory;
+		fi->n_tree_nodes = (uint32_t)factory->n_nodes;
+		fi->max_epochs = factory->counter.total_states;
+		fi->creation_block = ss_state.current_blockheight;
+		fi->expiry_block = factory->cltv_timeout > 0
+			? factory->cltv_timeout
+			: ss_state.current_blockheight + 4320; /* ~30 days */
 
 		/* Initialize signing sessions */
 		rc = factory_sessions_init(factory);
@@ -3867,11 +3873,16 @@ static struct command_result *json_factory_list(struct command *cmd,
 				lf->dist_tx_ready == 2 ? "signed" :
 				lf->dist_tx_ready == 1 ? "unsigned" :
 				"none");
-			json_add_u32(js, "tree_nodes", lf->n_nodes);
+		} else {
+			json_add_string(js, "dist_tx_status", "unknown");
 		}
 
-		/* Funding info */
-		if (fi->funding_txid[0] || fi->funding_txid[1]) {
+		/* tree_nodes: prefer live value, fall back to persisted */
+		json_add_u32(js, "tree_nodes",
+			lf ? (uint32_t)lf->n_nodes : fi->n_tree_nodes);
+
+		/* Funding info (factory-level synthetic funding UTXO) */
+		{
 			char ftxid[65];
 			for (int j = 0; j < 32; j++)
 				sprintf(ftxid + j*2, "%02x",
@@ -3880,24 +3891,34 @@ static struct command_result *json_factory_list(struct command *cmd,
 			json_add_u32(js, "funding_outnum", fi->funding_outnum);
 		}
 
-		/* Channel mappings */
-		if (fi->n_channels > 0) {
-			json_array_start(js, "channels");
-			for (size_t ch = 0; ch < fi->n_channels; ch++) {
-				char cid[65];
+		/* Per-channel data with DW leaf funding outpoint */
+		json_array_start(js, "channels");
+		for (size_t ch = 0; ch < fi->n_channels; ch++) {
+			char cid[65];
+			for (int j = 0; j < 32; j++)
+				sprintf(cid + j*2, "%02x",
+					fi->channels[ch].channel_id[j]);
+			json_object_start(js, NULL);
+			json_add_string(js, "channel_id", cid);
+			json_add_u32(js, "leaf_index",
+				fi->channels[ch].leaf_index);
+			json_add_u32(js, "leaf_side",
+				fi->channels[ch].leaf_side);
+			/* Per-channel funding txid from DW leaf node */
+			if (lf && (size_t)fi->channels[ch].leaf_index
+			    < lf->n_nodes) {
+				char ltxid[65];
+				size_t li = fi->channels[ch].leaf_index;
 				for (int j = 0; j < 32; j++)
-					sprintf(cid + j*2, "%02x",
-						fi->channels[ch].channel_id[j]);
-				json_object_start(js, NULL);
-				json_add_string(js, "channel_id", cid);
-				json_add_u32(js, "leaf_index",
-					fi->channels[ch].leaf_index);
-				json_add_u32(js, "leaf_side",
+					sprintf(ltxid + j*2, "%02x",
+						lf->nodes[li].txid[31-j]);
+				json_add_string(js, "funding_txid", ltxid);
+				json_add_u32(js, "funding_outnum",
 					fi->channels[ch].leaf_side);
-				json_object_end(js);
 			}
-			json_array_end(js);
+			json_object_end(js);
 		}
+		json_array_end(js);
 		json_object_end(js);
 	}
 	json_array_end(js);

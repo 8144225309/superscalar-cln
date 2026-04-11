@@ -75,8 +75,8 @@ size_t ss_persist_serialize_meta(const factory_instance_t *fi, uint8_t **out)
 	uint8_t *buf = NULL;
 	size_t len = 0, cap = 0;
 
-	/* Version byte */
-	buf_u8(&buf, &len, &cap, 1);
+	/* Version byte (2 adds n_tree_nodes) */
+	buf_u8(&buf, &len, &cap, 2);
 
 	/* Identity */
 	buf_append(&buf, &len, &cap, fi->instance_id, 32);
@@ -106,6 +106,9 @@ size_t ss_persist_serialize_meta(const factory_instance_t *fi, uint8_t **out)
 	buf_append(&buf, &len, &cap, fi->funding_txid, 32);
 	buf_u32(&buf, &len, &cap, fi->funding_outnum);
 
+	/* v2: tree node count */
+	buf_u32(&buf, &len, &cap, fi->n_tree_nodes);
+
 	*out = buf;
 	return len;
 }
@@ -119,7 +122,7 @@ bool ss_persist_deserialize_meta(factory_instance_t *fi,
 	uint8_t version, tmp8;
 	uint16_t tmp16;
 
-	if (!read_u8(&p, &rem, &version) || version != 1)
+	if (!read_u8(&p, &rem, &version) || (version != 1 && version != 2))
 		return false;
 
 	if (!read_bytes(&p, &rem, fi->instance_id, 32)) return false;
@@ -152,6 +155,11 @@ bool ss_persist_deserialize_meta(factory_instance_t *fi,
 
 	if (!read_bytes(&p, &rem, fi->funding_txid, 32)) return false;
 	if (!read_u32(&p, &rem, &fi->funding_outnum)) return false;
+
+	/* v2 fields */
+	if (version >= 2) {
+		if (!read_u32(&p, &rem, &fi->n_tree_nodes)) return false;
+	}
 
 	return true;
 }

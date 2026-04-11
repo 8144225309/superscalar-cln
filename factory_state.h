@@ -103,6 +103,10 @@ typedef struct factory_instance {
 	uint8_t funding_txid[32];
 	uint32_t funding_outnum;
 
+	/* Cached tree node count (persisted so factory-list works after restart
+	 * even when lib_factory hasn't been rebuilt yet). */
+	uint32_t n_tree_nodes;
+
 	/* Handle to libsuperscalar factory_t.
 	 * NULL until the library is initialized for this instance.
 	 * Declared as void* to avoid requiring superscalar headers
