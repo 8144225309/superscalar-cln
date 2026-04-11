@@ -58,6 +58,11 @@
 #define SS_SUBMSG_CLOSE_PSIG		0x0113
 #define SS_SUBMSG_CLOSE_DONE		0x0114
 
+/* Key turnover (assisted exit via PTLC / direct key handover) */
+#define SS_SUBMSG_TURNOVER_REQUEST	0x0120
+#define SS_SUBMSG_TURNOVER_KEY		0x0121
+#define SS_SUBMSG_TURNOVER_ACK		0x0122
+
 /* Ceremony state */
 typedef enum {
 	CEREMONY_IDLE,

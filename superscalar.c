@@ -3214,6 +3214,118 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 		}
 		break;
 
+	/* Key turnover: LSP requests client to hand over factory key */
+	case SS_SUBMSG_TURNOVER_REQUEST:
+		plugin_log(plugin_handle, LOG_INFORM,
+			   "TURNOVER_REQUEST from %s (len=%zu)",
+			   peer_id, len);
+		/* Client side: LSP is asking us to depart this factory.
+		 * Send our factory secret key back. */
+		if (fi && !fi->is_lsp) {
+			unsigned char our_sk[32];
+			derive_factory_seckey(our_sk, fi->instance_id,
+					      fi->our_participant_idx);
+
+			/* Send TURNOVER_KEY: instance_id(32) + seckey(32) */
+			uint8_t tkbuf[64];
+			memcpy(tkbuf, fi->instance_id, 32);
+			memcpy(tkbuf + 32, our_sk, 32);
+			send_factory_msg(cmd, peer_id,
+					 SS_SUBMSG_TURNOVER_KEY,
+					 tkbuf, 64);
+			plugin_log(plugin_handle, LOG_INFORM,
+				   "Client: sent TURNOVER_KEY to LSP "
+				   "(departing factory)");
+			memset(our_sk, 0, 32); /* wipe */
+		}
+		break;
+
+	/* Key turnover: client sends their factory secret key */
+	case SS_SUBMSG_TURNOVER_KEY:
+		plugin_log(plugin_handle, LOG_INFORM,
+			   "TURNOVER_KEY from %s (len=%zu)",
+			   peer_id, len);
+		if (fi && fi->is_lsp && len >= 64) {
+			const uint8_t *key_data = data + 32; /* skip instance_id */
+
+			/* Find client index */
+			uint8_t pid[33];
+			if (strlen(peer_id) == 66) {
+				for (int j = 0; j < 33; j++) {
+					unsigned int b;
+					sscanf(peer_id + j*2, "%02x", &b);
+					pid[j] = (uint8_t)b;
+				}
+			}
+
+			for (size_t ci = 0; ci < fi->n_clients; ci++) {
+				if (memcmp(fi->clients[ci].node_id, pid, 33) != 0)
+					continue;
+
+				/* Verify the key matches the client's pubkey */
+				secp256k1_pubkey verify_pub;
+				if (secp256k1_ec_pubkey_create(global_secp_ctx,
+							       &verify_pub,
+							       key_data)) {
+					uint8_t vp[33];
+					size_t vplen = 33;
+					secp256k1_ec_pubkey_serialize(
+						global_secp_ctx, vp, &vplen,
+						&verify_pub,
+						SECP256K1_EC_COMPRESSED);
+
+					bool key_ok = fi->clients[ci].has_factory_pubkey
+						&& memcmp(vp, fi->clients[ci].factory_pubkey, 33) == 0;
+
+					if (key_ok) {
+						memcpy(fi->extracted_keys[ci],
+						       key_data, 32);
+						fi->client_departed[ci] = true;
+						fi->n_departed++;
+
+						/* Record in ladder if active */
+						if (ss_ladder) {
+							/* Find ladder factory by matching instance_id */
+							for (size_t li = 0;
+							     li < ss_ladder->n_factories;
+							     li++) {
+								ladder_record_key_turnover(
+									ss_ladder,
+									ss_ladder->factories[li].factory_id,
+									(uint32_t)(ci + 1),
+									key_data);
+							}
+						}
+
+						/* Send ACK */
+						send_factory_msg(cmd, peer_id,
+							SS_SUBMSG_TURNOVER_ACK,
+							fi->instance_id, 32);
+
+						plugin_log(plugin_handle, LOG_INFORM,
+							   "LSP: client %zu departed "
+							   "(key verified, n_departed=%zu)",
+							   ci, fi->n_departed);
+						ss_save_factory(cmd, fi);
+					} else {
+						plugin_log(plugin_handle, LOG_UNUSUAL,
+							   "LSP: TURNOVER_KEY from "
+							   "client %zu: key mismatch!",
+							   ci);
+					}
+				}
+				break;
+			}
+		}
+		break;
+
+	/* Key turnover: LSP acknowledges departure */
+	case SS_SUBMSG_TURNOVER_ACK:
+		plugin_log(plugin_handle, LOG_INFORM,
+			   "TURNOVER_ACK from %s — departure confirmed",
+			   peer_id);
+		break;
+
 	default:
 		plugin_log(plugin_handle, LOG_DBG,
 			   "Unknown submsg 0x%04x from %s (len=%zu)",
@@ -4956,6 +5068,53 @@ static const char *init(struct command *init_cmd,
 	return NULL;
 }
 
+/* factory-initiate-exit RPC — LSP triggers key turnover for a client.
+ * Sends TURNOVER_REQUEST to the specified client, beginning the
+ * assisted exit protocol. The client responds with their factory key. */
+static struct command_result *json_factory_initiate_exit(struct command *cmd,
+							  const char *buf,
+							  const jsmntok_t *params)
+{
+	const char *inst_hex, *client_hex;
+
+	if (!param(cmd, buf, params,
+		   p_req("instance_id", param_string, &inst_hex),
+		   p_req("client_id", param_string, &client_hex),
+		   NULL))
+		return command_param_failed();
+
+	if (strlen(inst_hex) != 64)
+		return command_fail(cmd, LIGHTNINGD, "Bad instance_id");
+	if (strlen(client_hex) != 66)
+		return command_fail(cmd, LIGHTNINGD, "Bad client_id (66 hex chars)");
+
+	uint8_t instance_id[32];
+	for (int j = 0; j < 32; j++) {
+		unsigned int b;
+		sscanf(inst_hex + j*2, "%02x", &b);
+		instance_id[j] = (uint8_t)b;
+	}
+
+	factory_instance_t *fi = ss_factory_find(&ss_state, instance_id);
+	if (!fi)
+		return command_fail(cmd, LIGHTNINGD, "Factory not found");
+	if (!fi->is_lsp)
+		return command_fail(cmd, LIGHTNINGD, "Only LSP can initiate exit");
+
+	/* Send TURNOVER_REQUEST to the client */
+	send_factory_msg(cmd, client_hex,
+			 SS_SUBMSG_TURNOVER_REQUEST,
+			 fi->instance_id, 32);
+
+	plugin_log(plugin_handle, LOG_INFORM,
+		   "Sent TURNOVER_REQUEST to %s", client_hex);
+
+	struct json_stream *js = jsonrpc_stream_success(cmd);
+	json_add_string(js, "status", "turnover_requested");
+	json_add_string(js, "client_id", client_hex);
+	return command_finished(cmd, js);
+}
+
 /* factory-ladder-status RPC — show ladder lifecycle state */
 static struct command_result *json_factory_ladder_status(struct command *cmd,
 							  const char *buf,
@@ -5047,6 +5206,10 @@ static const struct plugin_command commands[] = {
 	{
 		"factory-ladder-status",
 		json_factory_ladder_status,
+	},
+	{
+		"factory-initiate-exit",
+		json_factory_initiate_exit,
 	},
 };
 

@@ -99,6 +99,13 @@ typedef struct factory_instance {
 	/* Rotation */
 	bool rotation_in_progress;
 
+	/* Key turnover (assisted exit): per-client departure state.
+	 * When a client departs, we store their extracted secret key
+	 * so the LSP can sign on their behalf for the factory's lifetime. */
+	bool client_departed[MAX_FACTORY_PARTICIPANTS];
+	uint8_t extracted_keys[MAX_FACTORY_PARTICIPANTS][32];
+	size_t n_departed;
+
 	/* Funding info */
 	uint8_t funding_txid[32];
 	uint32_t funding_outnum;
