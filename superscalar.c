@@ -2791,6 +2791,11 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 					   "(%zu clients + LSP)", fi->n_clients);
 			}
 
+			plugin_log(plugin_handle, LOG_INFORM,
+				   "DIST complete: rotation_in_progress=%d "
+				   "n_channels=%zu",
+				   fi->rotation_in_progress,
+				   fi->n_channels);
 			if (fi->rotation_in_progress) {
 				rotate_finish_and_notify(cmd, fi);
 			} else {
