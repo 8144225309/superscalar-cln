@@ -5320,8 +5320,9 @@ static struct command_result *handle_block_added(struct command *cmd,
 					/* LSP's own P2TR address as destination */
 					secp256k1_xonly_pubkey lsp_xonly;
 					int parity;
-					secp256k1_keypair_xonly_pub(global_secp_ctx,
-						&lsp_xonly, &parity, &lsp_kp);
+					if (!secp256k1_keypair_xonly_pub(global_secp_ctx,
+						&lsp_xonly, &parity, &lsp_kp))
+						break;
 					unsigned char dxonly[32];
 					secp256k1_xonly_pubkey_serialize(
 						global_secp_ctx, dxonly, &lsp_xonly);
