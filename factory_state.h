@@ -117,6 +117,11 @@ typedef struct factory_instance {
 	 * even when lib_factory hasn't been rebuilt yet). */
 	uint32_t n_tree_nodes;
 
+	/* Signed distribution TX (nLockTime fallback).
+	 * Broadcast after factory expiry — clients get their funds. */
+	uint8_t *dist_signed_tx;
+	size_t dist_signed_tx_len;
+
 	/* Handle to libsuperscalar factory_t.
 	 * NULL until the library is initialized for this instance.
 	 * Declared as void* to avoid requiring superscalar headers

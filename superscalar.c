@@ -960,6 +960,7 @@ static void continue_after_funding(struct command *cmd,
 		factory_set_funding(new_f, fi->funding_txid,
 			fi->funding_outnum, fi->funding_amount_sats,
 			fi->funding_spk, fi->funding_spk_len);
+		factory_set_lifecycle(new_f, fi->creation_block, 4320, 432);
 		factory_build_tree(new_f);
 
 		factory_t *old_f = f;
@@ -1209,6 +1210,8 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 				? propose_funding_sats
 				: DEFAULT_FACTORY_FUNDING_SATS;
 
+			factory_set_lifecycle(factory,
+				ss_state.current_blockheight, 4320, 432);
 			if (!factory_build_tree(factory)) {
 				plugin_log(plugin_handle, LOG_BROKEN,
 					   "Client: factory_build_tree failed");
@@ -1608,6 +1611,9 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 						factory_set_funding(tmp_f, ph_txid, 0,
 							fi->funding_amount_sats,
 							ph_spk, 34);
+						factory_set_lifecycle(tmp_f,
+							ss_state.current_blockheight,
+							4320, 432);
 						factory_build_tree(tmp_f);
 
 						/* Extract the root node's tweaked P2TR
@@ -1749,6 +1755,9 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 									: DEFAULT_FACTORY_FUNDING_SATS,
 								syn_spk, 34);
 						}
+						factory_set_lifecycle(new_f,
+							ss_state.current_blockheight,
+							4320, 432);
 						factory_build_tree(new_f);
 
 						/* Free old factory, swap in new */
@@ -1997,6 +2006,9 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 							: DEFAULT_FACTORY_FUNDING_SATS,
 							syn_spk, 34);
 					}
+					factory_set_lifecycle(new_f,
+						ss_state.current_blockheight,
+						4320, 432);
 					factory_build_tree(new_f);
 
 					factory_t *old_f = f;
@@ -2813,6 +2825,23 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 				plugin_log(plugin_handle, LOG_INFORM,
 					   "LSP: DISTRIBUTION TX SIGNED! "
 					   "(%zu clients + LSP)", fi->n_clients);
+
+				/* Store signed dist TX for timeout fallback.
+				 * After expiry, broadcast this to give clients
+				 * their funds without LSP cooperation. */
+				if (f->dist_unsigned_tx.data &&
+				    f->dist_unsigned_tx.len > 0) {
+					free(fi->dist_signed_tx);
+					fi->dist_signed_tx = malloc(
+						f->dist_unsigned_tx.len);
+					if (fi->dist_signed_tx) {
+						memcpy(fi->dist_signed_tx,
+						       f->dist_unsigned_tx.data,
+						       f->dist_unsigned_tx.len);
+						fi->dist_signed_tx_len =
+							f->dist_unsigned_tx.len;
+					}
+				}
 			}
 
 			plugin_log(plugin_handle, LOG_INFORM,
@@ -4244,6 +4273,14 @@ static struct command_result *json_factory_create(struct command *cmd,
 		factory_set_funding(factory, synth_txid, 0,
 				    *funding_sats, synth_spk, 34);
 
+		/* Set lifecycle so DW nodes get CLTV timeout script leaves.
+		 * This enables the timeout spend path (safety valve for
+		 * client unilateral exit if LSP vanishes after expiry). */
+		factory_set_lifecycle(factory,
+			ss_state.current_blockheight,
+			4320,   /* active period: ~30 days */
+			432);   /* dying period: ~3 days */
+
 		/* Build the DW tree */
 		int rc = factory_build_tree(factory);
 		if (rc == 0) {
@@ -5248,6 +5285,87 @@ static struct command_result *handle_block_added(struct command *cmd,
 				   i, fi->expiry_block,
 				   ss_state.current_blockheight);
 			fi->lifecycle = FACTORY_LIFECYCLE_DYING;
+
+			/* Broadcast signed distribution TX (nLockTime fallback).
+			 * After expiry, this TX is valid and sends each client
+			 * their funds without LSP cooperation. */
+			if (fi->dist_signed_tx && fi->dist_signed_tx_len > 0) {
+				char *dist_hex = tal_arr(cmd, char,
+					fi->dist_signed_tx_len * 2 + 1);
+				for (size_t h = 0; h < fi->dist_signed_tx_len; h++)
+					sprintf(dist_hex + h*2, "%02x",
+						fi->dist_signed_tx[h]);
+				struct out_req *dreq = jsonrpc_request_start(
+					cmd, "sendrawtransaction",
+					rpc_done, rpc_err, fi);
+				json_add_string(dreq->js, "tx", dist_hex);
+				json_add_bool(dreq->js, "allowhighfees", true);
+				send_outreq(dreq);
+				plugin_log(plugin_handle, LOG_INFORM,
+					   "Broadcasting distribution TX "
+					   "(%zu bytes) — client fallback",
+					   fi->dist_signed_tx_len);
+			}
+
+			/* Build and broadcast timeout spend TXs for each
+			 * node with a CLTV timeout (LSP signs alone via
+			 * timeout script path — unilateral exit safety valve). */
+			factory_t *ftx = (factory_t *)fi->lib_factory;
+			if (ftx && ss_state.has_master_key) {
+				secp256k1_keypair lsp_kp;
+				unsigned char lsp_sk[32];
+				derive_factory_seckey(lsp_sk, fi->instance_id, 0);
+				if (secp256k1_keypair_create(global_secp_ctx,
+							     &lsp_kp, lsp_sk)) {
+					/* LSP's own P2TR address as destination */
+					secp256k1_xonly_pubkey lsp_xonly;
+					int parity;
+					secp256k1_keypair_xonly_pub(global_secp_ctx,
+						&lsp_xonly, &parity, &lsp_kp);
+					unsigned char dxonly[32];
+					secp256k1_xonly_pubkey_serialize(
+						global_secp_ctx, dxonly, &lsp_xonly);
+					uint8_t dest_spk[34];
+					dest_spk[0] = 0x51; dest_spk[1] = 0x20;
+					memcpy(dest_spk + 2, dxonly, 32);
+
+					for (size_t ni = 1; ni < ftx->n_nodes; ni++) {
+						if (ftx->nodes[ni].cltv_timeout == 0)
+							continue;
+						int parent = ftx->nodes[ni].parent_index;
+						if (parent < 0) continue;
+						tx_buf_t timeout_tx;
+						tx_buf_init(&timeout_tx, 256);
+						if (factory_build_timeout_spend_tx(ftx,
+							ftx->nodes[parent].txid,
+							ftx->nodes[ni].parent_vout,
+							ftx->nodes[ni].input_amount,
+							(int)ni, &lsp_kp,
+							dest_spk, 34, 500,
+							&timeout_tx)) {
+							char *th = tal_arr(cmd, char,
+								timeout_tx.len * 2 + 1);
+							for (size_t h = 0;
+							     h < timeout_tx.len; h++)
+								sprintf(th + h*2, "%02x",
+									timeout_tx.data[h]);
+							struct out_req *treq =
+								jsonrpc_request_start(cmd,
+									"sendrawtransaction",
+									rpc_done, rpc_err, fi);
+							json_add_string(treq->js, "tx", th);
+							json_add_bool(treq->js,
+								"allowhighfees", true);
+							send_outreq(treq);
+							plugin_log(plugin_handle, LOG_INFORM,
+								   "Timeout spend: node %zu "
+								   "(%zu bytes)", ni,
+								   timeout_tx.len);
+						}
+						tx_buf_free(&timeout_tx);
+					}
+				}
+			}
 		} else if (ss_factory_should_warn(fi,
 				ss_state.current_blockheight)) {
 			plugin_log(plugin_handle, LOG_UNUSUAL,
