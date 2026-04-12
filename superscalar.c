@@ -1625,8 +1625,9 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 						/* Encode bech32m address from tweaked key
 						 * (skip OP_1 0x20 prefix = bytes 2-33) */
 						char addr[100];
-						segwit_addr_encode(addr, "bcrt", 1,
-							fctx->funding_spk + 2, 32);
+						segwit_addr_encode(addr,
+							chainparams->onchain_hrp,
+							1, fctx->funding_spk + 2, 32);
 
 						factory_free(tmp_f);
 						free(tmp_f);
