@@ -303,7 +303,8 @@ static void send_supported_protocols(struct command *cmd, const char *peer_id)
 {
 	/* Wire: type(2)+submsg(2) + TLV[512](4+32=36 bytes) = 40 total */
 	uint8_t wire[40];
-	wire[0] = 0x80; wire[1] = 0x20; /* type 32800 */
+	wire[0] = (FACTORY_MSG_TYPE >> 8) & 0xFF;
+	wire[1] = FACTORY_MSG_TYPE & 0xFF;
 	wire[2] = 0x00; wire[3] = 0x02; /* submsg 2 = supported_factory_protocols */
 
 	/* TLV type 512 (0x0200): protocol_ids */
@@ -3963,7 +3964,8 @@ static void dispatch_blip56_submsg(struct command *cmd,
 		{
 			/* Send factory_change_ack (submsg 8) with same TLVs */
 			uint8_t ack_wire[4 + 256];
-			ack_wire[0] = 0x80; ack_wire[1] = 0x20;
+			ack_wire[0] = (FACTORY_MSG_TYPE >> 8) & 0xFF;
+			ack_wire[1] = FACTORY_MSG_TYPE & 0xFF;
 			ack_wire[2] = 0x00; ack_wire[3] = 0x08;
 			memcpy(ack_wire + 4, data, len < 256 ? len : 256);
 			size_t ack_len = 4 + (len < 256 ? len : 256);
