@@ -4068,99 +4068,67 @@ static struct command_result *handle_openchannel(struct command *cmd,
 						 const char *buf,
 						 const jsmntok_t *params)
 {
-	const jsmntok_t *openchannel, *factory;
+	const jsmntok_t *openchannel;
 
 	openchannel = json_get_member(buf, params, "openchannel");
 	if (!openchannel)
 		return command_hook_success(cmd);
 
-	factory = json_get_member(buf, openchannel, "channel_in_factory");
-	if (!factory)
+	/* Check if the peer opening this channel is a known factory
+	 * participant. If so, accept with mindepth=0 (zero-conf)
+	 * since factory channels have virtual funding outpoints. */
+	const jsmntok_t *id_tok = json_get_member(buf, openchannel, "id");
+	if (!id_tok)
 		return command_hook_success(cmd);
 
-	/* Extract factory_protocol_id (32 bytes) and factory_instance_id (32 bytes) */
-	const jsmntok_t *proto_tok = json_get_member(buf, factory,
-						      "factory_protocol_id");
-	const jsmntok_t *inst_tok = json_get_member(buf, factory,
-						     "factory_instance_id");
-	const jsmntok_t *warn_tok = json_get_member(buf, factory,
-						     "factory_early_warning_time");
+	const char *peer_hex = json_strdup(cmd, buf, id_tok);
+	if (!peer_hex || strlen(peer_hex) != 66)
+		return command_hook_success(cmd);
 
-	if (proto_tok && inst_tok) {
-		const char *proto_hex = json_strdup(cmd, buf, proto_tok);
-		const char *inst_hex = json_strdup(cmd, buf, inst_tok);
+	/* Parse peer node_id */
+	uint8_t peer_id[33];
+	for (int j = 0; j < 33; j++) {
+		unsigned int b;
+		sscanf(peer_hex + j*2, "%02x", &b);
+		peer_id[j] = (uint8_t)b;
+	}
 
-		plugin_log(plugin_handle, LOG_INFORM,
-			   "Factory channel open: proto=%s inst=%s",
-			   proto_hex ? proto_hex : "?",
-			   inst_hex ? inst_hex : "?");
+	/* Check if this peer is the LSP of any of our factories,
+	 * or a client in any factory we're the LSP of. */
+	bool is_factory_peer = false;
+	for (size_t i = 0; i < ss_state.n_factories; i++) {
+		factory_instance_t *fi = ss_state.factories[i];
 
-		/* Validate protocol ID */
-		if (proto_hex && strlen(proto_hex) == 64) {
-			uint8_t proto_id[32];
-			for (int j = 0; j < 32; j++) {
-				unsigned int b;
-				sscanf(proto_hex + j*2, "%02x", &b);
-				proto_id[j] = (uint8_t)b;
-			}
-			if (memcmp(proto_id, SUPERSCALAR_PROTOCOL_ID, 32) != 0) {
-				plugin_log(plugin_handle, LOG_UNUSUAL,
-					   "Unknown factory protocol, rejecting");
-				return command_hook_success(cmd);
-			}
+		/* Client side: check if peer is our LSP */
+		if (!fi->is_lsp &&
+		    memcmp(fi->lsp_node_id, peer_id, 33) == 0) {
+			is_factory_peer = true;
+			break;
 		}
 
-		/* Find factory by instance_id and map channel */
-		if (inst_hex && strlen(inst_hex) == 64) {
-			uint8_t inst_id[32];
-			for (int j = 0; j < 32; j++) {
-				unsigned int b;
-				sscanf(inst_hex + j*2, "%02x", &b);
-				inst_id[j] = (uint8_t)b;
-			}
-			factory_instance_t *fi = ss_factory_find(&ss_state,
-								  inst_id);
-			if (fi) {
-				/* Map this channel to the factory */
-				const jsmntok_t *cid_tok = json_get_member(buf,
-					openchannel, "channel_id");
-				if (cid_tok) {
-					const char *cid_hex = json_strdup(cmd,
-						buf, cid_tok);
-					uint8_t cid[32];
-					if (cid_hex && strlen(cid_hex) == 64) {
-						for (int j = 0; j < 32; j++) {
-							unsigned int b;
-							sscanf(cid_hex + j*2,
-								"%02x", &b);
-							cid[j] = (uint8_t)b;
-						}
-						ss_factory_map_channel(fi, cid,
-							fi->n_channels, 0);
-						plugin_log(plugin_handle,
-							   LOG_INFORM,
-							   "Mapped channel to "
-							   "factory leaf %zu",
-							   fi->n_channels - 1);
-					}
+		/* LSP side: check if peer is a client */
+		if (fi->is_lsp) {
+			for (size_t ci = 0; ci < fi->n_clients; ci++) {
+				if (memcmp(fi->clients[ci].node_id,
+					   peer_id, 33) == 0) {
+					is_factory_peer = true;
+					break;
 				}
-
-				if (warn_tok) {
-					u32 ewt;
-					json_to_u32(buf, warn_tok, &ewt);
-					fi->early_warning_time = (uint16_t)ewt;
-				}
-
-				fi->lifecycle = FACTORY_LIFECYCLE_ACTIVE;
-			} else {
-				plugin_log(plugin_handle, LOG_UNUSUAL,
-					   "Factory instance not found for "
-					   "channel open");
 			}
+			if (is_factory_peer) break;
 		}
-	} else {
+	}
+
+	if (is_factory_peer) {
 		plugin_log(plugin_handle, LOG_INFORM,
-			   "Factory channel open detected (no TLV fields)");
+			   "Factory peer %s opening channel — "
+			   "accepting with mindepth=0", peer_hex);
+
+		/* Return mindepth=0 to accept zero-conf */
+		struct json_stream *js = jsonrpc_stream_success(cmd);
+		json_add_string(js, "result", "continue");
+		json_add_u32(js, "mindepth", 0);
+		return command_finished(cmd, js);
 	}
 
 	return command_hook_success(cmd);
