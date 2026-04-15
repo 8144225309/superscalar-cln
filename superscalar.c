@@ -4319,16 +4319,20 @@ static struct command_result *json_factory_create(struct command *cmd,
 	uint8_t instance_id[32];
 
 	const jsmntok_t *allocations_tok = NULL;
+	fprintf(stderr, "SS-DEBUG: factory-create entry\n"); fflush(stderr);
 	if (!param(cmd, buf, params,
 		   p_req("funding_sats", param_u64, &funding_sats),
 		   p_req("clients", param_array, &clients_tok),
 		   p_opt("allocations", param_array, &allocations_tok),
 		   NULL))
 		return command_param_failed();
+	fprintf(stderr, "SS-DEBUG: params parsed, alloc=%p\n",
+		(void*)allocations_tok); fflush(stderr);
 
 	/* Generate random instance_id */
 	for (int i = 0; i < 32; i++)
 		instance_id[i] = (uint8_t)(random() & 0xFF);
+	fprintf(stderr, "SS-DEBUG: instance_id generated\n"); fflush(stderr);
 
 	fi = ss_factory_new(&ss_state, instance_id);
 	if (!fi)
@@ -4358,6 +4362,7 @@ static struct command_result *json_factory_create(struct command *cmd,
 			fi->n_clients++;
 		}
 	}
+	fprintf(stderr, "SS-DEBUG: %zu clients parsed\n", fi->n_clients); fflush(stderr);
 
 	/* Parse optional allocations array (per-client sats, ordered to match
 	 * clients array). If omitted, allocation_sats stays 0 and the even-
