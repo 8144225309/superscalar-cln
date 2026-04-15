@@ -43,7 +43,10 @@ static ladder_t *ss_ladder;
 
 
 /* bLIP-56 factory message type */
-#define FACTORY_MSG_TYPE	32800
+/* ODD type = CLN allows it through connectd without any fork changes.
+ * Factory protocol messages are plugin-to-plugin via custommsg;
+ * they don't need to go through channeld. */
+#define FACTORY_MSG_TYPE	33001
 
 /* bLIP-56 feature bit (may already be in common/features.h) */
 #ifndef OPT_PLUGGABLE_CHANNEL_FACTORIES
@@ -252,7 +255,8 @@ static void send_factory_msg(struct command *cmd, const char *peer_id,
 	size_t wire_len = 4 + 34 + tlv1024_len;
 
 	uint8_t *wire = calloc(1, wire_len);
-	wire[0] = 0x80; wire[1] = 0x20; /* type 32800 */
+	wire[0] = (FACTORY_MSG_TYPE >> 8) & 0xFF;
+	wire[1] = FACTORY_MSG_TYPE & 0xFF; /* type 33001 (ODD) */
 	wire[2] = 0x00; wire[3] = 0x04; /* submsg 4 = factory_piggyback */
 
 	uint8_t *p = wire + 4;
