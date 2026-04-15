@@ -4319,16 +4319,12 @@ static struct command_result *json_factory_create(struct command *cmd,
 	uint8_t instance_id[32];
 
 	const jsmntok_t *allocations_tok = NULL;
-	plugin_log(plugin_handle, LOG_INFORM, "factory-create: entry");
 	if (!param(cmd, buf, params,
 		   p_req("funding_sats", param_u64, &funding_sats),
 		   p_req("clients", param_array, &clients_tok),
 		   p_opt("allocations", param_array, &allocations_tok),
 		   NULL))
 		return command_param_failed();
-	plugin_log(plugin_handle, LOG_INFORM,
-		   "factory-create: params parsed (allocations=%s)",
-		   allocations_tok ? "yes" : "no");
 
 	/* Generate random instance_id */
 	for (int i = 0; i < 32; i++)
