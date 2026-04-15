@@ -86,10 +86,10 @@ The wallet can cross-reference `channels[].channel_id` against CLN's `listpeerch
 
 CLN handles channels. The plugin handles the factory.
 
-- **Inbound**: Factory protocol messages arrive from peers via the `custommsg` hook (message type 32800) and are demultiplexed by submessage ID
-- **Outbound**: The plugin sends factory messages via `sendcustommsg`, wrapped in bLIP-56's `factory_piggyback` envelope
-- **Channel opening**: Factory channels are opened with `fundchannel_start`/`fundchannel_complete`, passing `factory_protocol_id`, `factory_instance_id`, and `factory_early_warning_time` TLVs
-- **State changes**: Factory rotation triggers `factory-change` in the CLN fork, which uses STFU + splice infrastructure to re-sign commitments against new funding outpoints
+- **Inbound**: Factory protocol messages arrive from peers via the `custommsg` hook (ODD message type 33001) and are demultiplexed by submessage ID
+- **Outbound**: The plugin sends factory messages via `sendcustommsg` — no CLN wire protocol changes needed (ODD types pass through connectd by default)
+- **Channel opening**: Factory channels are opened with `fundchannel_start`/`fundchannel_complete`, with `factory_funding_txid` override to reference the DW tree leaf outpoint
+- **State changes**: Factory rotation triggers `factory-change` RPC in the CLN fork, which updates the channel's funding outpoint internally
 - **Persistence**: Factory state is serialized to CLN's datastore under `superscalar/factories/{instance_id}/`
 
 ### Factory Creation Ceremony (MuSig2)
@@ -108,16 +108,15 @@ Ceremony states: `IDLE` -> `PROPOSED` -> `NONCES_COLLECTED` -> `PSIGS_COLLECTED`
 
 ## Why the bLIP-56 Fork is Required
 
-This plugin depends on protocol extensions that only exist in the [bLIP-56 CLN fork](https://github.com/8144225309/lightning/tree/blip-56):
+This plugin depends on channel-management changes in the [bLIP-56 CLN fork](https://github.com/8144225309/lightning/tree/blip-56). The fork adds **zero new LN network messages** — factory protocol runs via ODD custommsg (type 33001).
 
-- **Wire message 32800** (`factory_message`) — envelope for all factory protocol traffic
-- **TLV 65600** (`channel_in_factory`) on `open_channel`/`accept_channel` — marks channels as factory-owned, enables zero-conf
-- **Feature bit 270/271** — peers discover factory support during init
-- **`factory-change` RPC** — triggers STFU-gated commitment re-signing for new funding outpoints after rotation
-- **`factory-sign-commitment` RPC** — signs commitment transactions against new factory state
-- **Zero-conf factory channels** — CLN skips funding watch for factory leaf outputs (they're never broadcast on-chain)
+Fork changes needed by the plugin:
+- **`fundchannel_complete` override** — `factory_funding_txid` param to reference DW tree leaf outpoint
+- **`factory-change` RPC** — updates channel funding outpoint after factory rotation
+- **TLV 65600** (`channel_in_factory`) — marks channels as factory-owned, enforces zero-conf, skips funding watch
+- **`checkutxo` RPC** — UTXO status query for breach detection
 
-Without the fork, the plugin cannot open factory channels, send factory messages, or perform state rotations.
+Without the fork, the plugin cannot open factory channels with virtual funding outpoints or update them after rotation.
 
 ## Related Projects
 
