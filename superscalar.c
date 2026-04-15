@@ -1337,10 +1337,11 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 					 rbuf, rlen);
 			free(rbuf);
 
-			/* In 2-party mode, client has all nonces (its own +
-			 * LSP's) and can finalize + sign immediately.
-			 * In multi-client mode, wait for ALL_NONCES. */
-			if (nb->n_participants <= 2) {
+			/* Always wait for ALL_NONCES before signing.
+			 * The LSP rebuilds the tree with real funding after
+			 * collect all nonces, so signing before ALL_NONCES
+			 * would produce invalid partial sigs. */
+			if (false) { /* 2-party fast path disabled */
 				if (!factory_sessions_finalize(factory)) {
 					plugin_log(plugin_handle, LOG_BROKEN,
 						   "Client: factory_sessions_finalize failed");
