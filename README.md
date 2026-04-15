@@ -6,7 +6,7 @@ This plugin enables a Core Lightning node to participate in [SuperScalar](https:
 
 ## Requirements
 
-- [Core Lightning (bLIP-56 fork)](https://github.com/8144225309/lightning/tree/blip-56) — the `blip-56` branch, which adds pluggable channel factory wire messages, TLVs, and RPCs to CLN
+- [Core Lightning (bLIP-56 fork)](https://github.com/8144225309/lightning/tree/blip-56) — the `blip-56` branch with minimal channel-management changes for factory support (no new wire types, TLVs, or feature bits)
 - Bitcoin Core 28+
 - `libsuperscalar_core.a` (static library from the [SuperScalar](https://github.com/8144225309/SuperScalar) build)
 - `libsecp256k1` with extrakeys module
@@ -32,7 +32,7 @@ make plugins/superscalar
 lightningd --plugin=/path/to/cln-blip56/plugins/superscalar
 ```
 
-The plugin registers CLN hooks (`custommsg`, `openchannel`, `block_added`, `connect`) and advertises feature bit 271 (`OPT_PLUGGABLE_CHANNEL_FACTORIES`) via the bLIP-56 fork.
+The plugin registers CLN hooks (`custommsg`, `openchannel`, `block_added`, `connect`) for factory protocol handling and zero-conf channel acceptance.
 
 ## RPC Methods
 
@@ -46,7 +46,7 @@ The plugin exposes seven JSON-RPC methods through CLN's standard interface:
 | `factory-close` | `instance_id` | Initiate cooperative close: computes distribution outputs, sends `CLOSE_PROPOSE` |
 | `factory-force-close` | `instance_id` | Broadcast all signed DW tree transactions for unilateral exit, force-closes associated LN channels |
 | `factory-check-breach` | `instance_id`, `txid`, `vout`, `amount_sats`, `epoch` | Build and broadcast a penalty/burn transaction for a detected breach (old-epoch state on-chain) |
-| `factory-open-channels` | `instance_id` | Open Lightning channels inside the factory via `fundchannel_start`/`fundchannel_complete` with factory TLVs |
+| `factory-open-channels` | `instance_id` | Open Lightning channels inside the factory via `fundchannel_start`/`fundchannel_complete` with factory funding override |
 
 ### `factory-list` Response Schema
 
@@ -113,7 +113,8 @@ This plugin depends on channel-management changes in the [bLIP-56 CLN fork](http
 Fork changes needed by the plugin:
 - **`fundchannel_complete` override** — `factory_funding_txid` param to reference DW tree leaf outpoint
 - **`factory-change` RPC** — updates channel funding outpoint after factory rotation
-- **TLV 65600** (`channel_in_factory`) — marks channels as factory-owned, enforces zero-conf, skips funding watch
+- **`fundchannel_complete` override** — `factory_funding_txid` param to reference DW tree leaf outpoint
+- **Zero-conf** — `openchannel` hook returns `mindepth=0` for factory peers; skip funding watch for virtual outpoints
 - **`checkutxo` RPC** — UTXO status query for breach detection
 
 Without the fork, the plugin cannot open factory channels with virtual funding outpoints or update them after rotation.
