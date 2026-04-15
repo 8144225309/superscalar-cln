@@ -157,6 +157,54 @@ struct funding_ctx {
 	uint8_t funding_spk_len;
 };
 
+/* Apply per-client allocations to every leaf's output amounts.
+ * Uses fi->allocations[] (populated from factory-create RPC or from
+ * FACTORY_PROPOSE/ALL_NONCES payload). Falls back to even split when
+ * an allocation slot is 0. Must be called AFTER factory_build_tree. */
+static void apply_allocations_to_leaves(factory_instance_t *fi,
+					factory_t *factory,
+					size_t n_total)
+{
+	if (!factory || factory->n_leaf_nodes <= 0 || n_total <= 1)
+		return;
+	if (fi->n_allocations == 0 || fi->funding_amount_sats == 0)
+		return;
+
+	uint64_t total = fi->funding_amount_sats;
+	uint64_t lstock_total = total * 20 / 100;
+	uint64_t client_total = total - lstock_total;
+	uint64_t default_per = client_total / (n_total - 1);
+
+	for (int ls = 0; ls < factory->n_leaf_nodes; ls++) {
+		size_t leaf_ni = factory->leaf_node_indices[ls];
+		factory_node_t *ln = &factory->nodes[leaf_ni];
+		size_t nclients = 0;
+		for (size_t s = 0; s < ln->n_signers; s++)
+			if (ln->signer_indices[s] != 0)
+				nclients++;
+		size_t n_outputs = nclients + 1;
+		uint64_t *amts = calloc(n_outputs, sizeof(uint64_t));
+		if (!amts) continue;
+		size_t out_idx = 0;
+		uint64_t csum = 0;
+		for (size_t s = 0; s < ln->n_signers; s++) {
+			int pidx = ln->signer_indices[s];
+			if (pidx == 0) continue;
+			size_t ci = (size_t)(pidx - 1);
+			uint64_t a = (ci < fi->n_allocations
+				      && fi->allocations[ci] > 0)
+				? fi->allocations[ci]
+				: default_per;
+			amts[out_idx++] = a;
+			csum += a;
+		}
+		uint64_t lt = ln->input_amount;
+		amts[nclients] = lt > csum ? lt - csum : 546;
+		factory_set_leaf_amounts(factory, ls, amts, n_outputs);
+		free(amts);
+	}
+}
+
 /* Forward declaration */
 static void continue_after_funding(struct command *cmd,
 				   struct funding_ctx *fctx);
@@ -579,9 +627,11 @@ static void open_factory_channels(struct command *cmd,
 			fundchannel_start_ok, rpc_err, ctx);
 		json_add_string(req->js, "id", nid);
 		{
+			uint64_t amt = fi->clients[ci].allocation_sats;
+			if (amt == 0)
+				amt = DEFAULT_FUNDING_SATS;
 			char amt_str[32];
-			snprintf(amt_str, sizeof(amt_str), "%usat",
-				 DEFAULT_FUNDING_SATS);
+			snprintf(amt_str, sizeof(amt_str), "%"PRIu64"sat", amt);
 			json_add_string(req->js, "amount", amt_str);
 		}
 		json_add_bool(req->js, "announce", false);
@@ -1113,26 +1163,54 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 			nonce_bundle_t *nb = calloc(1, sizeof(*nb));
 			if (!nb) break;
 
-			/* Payload = nonce_bundle || funding_amount(8) || pidx(4)
-			 * Backward compat: old format was bundle || pidx(4) */
-			size_t trailer = 12; /* 8-byte amount + 4-byte pidx */
-			if (len < trailer || !nonce_bundle_deserialize(
-				nb, data, len - trailer)) {
-				/* Try old 4-byte trailer format */
-				trailer = 4;
-				if (len < trailer || !nonce_bundle_deserialize(
-					nb, data, len - trailer)) {
-					plugin_log(plugin_handle, LOG_UNUSUAL,
-						   "Bad FACTORY_PROPOSE payload");
-					free(nb);
-					break;
+			/* Payload formats (try in order):
+			 *   new: bundle || famt(8) || pidx(4) || alloc[n](n*8) || n_alloc(1)
+			 *   mid: bundle || famt(8) || pidx(4)
+			 *   old: bundle || pidx(4)
+			 * We detect "new" by reading the last byte as n_alloc and
+			 * checking that the implied trailer parses cleanly. */
+			uint8_t propose_n_alloc = 0;
+			uint64_t propose_allocs[MAX_FACTORY_PARTICIPANTS] = {0};
+			size_t trailer = 12;
+			bool parsed = false;
+
+			if (len >= 13) {
+				uint8_t cand = data[len - 1];
+				if (cand > 0 && cand <= MAX_FACTORY_PARTICIPANTS) {
+					size_t cand_trailer = 13 + (size_t)cand * 8;
+					if (len > cand_trailer) {
+						if (nonce_bundle_deserialize(
+							nb, data, len - cand_trailer)) {
+							propose_n_alloc = cand;
+							trailer = cand_trailer;
+							parsed = true;
+						}
+					}
 				}
 			}
+			if (!parsed && len >= 12 && nonce_bundle_deserialize(
+				nb, data, len - 12)) {
+				trailer = 12;
+				parsed = true;
+			}
+			if (!parsed && len >= 4 && nonce_bundle_deserialize(
+				nb, data, len - 4)) {
+				trailer = 4;
+				parsed = true;
+			}
+			if (!parsed) {
+				plugin_log(plugin_handle, LOG_UNUSUAL,
+					   "Bad FACTORY_PROPOSE payload");
+				free(nb);
+				break;
+			}
 
-			/* Read funding amount (0 if old 4-byte trailer) */
+			/* Read funding amount (0 if old 4-byte trailer). In the
+			 * new format the famt+pidx come right after the bundle. */
 			uint64_t propose_funding_sats = 0;
-			if (trailer == 12) {
-				const uint8_t *ap = data + len - 12;
+			size_t famt_off = len - trailer;
+			if (trailer >= 12) {
+				const uint8_t *ap = data + famt_off;
 				propose_funding_sats =
 					((uint64_t)ap[0] << 56) |
 					((uint64_t)ap[1] << 48) |
@@ -1143,11 +1221,35 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 					((uint64_t)ap[6] <<  8) | ap[7];
 			}
 
-			/* Read participant index from last 4 bytes */
-			uint32_t our_pidx = ((uint32_t)data[len-4] << 24) |
-					    ((uint32_t)data[len-3] << 16) |
-					    ((uint32_t)data[len-2] << 8)  |
-					     (uint32_t)data[len-1];
+			/* Participant index is always the 4 bytes after famt. */
+			size_t pidx_off = (trailer >= 12) ? famt_off + 8
+							  : famt_off;
+			uint32_t our_pidx =
+				((uint32_t)data[pidx_off]     << 24) |
+				((uint32_t)data[pidx_off + 1] << 16) |
+				((uint32_t)data[pidx_off + 2] << 8)  |
+				 (uint32_t)data[pidx_off + 3];
+
+			/* Read allocations if present. */
+			if (propose_n_alloc > 0) {
+				size_t ao = pidx_off + 4;
+				for (uint8_t ai = 0; ai < propose_n_alloc; ai++) {
+					const uint8_t *ap = data + ao;
+					propose_allocs[ai] =
+						((uint64_t)ap[0] << 56) |
+						((uint64_t)ap[1] << 48) |
+						((uint64_t)ap[2] << 40) |
+						((uint64_t)ap[3] << 32) |
+						((uint64_t)ap[4] << 24) |
+						((uint64_t)ap[5] << 16) |
+						((uint64_t)ap[6] <<  8) |
+						 ap[7];
+					ao += 8;
+				}
+				plugin_log(plugin_handle, LOG_INFORM,
+					   "FACTORY_PROPOSE carries %u allocations",
+					   propose_n_alloc);
+			}
 
 			fi = ss_factory_new(&ss_state, nb->instance_id);
 			if (!fi) {
@@ -1225,6 +1327,64 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 				free(nb);
 				break;
 			}
+
+			/* Apply allocations (from FACTORY_PROPOSE payload) to
+			 * leaf amounts so our MuSig2 signing uses the same
+			 * message hash as the LSP. Mirrors the LSP's loop in
+			 * json_factory_create. */
+			if (propose_n_alloc > 0
+			    && propose_funding_sats > 0
+			    && factory->n_leaf_nodes > 0) {
+				fi->n_allocations = propose_n_alloc;
+				for (uint8_t ai = 0; ai < propose_n_alloc; ai++)
+					fi->allocations[ai] = propose_allocs[ai];
+
+				uint64_t total = propose_funding_sats;
+				uint64_t lstock_total = total * 20 / 100;
+				uint64_t client_total = total - lstock_total;
+				uint64_t default_per =
+					client_total /
+					(nb->n_participants - 1);
+
+				for (int ls = 0; ls < factory->n_leaf_nodes; ls++) {
+					size_t leaf_ni =
+						factory->leaf_node_indices[ls];
+					factory_node_t *ln =
+						&factory->nodes[leaf_ni];
+					size_t nclients = 0;
+					for (size_t s = 0; s < ln->n_signers; s++)
+						if (ln->signer_indices[s] != 0)
+							nclients++;
+					size_t n_outputs = nclients + 1;
+					uint64_t *amts = calloc(n_outputs,
+								sizeof(uint64_t));
+					if (!amts) break;
+					size_t out_idx = 0;
+					uint64_t csum = 0;
+					for (size_t s = 0; s < ln->n_signers; s++) {
+						int pidx = ln->signer_indices[s];
+						if (pidx == 0) continue;
+						size_t ci = (size_t)(pidx - 1);
+						uint64_t a =
+						  (ci < propose_n_alloc
+						   && propose_allocs[ci] > 0)
+						   ? propose_allocs[ci]
+						   : default_per;
+						amts[out_idx++] = a;
+						csum += a;
+					}
+					uint64_t lt = ln->input_amount;
+					amts[nclients] = lt > csum
+						? lt - csum : 546;
+					factory_set_leaf_amounts(factory, ls,
+								 amts, n_outputs);
+					free(amts);
+				}
+				plugin_log(plugin_handle, LOG_INFORM,
+					   "Client: applied %u allocations to leaves",
+					   propose_n_alloc);
+			}
+
 			factory_sessions_init(factory);
 			fi->lib_factory = factory;
 
@@ -1766,6 +1926,10 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 							4320, 432);
 						factory_build_tree(new_f);
 
+						/* Apply allocations (if any) so leaf
+						 * amounts match what we signed. */
+						apply_allocations_to_leaves(fi, new_f, n_total);
+
 						/* Free old factory, swap in new */
 						factory_t *old_f = (factory_t *)fi->lib_factory;
 						if (old_f) {
@@ -2016,6 +2180,11 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 						ss_state.current_blockheight,
 						4320, 432);
 					factory_build_tree(new_f);
+
+					/* Apply allocations so our leaves match the
+					 * LSP's post-rebuild state. */
+					apply_allocations_to_leaves(fi, new_f,
+						anb->n_participants);
 
 					factory_t *old_f = f;
 					factory_free(old_f);
@@ -4149,9 +4318,11 @@ static struct command_result *json_factory_create(struct command *cmd,
 	secp256k1_context *secp_ctx;
 	uint8_t instance_id[32];
 
+	const jsmntok_t *allocations_tok = NULL;
 	if (!param(cmd, buf, params,
 		   p_req("funding_sats", param_u64, &funding_sats),
 		   p_req("clients", param_array, &clients_tok),
+		   p_opt("allocations", param_array, &allocations_tok),
 		   NULL))
 		return command_param_failed();
 
@@ -4183,8 +4354,48 @@ static struct command_result *json_factory_create(struct command *cmd,
 				c->node_id[j] = (uint8_t)byte;
 			}
 			c->signer_slot = fi->n_clients + 1; /* 0=LSP */
+			c->allocation_sats = 0; /* Default: even split */
 			fi->n_clients++;
 		}
+	}
+
+	/* Parse optional allocations array (per-client sats, ordered to match
+	 * clients array). If omitted, allocation_sats stays 0 and the even-
+	 * split fallback is used downstream. */
+	fi->n_allocations = 0;
+	if (allocations_tok) {
+		const jsmntok_t *at;
+		size_t ai;
+		size_t alloc_count = 0;
+		uint64_t alloc_sum = 0;
+		json_for_each_arr(ai, at, allocations_tok) {
+			if (alloc_count >= fi->n_clients)
+				break;
+			u64 v;
+			if (!json_to_u64(buf, at, &v))
+				return command_fail(cmd, LIGHTNINGD,
+					"allocations[%zu] not a u64", ai);
+			fi->clients[alloc_count].allocation_sats = v;
+			alloc_sum += v;
+			alloc_count++;
+		}
+		if (alloc_count != fi->n_clients)
+			return command_fail(cmd, LIGHTNINGD,
+				"allocations length (%zu) != clients length (%zu)",
+				alloc_count, fi->n_clients);
+		/* Validate sum fits within non-L-stock 80% of funding. */
+		uint64_t cap = (*funding_sats) * 80 / 100;
+		if (alloc_sum > cap)
+			return command_fail(cmd, LIGHTNINGD,
+				"allocations sum %"PRIu64" exceeds 80%% of "
+				"funding_sats (%"PRIu64")", alloc_sum, cap);
+		/* Cache on fi for FACTORY_PROPOSE/ALL_NONCES serialization. */
+		fi->n_allocations = (uint8_t)fi->n_clients;
+		for (size_t i2 = 0; i2 < fi->n_clients; i2++)
+			fi->allocations[i2] = fi->clients[i2].allocation_sats;
+		plugin_log(plugin_handle, LOG_INFORM,
+			   "factory-create: custom allocations sum=%"PRIu64" sats",
+			   alloc_sum);
 	}
 
 	plugin_log(plugin_handle, LOG_INFORM,
@@ -4271,14 +4482,16 @@ static struct command_result *json_factory_create(struct command *cmd,
 			   "Factory tree built: %zu participants",
 			   n_total);
 
-		/* Configure per-leaf amounts: split funding among clients
-		 * with 20% reserved as LSP liquidity stock (L-stock).
-		 * L-stock is the last output on each leaf. */
+		/* Configure per-leaf amounts: each client gets either their
+		 * explicit allocation_sats, or an even share if 0.
+		 * L-stock (LSP liquidity) is the last output on each leaf. */
 		{
 			uint64_t total = *funding_sats;
 			uint64_t lstock_pct = 20;
 			uint64_t lstock_total = total * lstock_pct / 100;
 			uint64_t client_total = total - lstock_total;
+			uint64_t default_per_client =
+				client_total / (n_total - 1);
 
 			for (int ls = 0; ls < factory->n_leaf_nodes; ls++) {
 				size_t leaf_ni = factory->leaf_node_indices[ls];
@@ -4288,18 +4501,26 @@ static struct command_result *json_factory_create(struct command *cmd,
 					if (ln->signer_indices[s] != 0)
 						n_clients_on_leaf++;
 
-				/* Distribute evenly among clients on this
-				 * leaf, with L-stock as the last output */
 				size_t n_outputs = n_clients_on_leaf + 1;
 				uint64_t *amts = calloc(n_outputs, sizeof(uint64_t));
 				if (amts) {
-					uint64_t per_client = client_total /
-						(n_total - 1); /* per client */
-					for (size_t a = 0; a < n_clients_on_leaf; a++)
-						amts[a] = per_client;
-					/* L-stock = remainder */
+					/* Walk signers for this leaf, map
+					 * participant_idx -> client_idx, pick
+					 * allocation_sats (or default). */
+					size_t out_idx = 0;
+					uint64_t client_sum = 0;
+					for (size_t s = 0; s < ln->n_signers; s++) {
+						int pidx = ln->signer_indices[s];
+						if (pidx == 0) continue; /* skip LSP */
+						size_t ci = (size_t)(pidx - 1);
+						uint64_t a = (ci < fi->n_clients &&
+							      fi->clients[ci].allocation_sats > 0)
+							? fi->clients[ci].allocation_sats
+							: default_per_client;
+						amts[out_idx++] = a;
+						client_sum += a;
+					}
 					uint64_t leaf_total = ln->input_amount;
-					uint64_t client_sum = per_client * n_clients_on_leaf;
 					amts[n_clients_on_leaf] = leaf_total > client_sum
 						? leaf_total - client_sum : 546;
 
@@ -4488,20 +4709,30 @@ static struct command_result *json_factory_create(struct command *cmd,
 			fi->ceremony = CEREMONY_PROPOSED;
 
 			/* Send FACTORY_PROPOSE to each client.
-			 * Append participant index (4 bytes, big-endian) so
-			 * clients know their slot (LSP=0, clients 1..n). */
+			 * Payload format:
+			 *   nonce_bundle || famt(8) || pidx(4)
+			 *                [|| alloc[n_alloc](n*8) || n_alloc(1)]
+			 * The allocations suffix is optional: n_alloc==0 means
+			 * recipients fall back to even-split. */
+			uint8_t n_alloc = 0;
+			for (size_t ci = 0; ci < fi->n_clients; ci++) {
+				if (fi->clients[ci].allocation_sats > 0) {
+					n_alloc = (uint8_t)fi->n_clients;
+					break;
+				}
+			}
+			size_t alloc_bytes = (size_t)n_alloc * 8;
+			size_t extra = (n_alloc > 0) ? (1 + alloc_bytes) : 0;
+
 			for (size_t ci = 0; ci < fi->n_clients; ci++) {
 				char client_hex[67];
 				for (int h = 0; h < 33; h++)
 					sprintf(client_hex + h*2, "%02x",
 						fi->clients[ci].node_id[h]);
 
-				/* Build per-client buffer:
-				 * nonce_bundle + funding_amount(8) + pidx(4) */
 				uint32_t pidx = (uint32_t)(ci + 1);
-				uint8_t *cbuf = calloc(1, blen + 12);
+				uint8_t *cbuf = calloc(1, blen + 12 + extra);
 				memcpy(cbuf, nbuf, blen);
-				/* 8-byte funding amount (big-endian) */
 				uint64_t famt = fi->funding_amount_sats;
 				cbuf[blen]     = (famt >> 56) & 0xFF;
 				cbuf[blen + 1] = (famt >> 48) & 0xFF;
@@ -4511,21 +4742,37 @@ static struct command_result *json_factory_create(struct command *cmd,
 				cbuf[blen + 5] = (famt >> 16) & 0xFF;
 				cbuf[blen + 6] = (famt >>  8) & 0xFF;
 				cbuf[blen + 7] = famt & 0xFF;
-				/* 4-byte participant index */
 				cbuf[blen + 8]  = (pidx >> 24) & 0xFF;
 				cbuf[blen + 9]  = (pidx >> 16) & 0xFF;
 				cbuf[blen + 10] = (pidx >> 8)  & 0xFF;
 				cbuf[blen + 11] = pidx & 0xFF;
 
+				if (n_alloc > 0) {
+					size_t off = blen + 12;
+					for (uint8_t ai = 0; ai < n_alloc; ai++) {
+						uint64_t v = fi->clients[ai].allocation_sats;
+						cbuf[off + 0] = (v >> 56) & 0xFF;
+						cbuf[off + 1] = (v >> 48) & 0xFF;
+						cbuf[off + 2] = (v >> 40) & 0xFF;
+						cbuf[off + 3] = (v >> 32) & 0xFF;
+						cbuf[off + 4] = (v >> 24) & 0xFF;
+						cbuf[off + 5] = (v >> 16) & 0xFF;
+						cbuf[off + 6] = (v >>  8) & 0xFF;
+						cbuf[off + 7] = v & 0xFF;
+						off += 8;
+					}
+					cbuf[off] = n_alloc;
+				}
+
 				send_factory_msg(cmd, client_hex,
 					SS_SUBMSG_FACTORY_PROPOSE,
-					cbuf, blen + 12);
+					cbuf, blen + 12 + extra);
 				free(cbuf);
 
 				plugin_log(plugin_handle, LOG_INFORM,
 					   "Sent FACTORY_PROPOSE to client %zu "
-					   "(%zu bytes, participant_idx=%u)",
-					   ci, blen + 4, pidx);
+					   "(%zu bytes, participant_idx=%u, n_alloc=%u)",
+					   ci, blen + 12 + extra, pidx, n_alloc);
 			}
 			free(nbuf);
 		}

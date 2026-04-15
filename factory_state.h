@@ -58,6 +58,9 @@ typedef struct {
 	int signer_slot;		/* Index in MuSig2 signer set */
 	uint8_t factory_pubkey[33];	/* Real factory pubkey (from NONCE_BUNDLE) */
 	bool has_factory_pubkey;	/* Whether factory_pubkey was received */
+	uint64_t allocation_sats;	/* Sats allocated to this client's channel.
+					 * 0 = use default even-split. Set by
+					 * factory-create `allocations` param. */
 } client_state_t;
 
 /* Factory instance */
@@ -154,6 +157,13 @@ typedef struct factory_instance {
 	size_t n_secnonces;
 	uint8_t our_seckey[32];
 	int our_participant_idx;
+
+	/* Per-client allocations (sats). Index 0 = client 0, index 1 = client 1...
+	 * Populated on LSP from factory-create `allocations` param, and on
+	 * clients from FACTORY_PROPOSE / ALL_NONCES payloads.
+	 * n_allocations == 0 means fall back to even split. */
+	uint8_t n_allocations;
+	uint64_t allocations[MAX_FACTORY_PARTICIPANTS];
 
 } factory_instance_t;
 
