@@ -10,7 +10,12 @@
 #        rm -rf $CLN_DIR/external/build-*/libwally-core-build
 #        cd $CLN_DIR && make -j$(nproc)
 #
-# Why this is needed: see comment block at bottom of this script.
+# Both SuperScalar and CLN/wally pin secp256k1-zkp to the same commit
+# (6152622613fdf1c5af6f31f74c427c4e9ee120ce), so there is ONE secp256k1
+# in the binary. No --allow-multiple-definition needed for secp symbols.
+#
+# The only remaining symbol conflicts are utility functions in
+# libsuperscalar (sha256, hex_decode, etc.) which are renamed via objcopy.
 
 set -e
 
@@ -29,15 +34,15 @@ cp "$PLUGIN_SRC/superscalar.c" "$PLUGIN_SRC/factory_state.h" \
 
 # --- Step 1: Build slim libsuperscalar (only the 9 files we need) ---
 # The full libsuperscalar.a has 106 .o files. 97 of them export symbols
-# that conflict with CLN (hex_decode, bolt11_decode, sha256_double, etc).
-# We extract only the 9 .o files our plugin actually calls.
+# that conflict with CLN (hex_decode, bolt11_decode, etc). We extract
+# only the 9 .o files our plugin actually calls.
 SLIM_DIR=$(mktemp -d)
 cd "$SLIM_DIR"
 ar x "$SS_DIR/build/libsuperscalar.a" \
   factory.c.o musig.c.o dw_state.c.o ladder.c.o \
   tx_builder.c.o tapscript.c.o adaptor.c.o util.c.o shachain.c.o
 
-# Rename the 6 remaining conflicting symbols in ALL extracted .o files
+# Rename the 6 utility-function conflicts in ALL extracted .o files
 for obj in *.o; do
   objcopy \
     --redefine-sym sha256=ss_sha256 \
@@ -76,74 +81,18 @@ for src in superscalar factory_state persist nonce_exchange fee_stubs; do
 done
 
 # --- Step 3: Link ---
-# SuperScalar's secp256k1-zkp (from its FetchContent) provides the musig
-# functions with the API that libsuperscalar was compiled against.
-# CLN's wally secp256k1-zkp provides all other secp256k1 functions.
-# --allow-multiple-definition lets the first definition win for shared
-# symbols (context_create, ec_pubkey_parse, etc).
-SS_SECP="$SS_DIR/build/_deps/secp256k1-zkp-build/lib/libsecp256k1.a"
-if [ ! -f "$SS_SECP" ]; then
-  SS_SECP="$SS_DIR/build/_deps/secp256k1-zkp-build/src/libsecp256k1.a"
-fi
-
+# One secp256k1 (from CLN's wally, with musig enabled).
+# Slim libsuperscalar provides factory/musig/DW functions.
+# No --allow-multiple-definition needed.
 cc -Og -o plugins/superscalar \
   plugins/superscalar.o plugins/factory_state.o plugins/nonce_exchange.o \
   plugins/persist.o plugins/fee_stubs.o plugins/libplugin.o \
-  "$SLIM_DIR/libsuperscalar_slim.a" "$SS_SECP" \
+  "$SLIM_DIR/libsuperscalar_slim.a" \
   libcommon.a libccan.a \
   -Lexternal/build-$(uname -m)-linux-gnu -lwallycore -lsecp256k1 -ljsmn -lbacktrace \
-  -Wl,--allow-multiple-definition \
   -L/usr/local/include -lm -lsqlite3 \
   -L/usr/lib/$(uname -m)-linux-gnu -lpq -lsodium -lz -lcrypto \
   -o plugins/superscalar
 
 rm -rf "$SLIM_DIR"
 echo "Plugin built: $(ls -la plugins/superscalar)"
-
-# ==========================================================================
-# WHY THIS BUILD IS COMPLICATED
-# ==========================================================================
-#
-# The SuperScalar plugin links two libraries that both use secp256k1-zkp
-# (BlockstreamResearch's fork of libsecp256k1 with MuSig2 support):
-#
-#   1. libsuperscalar — the SuperScalar protocol library (DW trees, MuSig2
-#      ceremony, factory state). Built by SuperScalar's CMake, which
-#      fetches secp256k1-zkp via FetchContent at a specific commit.
-#
-#   2. CLN's libwally-core — Bitcoin primitives (PSBT, signatures, etc).
-#      Bundles its OWN copy of secp256k1-zkp as a git submodule, at a
-#      DIFFERENT commit than SuperScalar uses.
-#
-# Both are secp256k1-zkp, but at different commits with INCOMPATIBLE APIs:
-#   - SuperScalar's commit: secp256k1_musig_pubkey_agg takes 5 arguments
-#   - Wally's commit: secp256k1_musig_pubkey_agg takes 6 arguments
-#     (extra scratch_space parameter)
-#
-# This is NOT a bug in either project. secp256k1-zkp's MuSig2 module is
-# experimental and its API changes between commits. Both SuperScalar and
-# wally pin to specific commits that work for their respective needs.
-#
-# The conflict arises ONLY when linking both into one binary (our plugin).
-# With two copies of secp256k1 statically linked, the linker must choose
-# which version of each function to keep. If it picks wally's
-# secp256k1_musig_pubkey_agg (6-arg) but libsuperscalar calls the 5-arg
-# version, the 5th argument (n_pubkeys, a count like "2") gets interpreted
-# as a pointer → SIGSEGV.
-#
-# The solution:
-#   1. Link SuperScalar's secp256k1-zkp FIRST (via $SS_SECP) so its musig
-#      functions win for --allow-multiple-definition
-#   2. CLN's secp256k1-zkp (via -lsecp256k1) provides non-musig functions
-#      that wally needs (ecdh, surjection, whitelist, etc)
-#   3. The slim lib contains only 9 .o files from libsuperscalar (out of
-#      106) to minimize symbol conflicts — the other 97 files export
-#      functions like hex_decode, bolt11_decode, etc that clash with CLN
-#   4. The 6 remaining utility-function conflicts are resolved via objcopy
-#      --redefine-sym (sha256 → ss_sha256, hex_decode → ss_hex_decode)
-#
-# Wally's --enable-module-musig in configure.ac is needed so CLN's own
-# secp256k1 build includes the musig headers. Without it, our plugin code
-# can't compile against CLN's secp256k1 headers (missing musig types).
-# The actual musig FUNCTIONS come from SuperScalar's secp, not wally's.
-# ==========================================================================
