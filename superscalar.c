@@ -3890,19 +3890,30 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 					   fi->n_clients);
 				ss_save_factory(cmd, fi);
 
-				/* Close open channels in this factory */
+				/* Forget factory channels (no commitment broadcast —
+				 * factory protocol resolved the funds) */
 				for (size_t ch = 0; ch < fi->n_channels; ch++) {
 					char cid_hex[65];
 					for (int j = 0; j < 32; j++)
 						sprintf(cid_hex + j*2, "%02x",
 							fi->channels[ch].channel_id[j]);
+					size_t ci = 0;
+					for (; ci < fi->n_clients; ci++)
+						if (fi->channels[ch].leaf_index >= 0)
+							break;
+					char peer_nid[67];
+					for (int j = 0; j < 33; j++)
+						sprintf(peer_nid + j*2, "%02x",
+							fi->clients[ci < fi->n_clients ? ci : 0].node_id[j]);
+					peer_nid[66] = '\0';
 					struct out_req *creq = jsonrpc_request_start(
-						cmd, "close",
+						cmd, "factory-forget-channel",
 						rpc_done, rpc_err, fi);
-					json_add_string(creq->js, "id", cid_hex);
+					json_add_string(creq->js, "id", peer_nid);
+					json_add_string(creq->js, "channel_id", cid_hex);
 					send_outreq(creq);
 					plugin_log(plugin_handle, LOG_INFORM,
-						   "LSP: closing channel %zu", ch);
+						   "LSP: forgetting factory channel %zu", ch);
 				}
 			} else {
 				plugin_log(plugin_handle, LOG_BROKEN,
@@ -3921,19 +3932,26 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 			plugin_log(plugin_handle, LOG_INFORM,
 				   "Client: factory closed cooperatively");
 
-			/* Close our side of each channel in this factory */
+			/* Forget factory channels (no commitment broadcast —
+			 * factory protocol resolved the funds) */
 			for (size_t ch = 0; ch < fi->n_channels; ch++) {
 				char cid_hex[65];
 				for (int j = 0; j < 32; j++)
 					sprintf(cid_hex + j*2, "%02x",
 						fi->channels[ch].channel_id[j]);
+				char lsp_hex[67];
+				for (int j = 0; j < 33; j++)
+					sprintf(lsp_hex + j*2, "%02x",
+						fi->lsp_node_id[j]);
+				lsp_hex[66] = '\0';
 				struct out_req *creq = jsonrpc_request_start(
-					cmd, "close",
+					cmd, "factory-forget-channel",
 					rpc_done, rpc_err, fi);
-				json_add_string(creq->js, "id", cid_hex);
+				json_add_string(creq->js, "id", lsp_hex);
+				json_add_string(creq->js, "channel_id", cid_hex);
 				send_outreq(creq);
 				plugin_log(plugin_handle, LOG_INFORM,
-					   "Client: closing channel %zu", ch);
+					   "Client: forgetting factory channel %zu", ch);
 			}
 		}
 		break;
