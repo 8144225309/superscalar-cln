@@ -765,6 +765,37 @@ static void rotate_finish_and_notify(struct command *cmd,
 
 	ss_save_factory(cmd, fi);
 
+	/* Reconnect each client peer after factory-change to force CLN
+	 * to re-exchange channel_reestablish. This re-registers the
+	 * channel in CLN's routing table with the updated funding
+	 * outpoint, fixing the "no path found" issue after rotation.
+	 * Workaround for CLN not natively routing via alias SCIDs
+	 * after a funding outpoint change. */
+	for (size_t ci = 0; ci < fi->n_clients; ci++) {
+		char nid[67];
+		for (int j = 0; j < 33; j++)
+			sprintf(nid + j*2, "%02x",
+				fi->clients[ci].node_id[j]);
+		nid[66] = '\0';
+
+		struct out_req *dreq = jsonrpc_request_start(
+			cmd, "disconnect",
+			rpc_done, rpc_err, fi);
+		json_add_string(dreq->js, "id", nid);
+		json_add_bool(dreq->js, "force", true);
+		send_outreq(dreq);
+
+		struct out_req *creq = jsonrpc_request_start(
+			cmd, "connect",
+			rpc_done, rpc_err, fi);
+		json_add_string(creq->js, "id", nid);
+		send_outreq(creq);
+
+		plugin_log(plugin_handle, LOG_INFORM,
+			   "LSP: reconnecting client %zu after factory-change",
+			   ci);
+	}
+
 	plugin_log(plugin_handle, LOG_INFORM,
 		   "LSP: ROTATION COMPLETE epoch=%u", fi->epoch);
 }
