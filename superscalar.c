@@ -812,6 +812,19 @@ static void ss_save_factory(struct command *cmd, factory_instance_t *fi)
 		"create-or-replace", rpc_done, rpc_err, fi);
 	free(idx_buf);
 
+	/* Save signed DW tree transactions (for force-close after restart).
+	 * Both LSP and client persist independently — each must be able
+	 * to unilaterally exit without the other's cooperation. */
+	if (fi->lib_factory) {
+		ss_persist_key_signed_txs(fi, key, sizeof(key));
+		len = ss_persist_serialize_signed_txs(fi->lib_factory, &buf);
+		if (len > 0 && buf) {
+			jsonrpc_set_datastore_binary(cmd, key, buf, len,
+				"create-or-replace", rpc_done, rpc_err, fi);
+			free(buf);
+		}
+	}
+
 	plugin_log(plugin_handle, LOG_DBG,
 		   "Persisted factory state (epoch=%u, channels=%zu)",
 		   fi->epoch, fi->n_channels);
@@ -1068,6 +1081,29 @@ static void ss_load_factories(struct command *cmd)
 							fi->lib_factory = f;
 							fi->n_tree_nodes =
 								(uint32_t)f->n_nodes;
+							/* Load signed TXs from
+							 * datastore if available */
+							char stx_key[128];
+							ss_persist_key_signed_txs(
+								fi, stx_key,
+								sizeof(stx_key));
+							uint8_t *stx_data = NULL;
+							size_t stx_len = 0;
+							stx_data = rpc_scan_datastore_hex(
+								cmd, stx_key,
+								&stx_len);
+							if (stx_data && stx_len > 0) {
+								ss_persist_deserialize_signed_txs(
+									f, stx_data,
+									stx_len);
+								plugin_log(plugin_handle,
+									LOG_INFORM,
+									"Loaded signed "
+									"TXs for factory");
+							}
+							if (stx_data)
+								tal_free(stx_data);
+
 							plugin_log(plugin_handle,
 								LOG_INFORM,
 								"Rebuilt factory tree "

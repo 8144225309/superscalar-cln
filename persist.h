@@ -41,5 +41,18 @@ void ss_persist_key_channels(const factory_instance_t *fi, char *out, size_t len
 void ss_persist_key_breach(const factory_instance_t *fi, uint32_t epoch,
 			   char *out, size_t len);
 void ss_persist_key_breach_index(const factory_instance_t *fi, char *out, size_t len);
+void ss_persist_key_signed_txs(const factory_instance_t *fi, char *out, size_t len);
+
+/* Serialize signed DW tree transactions (for force-close after restart).
+ * Format: n_nodes(u16) + for each signed node: node_idx(u16) + txid(32) +
+ *         tx_len(u32) + tx_data(tx_len). Only includes nodes where
+ *         is_signed==true and signed_tx.len > 0. */
+size_t ss_persist_serialize_signed_txs(const void *lib_factory,
+                                       uint8_t **out);
+
+/* Deserialize signed TXs into a rebuilt factory_t.
+ * Restores signed_tx buffers and sets is_signed flag per node. */
+bool ss_persist_deserialize_signed_txs(void *lib_factory,
+                                       const uint8_t *data, size_t len);
 
 #endif /* SUPERSCALAR_PERSIST_H */

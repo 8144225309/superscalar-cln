@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include "persist.h"
+#include <superscalar/factory.h>
 
 /* Helper: append bytes to a growing buffer */
 static void buf_append(uint8_t **buf, size_t *len, size_t *cap,
@@ -407,4 +408,93 @@ void ss_persist_key_breach_index(const factory_instance_t *fi, char *out, size_t
 	char id_hex[65];
 	hex32(fi->instance_id, id_hex);
 	snprintf(out, len, "superscalar/factories/%s/breach-index", id_hex);
+}
+
+void ss_persist_key_signed_txs(const factory_instance_t *fi, char *out, size_t len)
+{
+	char id_hex[65];
+	hex32(fi->instance_id, id_hex);
+	snprintf(out, len, "superscalar/factories/%s/signed_txs", id_hex);
+}
+
+/* Serialize signed DW tree transactions.
+ * Only includes nodes where is_signed and signed_tx.data exist. */
+size_t ss_persist_serialize_signed_txs(const void *lib_factory,
+                                       uint8_t **out)
+{
+	const factory_t *f = (const factory_t *)lib_factory;
+	if (!f) { *out = NULL; return 0; }
+
+	uint8_t *buf = NULL;
+	size_t len = 0, cap = 0;
+	uint16_t count = 0;
+
+	/* Count signed nodes */
+	for (size_t ni = 0; ni < f->n_nodes; ni++) {
+		if (f->nodes[ni].is_signed &&
+		    f->nodes[ni].signed_tx.data &&
+		    f->nodes[ni].signed_tx.len > 0)
+			count++;
+	}
+
+	buf_u16(&buf, &len, &cap, count);
+
+	for (size_t ni = 0; ni < f->n_nodes; ni++) {
+		if (!f->nodes[ni].is_signed ||
+		    !f->nodes[ni].signed_tx.data ||
+		    f->nodes[ni].signed_tx.len == 0)
+			continue;
+
+		buf_u16(&buf, &len, &cap, (uint16_t)ni);
+		buf_append(&buf, &len, &cap, f->nodes[ni].txid, 32);
+		buf_u32(&buf, &len, &cap, (uint32_t)f->nodes[ni].signed_tx.len);
+		buf_append(&buf, &len, &cap,
+			   f->nodes[ni].signed_tx.data,
+			   f->nodes[ni].signed_tx.len);
+	}
+
+	*out = buf;
+	return len;
+}
+
+/* Deserialize signed TXs into a rebuilt factory_t. */
+bool ss_persist_deserialize_signed_txs(void *lib_factory,
+                                       const uint8_t *data, size_t len)
+{
+	factory_t *f = (factory_t *)lib_factory;
+	if (!f || !data) return false;
+
+	const uint8_t *p = data;
+	size_t rem = len;
+	uint16_t count;
+
+	if (!read_u16(&p, &rem, &count)) return false;
+
+	for (uint16_t i = 0; i < count; i++) {
+		uint16_t ni;
+		uint32_t tx_len;
+
+		if (!read_u16(&p, &rem, &ni)) return false;
+		if (ni >= f->n_nodes) return false;
+
+		if (!read_bytes(&p, &rem, f->nodes[ni].txid, 32))
+			return false;
+		if (!read_u32(&p, &rem, &tx_len)) return false;
+		if (rem < tx_len) return false;
+
+		/* Allocate and copy signed TX data */
+		if (f->nodes[ni].signed_tx.data)
+			free(f->nodes[ni].signed_tx.data);
+		f->nodes[ni].signed_tx.data = malloc(tx_len);
+		if (!f->nodes[ni].signed_tx.data) return false;
+		memcpy(f->nodes[ni].signed_tx.data, p, tx_len);
+		f->nodes[ni].signed_tx.len = tx_len;
+		f->nodes[ni].signed_tx.cap = tx_len;
+		f->nodes[ni].is_signed = true;
+
+		p += tx_len;
+		rem -= tx_len;
+	}
+
+	return true;
 }
