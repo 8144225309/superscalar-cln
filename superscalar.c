@@ -962,8 +962,7 @@ static void ss_load_factories(struct command *cmd)
 
 				/* Rebuild factory_t from persisted data so
 				 * rotation/force-close work after restart. */
-				if (fi->funding_spk_len > 0
-				    && fi->n_clients > 0
+				if (fi->n_clients > 0
 				    && !fi->lib_factory) {
 					size_t n_total = 1 + fi->n_clients;
 					secp256k1_pubkey *pks = calloc(
@@ -1014,12 +1013,28 @@ static void ss_load_factories(struct command *cmd)
 							n_total <= 2
 							? FACTORY_ARITY_1
 							: FACTORY_ARITY_2);
-						factory_set_funding(f,
-							fi->funding_txid,
-							fi->funding_outnum,
-							fi->funding_amount_sats,
-							fi->funding_spk,
-							fi->funding_spk_len);
+						if (fi->funding_spk_len > 0) {
+							factory_set_funding(f,
+								fi->funding_txid,
+								fi->funding_outnum,
+								fi->funding_amount_sats,
+								fi->funding_spk,
+								fi->funding_spk_len);
+						} else {
+							uint8_t syn_txid[32];
+							uint8_t syn_spk[34];
+							for (int j=0; j<32; j++)
+								syn_txid[j] = j+1;
+							syn_spk[0]=0x51;
+							syn_spk[1]=0x20;
+							memset(syn_spk+2,0xAA,32);
+							factory_set_funding(f,
+								syn_txid, 0,
+								fi->funding_amount_sats > 0
+								? fi->funding_amount_sats
+								: 500000,
+								syn_spk, 34);
+						}
 						factory_set_lifecycle(f,
 							fi->creation_block,
 							4320, 432);
