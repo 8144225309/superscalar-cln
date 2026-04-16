@@ -1169,33 +1169,32 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 			 *   old: bundle || pidx(4)
 			 * We detect "new" by reading the last byte as n_alloc and
 			 * checking that the implied trailer parses cleanly. */
+			/* Payload format:
+			 *   bundle || famt(8) || pidx(4) || [alloc(n*8)] || n_alloc(1)
+			 * n_alloc is always present (0 = no allocations).
+			 * Trailer = 13 + n_alloc * 8. */
 			uint8_t propose_n_alloc = 0;
 			uint64_t propose_allocs[MAX_FACTORY_PARTICIPANTS] = {0};
-			size_t trailer = 12;
+			size_t trailer;
 			bool parsed = false;
 
 			if (len >= 13) {
 				uint8_t cand = data[len - 1];
-				if (cand > 0 && cand <= MAX_FACTORY_PARTICIPANTS) {
+				if (cand <= MAX_FACTORY_PARTICIPANTS) {
 					size_t cand_trailer = 13 + (size_t)cand * 8;
-					if (len > cand_trailer) {
-						if (nonce_bundle_deserialize(
-							nb, data, len - cand_trailer)) {
-							propose_n_alloc = cand;
-							trailer = cand_trailer;
-							parsed = true;
-						}
+					if (len > cand_trailer
+					    && nonce_bundle_deserialize(
+						nb, data, len - cand_trailer)) {
+						propose_n_alloc = cand;
+						trailer = cand_trailer;
+						parsed = true;
 					}
 				}
 			}
+			/* Fallback for old format (no n_alloc byte) */
 			if (!parsed && len >= 12 && nonce_bundle_deserialize(
 				nb, data, len - 12)) {
 				trailer = 12;
-				parsed = true;
-			}
-			if (!parsed && len >= 4 && nonce_bundle_deserialize(
-				nb, data, len - 4)) {
-				trailer = 4;
 				parsed = true;
 			}
 			if (!parsed) {
@@ -4788,7 +4787,7 @@ static struct command_result *json_factory_create(struct command *cmd,
 				}
 			}
 			size_t alloc_bytes = (size_t)n_alloc * 8;
-			size_t extra = (n_alloc > 0) ? (1 + alloc_bytes) : 0;
+			size_t extra = 1 + alloc_bytes; /* always send n_alloc byte */
 
 			for (size_t ci = 0; ci < fi->n_clients; ci++) {
 				char client_hex[67];
@@ -4813,7 +4812,7 @@ static struct command_result *json_factory_create(struct command *cmd,
 				cbuf[blen + 10] = (pidx >> 8)  & 0xFF;
 				cbuf[blen + 11] = pidx & 0xFF;
 
-				if (n_alloc > 0) {
+				{
 					size_t off = blen + 12;
 					for (uint8_t ai = 0; ai < n_alloc; ai++) {
 						uint64_t v = fi->clients[ai].allocation_sats;
@@ -4827,7 +4826,7 @@ static struct command_result *json_factory_create(struct command *cmd,
 						cbuf[off + 7] = v & 0xFF;
 						off += 8;
 					}
-					cbuf[off] = n_alloc;
+					cbuf[off] = n_alloc; /* 0 when no allocs */
 				}
 
 				send_factory_msg(cmd, client_hex,
