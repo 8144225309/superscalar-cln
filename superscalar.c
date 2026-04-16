@@ -4898,6 +4898,9 @@ static struct command_result *json_factory_list(struct command *cmd,
 			fi->ceremony == CEREMONY_REVOKED ? "revoked" :
 			"failed");
 		json_add_u32(js, "max_epochs", fi->max_epochs);
+		json_add_u32(js, "epochs_remaining",
+			     fi->max_epochs > fi->epoch
+				? fi->max_epochs - fi->epoch : 0);
 		json_add_u32(js, "creation_block", fi->creation_block);
 		json_add_u32(js, "expiry_block", fi->expiry_block);
 		json_add_bool(js, "rotation_in_progress",
@@ -5153,6 +5156,20 @@ static struct command_result *json_factory_rotate(struct command *cmd,
 	/* Generate revocation secret for current epoch before advancing */
 	if (factory->n_revocation_secrets == 0)
 		factory_generate_flat_secrets(factory, 256);
+
+	/* Check proximity to exhaustion before advancing */
+	if (fi->max_epochs > 0 && fi->epoch >= fi->max_epochs - 1) {
+		return command_fail(cmd, LIGHTNINGD,
+			"DW epoch exhausted (%u/%u). Call factory-migrate "
+			"to move channels to a new factory.",
+			fi->epoch, fi->max_epochs);
+	}
+	if (fi->max_epochs > 0 && fi->epoch >= fi->max_epochs - 5) {
+		plugin_log(plugin_handle, LOG_UNUSUAL,
+			   "Factory %s: epoch %u/%u — approaching exhaustion, "
+			   "schedule factory-migrate soon",
+			   id_hex, fi->epoch, fi->max_epochs);
+	}
 
 	/* Advance the DW counter */
 	if (!dw_counter_advance(&factory->counter)) {
@@ -5662,6 +5679,18 @@ static struct command_result *handle_block_added(struct command *cmd,
 				   i, fi->expiry_block,
 				   ss_state.current_blockheight,
 				   fi->early_warning_time);
+		}
+
+		/* DW epoch exhaustion warning: if epoch is within 10 of
+		 * max_epochs, warn once per block so operator can migrate. */
+		if (fi->is_lsp && fi->max_epochs > 0
+		    && fi->epoch >= fi->max_epochs - 10
+		    && fi->lifecycle == FACTORY_LIFECYCLE_ACTIVE) {
+			uint32_t remaining = fi->max_epochs - fi->epoch;
+			plugin_log(plugin_handle, LOG_UNUSUAL,
+				   "Factory %zu: %u/%u epochs used (%u remaining)"
+				   " — call factory-migrate before exhaustion",
+				   i, fi->epoch, fi->max_epochs, remaining);
 		}
 
 		/* DW cascade: if factory is DYING (force-close in progress),
