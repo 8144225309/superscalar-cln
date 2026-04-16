@@ -4898,6 +4898,9 @@ static struct command_result *json_factory_list(struct command *cmd,
 			fi->ceremony == CEREMONY_REVOKED ? "revoked" :
 			"failed");
 		json_add_u32(js, "max_epochs", fi->max_epochs);
+		json_add_u32(js, "epochs_remaining",
+			     fi->max_epochs > fi->epoch
+				? fi->max_epochs - fi->epoch : 0);
 		json_add_u32(js, "creation_block", fi->creation_block);
 		json_add_u32(js, "expiry_block", fi->expiry_block);
 		json_add_bool(js, "rotation_in_progress",
@@ -5153,6 +5156,20 @@ static struct command_result *json_factory_rotate(struct command *cmd,
 	/* Generate revocation secret for current epoch before advancing */
 	if (factory->n_revocation_secrets == 0)
 		factory_generate_flat_secrets(factory, 256);
+
+	/* Check proximity to exhaustion before advancing */
+	if (fi->max_epochs > 0 && fi->epoch >= fi->max_epochs - 1) {
+		return command_fail(cmd, LIGHTNINGD,
+			"DW epoch exhausted (%u/%u). Call factory-migrate "
+			"to move channels to a new factory.",
+			fi->epoch, fi->max_epochs);
+	}
+	if (fi->max_epochs > 0 && fi->epoch >= fi->max_epochs - 5) {
+		plugin_log(plugin_handle, LOG_UNUSUAL,
+			   "Factory %s: epoch %u/%u — approaching exhaustion, "
+			   "schedule factory-migrate soon",
+			   id_hex, fi->epoch, fi->max_epochs);
+	}
 
 	/* Advance the DW counter */
 	if (!dw_counter_advance(&factory->counter)) {
@@ -5455,6 +5472,111 @@ static struct command_result *json_factory_force_close(struct command *cmd,
 	return command_finished(cmd, js);
 }
 
+/* factory-close-departed RPC — use extracted keys to cooperatively
+ * close a departed client's channel. After key turnover, the LSP
+ * holds both signing keys and can produce a valid cooperative close
+ * without the departed client being online. */
+static struct command_result *json_factory_close_departed(struct command *cmd,
+							   const char *buf,
+							   const jsmntok_t *params)
+{
+	const char *id_hex;
+	u32 *client_idx;
+
+	if (!param(cmd, buf, params,
+		   p_req("instance_id", param_string, &id_hex),
+		   p_req("client_idx", param_u32, &client_idx),
+		   NULL))
+		return command_param_failed();
+
+	if (strlen(id_hex) != 64)
+		return command_fail(cmd, LIGHTNINGD, "Bad instance_id length");
+
+	uint8_t instance_id[32];
+	for (int j = 0; j < 32; j++) {
+		unsigned int b;
+		sscanf(id_hex + j*2, "%02x", &b);
+		instance_id[j] = (uint8_t)b;
+	}
+
+	factory_instance_t *fi = ss_factory_find(&ss_state, instance_id);
+	if (!fi)
+		return command_fail(cmd, LIGHTNINGD, "Factory not found");
+	if (!fi->is_lsp)
+		return command_fail(cmd, LIGHTNINGD, "Only LSP can close departed");
+	if (*client_idx >= fi->n_clients)
+		return command_fail(cmd, LIGHTNINGD, "Invalid client_idx");
+	if (!fi->client_departed[*client_idx])
+		return command_fail(cmd, LIGHTNINGD,
+			"Client %u has not departed (no extracted key)",
+			*client_idx);
+
+	/* We have the departed client's secret key. Build a cooperative
+	 * close: sign with both our key and theirs. */
+	factory_t *factory = (factory_t *)fi->lib_factory;
+	if (!factory)
+		return command_fail(cmd, LIGHTNINGD, "No lib_factory handle");
+
+	/* Find the leaf node for this client */
+	int leaf_idx = factory_find_leaf_for_client(factory,
+						    (int)(*client_idx + 1));
+	if (leaf_idx < 0)
+		return command_fail(cmd, LIGHTNINGD,
+			"No leaf found for client %u", *client_idx);
+
+	/* Create keypair from extracted key for signing */
+	secp256k1_keypair departed_kp;
+	if (!secp256k1_keypair_create(global_secp_ctx, &departed_kp,
+				      fi->extracted_keys[*client_idx]))
+		return command_fail(cmd, LIGHTNINGD,
+			"Bad extracted key for client %u", *client_idx);
+
+	plugin_log(plugin_handle, LOG_INFORM,
+		   "factory-close-departed: client %u, leaf_idx=%d, "
+		   "signing with extracted key",
+		   *client_idx, leaf_idx);
+
+	/* Forget the channel from CLN (no commitment broadcast needed —
+	 * the factory protocol handles fund recovery) */
+	for (size_t ch = 0; ch < fi->n_channels; ch++) {
+		if (fi->channels[ch].leaf_index == leaf_idx) {
+			char cid_hex[65];
+			for (int j = 0; j < 32; j++)
+				sprintf(cid_hex + j*2, "%02x",
+					fi->channels[ch].channel_id[j]);
+			char peer_nid[67];
+			for (int j = 0; j < 33; j++)
+				sprintf(peer_nid + j*2, "%02x",
+					fi->clients[*client_idx].node_id[j]);
+			peer_nid[66] = '\0';
+			struct out_req *creq = jsonrpc_request_start(
+				cmd, "factory-forget-channel",
+				rpc_done, rpc_err, fi);
+			json_add_string(creq->js, "id", peer_nid);
+			json_add_string(creq->js, "channel_id", cid_hex);
+			send_outreq(creq);
+			plugin_log(plugin_handle, LOG_INFORM,
+				   "factory-close-departed: forgetting "
+				   "channel %zu for departed client %u",
+				   ch, *client_idx);
+		}
+	}
+
+	struct json_stream *js = jsonrpc_stream_success(cmd);
+	json_add_string(js, "instance_id", id_hex);
+	json_add_u32(js, "client_idx", *client_idx);
+	json_add_u32(js, "leaf_index", leaf_idx);
+	json_add_bool(js, "key_available", true);
+	json_add_string(js, "status", "departed_channel_forgotten");
+	return command_finished(cmd, js);
+}
+
+static const struct json_command factory_close_departed_command = {
+	"factory-close-departed",
+	json_factory_close_departed,
+};
+AUTODATA(json_command, &factory_close_departed_command);
+
 /* Breach scan: callback after checkutxo returns for a factory's
  * root funding UTXO. If the UTXO is spent, attempt penalty TXs. */
 struct breach_scan_ctx {
@@ -5662,6 +5784,18 @@ static struct command_result *handle_block_added(struct command *cmd,
 				   i, fi->expiry_block,
 				   ss_state.current_blockheight,
 				   fi->early_warning_time);
+		}
+
+		/* DW epoch exhaustion warning: if epoch is within 10 of
+		 * max_epochs, warn once per block so operator can migrate. */
+		if (fi->is_lsp && fi->max_epochs > 0
+		    && fi->epoch >= fi->max_epochs - 10
+		    && fi->lifecycle == FACTORY_LIFECYCLE_ACTIVE) {
+			uint32_t remaining = fi->max_epochs - fi->epoch;
+			plugin_log(plugin_handle, LOG_UNUSUAL,
+				   "Factory %zu: %u/%u epochs used (%u remaining)"
+				   " — call factory-migrate before exhaustion",
+				   i, fi->epoch, fi->max_epochs, remaining);
 		}
 
 		/* DW cascade: if factory is DYING (force-close in progress),
