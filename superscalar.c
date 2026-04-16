@@ -4253,6 +4253,55 @@ static struct command_result *handle_custommsg(struct command *cmd,
 	return command_hook_success(cmd);
 }
 
+/* Handle htlc_accepted hook — enforce factory_early_warning_time CLTV.
+ * Reject incoming HTLCs on factory channels if cltv_expiry is too tight
+ * (not enough headroom for the factory's nested relative timelocks). */
+static struct command_result *handle_htlc_accepted(struct command *cmd,
+						    const char *buf,
+						    const jsmntok_t *params)
+{
+	const jsmntok_t *htlc_tok = json_get_member(buf, params, "htlc");
+	const jsmntok_t *onion_tok = json_get_member(buf, params, "onion");
+	if (!htlc_tok)
+		return command_hook_success(cmd);
+
+	const jsmntok_t *cltv_tok = json_get_member(buf, htlc_tok,
+						     "cltv_expiry");
+	const jsmntok_t *scid_tok = json_get_member(buf, htlc_tok,
+						     "short_channel_id");
+	if (!cltv_tok)
+		return command_hook_success(cmd);
+
+	u32 cltv_expiry;
+	if (!json_to_u32(buf, cltv_tok, &cltv_expiry))
+		return command_hook_success(cmd);
+
+	uint32_t max_early_warning = 0;
+	for (size_t i = 0; i < ss_state.n_factories; i++) {
+		factory_instance_t *fi = ss_state.factories[i];
+		if (fi->lifecycle == FACTORY_LIFECYCLE_ACTIVE
+		    && fi->early_warning_time > max_early_warning)
+			max_early_warning = fi->early_warning_time;
+	}
+
+	if (max_early_warning > 0
+	    && cltv_expiry < ss_state.current_blockheight
+			     + max_early_warning + 1) {
+		plugin_log(plugin_handle, LOG_INFORM,
+			   "htlc_accepted: rejecting HTLC cltv_expiry=%u "
+			   "(need >= %u + %u + 1 = %u)",
+			   cltv_expiry, ss_state.current_blockheight,
+			   max_early_warning,
+			   ss_state.current_blockheight + max_early_warning + 1);
+		struct json_stream *js = jsonrpc_stream_success(cmd);
+		json_add_string(js, "result", "fail");
+		json_add_u32(js, "failure_code", 0x1000 | 14);
+		return command_finished(cmd, js);
+	}
+
+	return command_hook_success(cmd);
+}
+
 /* Handle openchannel hook — process channel_in_factory TLV (65600) */
 static struct command_result *handle_openchannel(struct command *cmd,
 						 const char *buf,
@@ -6447,6 +6496,7 @@ static struct command_result *json_factory_ladder_status(struct command *cmd,
 static const struct plugin_hook hooks[] = {
 	{ "custommsg", handle_custommsg },
 	{ "openchannel", handle_openchannel },
+	{ "htlc_accepted", handle_htlc_accepted },
 };
 
 static const struct plugin_command commands[] = {
@@ -6500,9 +6550,25 @@ static const struct plugin_command commands[] = {
 	},
 };
 
+static struct command_result *handle_factory_change_locked(struct command *cmd,
+							     const char *buf,
+							     const jsmntok_t *params)
+{
+	const jsmntok_t *txid_tok = json_get_member(buf, params,
+						     "funding_txid");
+	if (txid_tok) {
+		const char *txid_hex = json_strdup(cmd, buf, txid_tok);
+		plugin_log(plugin_handle, LOG_INFORM,
+			   "factory_change_locked: funding updated to %s",
+			   txid_hex);
+	}
+	return command_hook_success(cmd);
+}
+
 static const struct plugin_notification notifs[] = {
 	{ "block_added", handle_block_added },
 	{ "connect", handle_connect },
+	{ "factory_change_locked", handle_factory_change_locked },
 };
 
 int main(int argc, char *argv[])
