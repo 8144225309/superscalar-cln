@@ -983,6 +983,7 @@ static void ss_load_factories(struct command *cmd)
 						n_total = 2;
 					else
 						n_total = 0;
+					if (n_total == 0) goto skip_rebuild;
 					secp256k1_pubkey *pks = calloc(
 						n_total, sizeof(secp256k1_pubkey));
 					bool ok = pks != NULL;
@@ -1121,6 +1122,7 @@ static void ss_load_factories(struct command *cmd)
 					}
 					free(pks);
 				}
+				skip_rebuild:
 
 				p += 32; rem -= 32;
 			}
