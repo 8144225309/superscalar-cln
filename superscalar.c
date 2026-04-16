@@ -6552,25 +6552,9 @@ static const struct plugin_command commands[] = {
 	},
 };
 
-static struct command_result *handle_factory_change_locked(struct command *cmd,
-							     const char *buf,
-							     const jsmntok_t *params)
-{
-	const jsmntok_t *txid_tok = json_get_member(buf, params,
-						     "funding_txid");
-	if (txid_tok) {
-		const char *txid_hex = json_strdup(cmd, buf, txid_tok);
-		plugin_log(plugin_handle, LOG_INFORM,
-			   "factory_change_locked: funding updated to %s",
-			   txid_hex);
-	}
-	return command_hook_success(cmd);
-}
-
 static const struct plugin_notification notifs[] = {
 	{ "block_added", handle_block_added },
 	{ "connect", handle_connect },
-	{ "factory_change_locked", handle_factory_change_locked },
 };
 
 int main(int argc, char *argv[])
