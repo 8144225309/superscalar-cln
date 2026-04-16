@@ -1424,6 +1424,10 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 			fi->is_lsp = false;
 			fi->n_clients = nb->n_participants > 1
 				? nb->n_participants - 1 : 0;
+			fi->funding_amount_sats = propose_funding_sats;
+			fi->creation_block = ss_state.current_blockheight;
+			fi->expiry_block = ss_state.current_blockheight + 4320 + 432;
+			fi->n_tree_nodes = nb->n_nodes > 0 ? nb->n_nodes : 2;
 
 			/* Store LSP peer_id as node_id */
 			if (strlen(peer_id) == 66) {
@@ -1432,6 +1436,14 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 					sscanf(peer_id + j*2, "%02x", &b);
 					fi->lsp_node_id[j] = (uint8_t)b;
 				}
+			}
+
+			/* Store LSP factory pubkey (slot 0) for
+			 * tree rebuild after restart */
+			if (nb->n_participants > 0 && nb->pubkeys[0][0] != 0) {
+				fi->clients[0].has_factory_pubkey = true;
+				memcpy(fi->clients[0].factory_pubkey,
+				       nb->pubkeys[0], 33);
 			}
 
 			/* Use pubkeys from the bundle (same as LSP's) */
