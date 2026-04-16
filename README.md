@@ -6,25 +6,33 @@ This plugin enables a Core Lightning node to participate in [SuperScalar](https:
 
 ## Requirements
 
-- [Core Lightning (bLIP-56 fork)](https://github.com/8144225309/lightning/tree/blip-56) — the `blip-56` branch with minimal channel-management changes for factory support (no new wire types, TLVs, or feature bits)
+- [Core Lightning (bLIP-56 fork)](https://github.com/8144225309/lightning/tree/blip-56) — the `blip-56` branch with TLV 65600, feature bit 270/271, STFU-gated factory-change, and batch commitment_signed support
 - Bitcoin Core 28+
-- `libsuperscalar_core.a` (static library from the [SuperScalar](https://github.com/8144225309/SuperScalar) build)
-- `libsecp256k1` with extrakeys module
+- [SuperScalar](https://github.com/8144225309/SuperScalar) built from source (`cmake -B build && cmake --build build`)
+- Both SuperScalar and CLN's wally must pin the same secp256k1-zkp commit (see `build-plugin.sh` for details)
 
 ## Building
 
-The plugin builds inside the CLN source tree:
+Use the included build script:
 
 ```bash
-# Clone CLN with bLIP-56 support
+# 1. Build CLN (bLIP-56 fork) with musig module enabled
 git clone --branch blip-56 https://github.com/8144225309/lightning.git cln-blip56
 cd cln-blip56
+sed -i 's/\[--enable-module-ecdsa-s2c\]/[--enable-module-ecdsa-s2c], [--enable-module-musig]/' \
+  external/libwally-core/configure.ac
 ./configure && make -j$(nproc)
 
-# Copy plugin source and build
-cp /path/to/superscalar-cln/superscalar.c plugins/
-make plugins/superscalar
+# 2. Build SuperScalar library
+git clone https://github.com/8144225309/SuperScalar.git
+cd SuperScalar && cmake -B build && cmake --build build
+
+# 3. Build the plugin
+cd /path/to/superscalar-cln
+CLN_DIR=/path/to/cln-blip56 SS_DIR=/path/to/SuperScalar ./build-plugin.sh
 ```
+
+See [`build-plugin.sh`](build-plugin.sh) for full build details including the slim library extraction and symbol rename steps.
 
 ## Running
 
@@ -32,90 +40,104 @@ make plugins/superscalar
 lightningd --plugin=/path/to/cln-blip56/plugins/superscalar
 ```
 
-The plugin registers CLN hooks (`custommsg`, `openchannel`, `block_added`, `connect`) for factory protocol handling and zero-conf channel acceptance.
+The plugin registers CLN hooks (`custommsg`, `openchannel`, `htlc_accepted`, `block_added`, `connect`) for factory protocol handling, zero-conf channel acceptance, and HTLC safety enforcement.
 
 ## RPC Methods
 
-The plugin exposes seven JSON-RPC methods through CLN's standard interface:
-
 | Method | Parameters | Description |
 |--------|-----------|-------------|
-| `factory-create` | `funding_sats`, `clients` (array of node IDs) | Create a new factory: builds DW tree, generates MuSig2 nonces, sends `FACTORY_PROPOSE` to all clients |
+| `factory-create` | `funding_sats`, `clients[]`, `[allocations[]]` | Create a new factory: builds DW tree, generates MuSig2 nonces, sends `FACTORY_PROPOSE` to all clients. Optional `allocations` array specifies per-client sat amounts. |
 | `factory-list` | (none) | List all factories with full status (see response schema below) |
-| `factory-rotate` | `instance_id` | Advance the Decker-Wattenhofer epoch: rebuilds tree transactions with new nonces, sends `ROTATE_PROPOSE` |
+| `factory-rotate` | `instance_id` | Advance the Decker-Wattenhofer epoch: STFU quiescence, re-sign tree, send `ROTATE_PROPOSE`, trigger `factory-change` on channels |
 | `factory-close` | `instance_id` | Initiate cooperative close: computes distribution outputs, sends `CLOSE_PROPOSE` |
-| `factory-force-close` | `instance_id` | Broadcast all signed DW tree transactions for unilateral exit, force-closes associated LN channels |
-| `factory-check-breach` | `instance_id`, `txid`, `vout`, `amount_sats`, `epoch` | Build and broadcast a penalty/burn transaction for a detected breach (old-epoch state on-chain) |
+| `factory-force-close` | `instance_id` | Broadcast all signed DW tree transactions for unilateral exit |
+| `factory-check-breach` | `instance_id`, `txid`, `vout`, `amount_sats`, `epoch` | Build and broadcast a penalty transaction for a detected breach |
 | `factory-open-channels` | `instance_id` | Open Lightning channels inside the factory via `fundchannel_start`/`fundchannel_complete` with factory funding override |
+| `factory-forget-channel` | `id`, `channel_id` | Drop a factory channel from CLN without broadcasting a commitment transaction |
+| `factory-close-departed` | `instance_id`, `client_idx` | Close a departed client's channel using their extracted key (after key turnover) |
+| `factory-migrate` | `instance_id` | Initiate key turnover for all clients, preparing to move channels to a new factory |
+| `factory-migrate-complete` | `instance_id`, `[new_funding_sats]` | Finalize migration after all cooperative clients have departed |
+| `factory-buy-liquidity` | `instance_id`, `client_idx`, `amount_sats` | Rebalance L-stock to client on a leaf (requires re-signing) |
 
 ### `factory-list` Response Schema
 
 ```json
 {
   "factories": [{
-    "instance_id": "hex",       // 32-byte factory identifier
-    "is_lsp": true,             // whether this node is the LSP
-    "n_clients": 3,             // number of client participants
-    "epoch": 0,                 // current DW epoch (increments on rotation)
-    "n_channels": 3,            // number of open LN channels in factory
-    "lifecycle": "active",      // init | active | dying | expired
-    "ceremony": "complete",     // idle | proposed | nonces_collected | psigs_collected | complete | rotating | rotate_complete | revoked | failed
-    "max_epochs": 256,          // total DW states before factory exhaustion
-    "creation_block": 14195,    // block height when factory was created
-    "expiry_block": 18515,      // absolute block height of factory CLTV timeout
+    "instance_id": "hex",
+    "is_lsp": true,
+    "n_clients": 3,
+    "epoch": 0,
+    "n_channels": 3,
+    "lifecycle": "active",
+    "ceremony": "complete",
+    "max_epochs": 16,
+    "epochs_remaining": 16,
+    "early_warning_time": 2202,
+    "creation_block": 300000,
+    "expiry_block": 304320,
     "rotation_in_progress": false,
-    "n_breach_epochs": 0,       // number of stored breach/revocation records
-    "dist_tx_status": "signed", // none | unsigned | signed | unknown
-    "tree_nodes": 6,            // total nodes in DW tree (persisted across restarts)
-    "funding_txid": "hex",      // factory-level synthetic funding UTXO
+    "n_breach_epochs": 0,
+    "dist_tx_status": "signed",
+    "tree_nodes": 2,
+    "funding_txid": "hex",
     "funding_outnum": 0,
     "channels": [{
-      "channel_id": "hex",      // CLN channel_id
-      "leaf_index": 3,          // DW tree node index for this channel's leaf
-      "leaf_side": 0,           // output index within the leaf (for arity-2 shared leaves)
-      "funding_txid": "hex",    // real DW leaf node txid (the on-chain enforceable outpoint)
-      "funding_outnum": 0       // output index on the leaf transaction
+      "channel_id": "hex",
+      "leaf_index": 1,
+      "leaf_side": 0,
+      "funding_txid": "hex",
+      "funding_outnum": 0
     }]
   }]
 }
 ```
 
-The wallet can cross-reference `channels[].channel_id` against CLN's `listpeerchannels` to get per-channel spendable/receivable balances, connection state, and creation timestamps.
+Key fields:
+- `early_warning_time` — minimum CLTV headroom (in blocks) for HTLCs on this factory's channels. Derived from the DW tree depth. HTLCs with tighter timeouts are rejected by the `htlc_accepted` hook.
+- `epochs_remaining` — rotations left before DW exhaustion triggers migration.
 
 ## Architecture
 
 CLN handles channels. The plugin handles the factory.
 
 - **Inbound**: Factory protocol messages arrive from peers via the `custommsg` hook (ODD message type 33001) and are demultiplexed by submessage ID
-- **Outbound**: The plugin sends factory messages via `sendcustommsg` — no CLN wire protocol changes needed (ODD types pass through connectd by default)
+- **Outbound**: The plugin sends factory messages via `sendcustommsg` — no new BOLT peer wire message types needed
 - **Channel opening**: Factory channels are opened with `fundchannel_start`/`fundchannel_complete`, with `factory_funding_txid` override to reference the DW tree leaf outpoint
-- **State changes**: Factory rotation triggers `factory-change` RPC in the CLN fork, which updates the channel's funding outpoint internally
-- **Persistence**: Factory state is serialized to CLN's datastore under `superscalar/factories/{instance_id}/`
+- **State changes**: Factory rotation triggers STFU quiescence in channeld, then `factory-change` RPC updates the channel's funding outpoint with batch `commitment_signed` (signing against both old and new outpoints simultaneously)
+- **Persistence**: Factory state (metadata, channels, breach data, signed DW tree transactions) is serialized to CLN's datastore under `superscalar/factories/{instance_id}/`. Both LSP and client persist independently for trustless unilateral exit.
+- **Tree reconstruction**: On restart, factory trees are rebuilt from persisted metadata + participant pubkeys. Signed transactions are loaded from datastore so `factory-force-close` works immediately after restart.
+- **HTLC safety**: The `htlc_accepted` hook rejects incoming HTLCs whose CLTV timeout doesn't leave enough headroom for the factory's DW tree to fully unwind via force-close.
 
 ### Factory Creation Ceremony (MuSig2)
 
-Factory creation is a 3-round MuSig2 protocol between 1 LSP and N clients:
+Factory creation is a multi-round MuSig2 protocol between 1 LSP and N clients:
 
-1. **`FACTORY_PROPOSE`** (LSP -> Clients): LSP builds DW tree, generates nonces, sends nonce bundle
-2. **`NONCE_BUNDLE`** (Clients -> LSP): Clients build identical tree, generate their nonces, send back. In 2-party mode, clients also send partial signatures in the same round
-3. **`PSIG_BUNDLE`** (Clients -> LSP): LSP aggregates nonces and partial sigs into final Schnorr signatures, then co-signs the distribution TX and sends `FACTORY_READY`
+1. **`FACTORY_PROPOSE`** (LSP → Clients): LSP builds DW tree, generates nonces, sends nonce bundle
+2. **`NONCE_BUNDLE`** (Clients → LSP): Clients build identical tree, generate their nonces, send back
+3. **`ALL_NONCES`** (LSP → Clients): LSP aggregates all nonces, sends combined bundle so clients can finalize and create partial signatures
+4. **`PSIG_BUNDLE`** (Clients → LSP): Clients send partial signatures
+5. **`FACTORY_READY`** (LSP → Clients): LSP aggregates into final Schnorr signatures, co-signs distribution TX, ceremony complete
 
 ### Factory Lifecycle
 
-`INIT` -> `ACTIVE` -> `DYING` -> `EXPIRED`
+`INIT` → `ACTIVE` → `DYING` → `EXPIRED`
 
-Ceremony states: `IDLE` -> `PROPOSED` -> `NONCES_COLLECTED` -> `PSIGS_COLLECTED` -> `COMPLETE`
+Ceremony states: `IDLE` → `PROPOSED` → `NONCES_COLLECTED` → `PSIGS_COLLECTED` → `COMPLETE`
 
 ## Why the bLIP-56 Fork is Required
 
-This plugin depends on channel-management changes in the [bLIP-56 CLN fork](https://github.com/8144225309/lightning/tree/blip-56). The fork adds **zero new LN network messages** — factory protocol runs via ODD custommsg (type 33001).
+This plugin depends on channel-management changes in the [bLIP-56 CLN fork](https://github.com/8144225309/lightning/tree/blip-56).
 
 Fork changes needed by the plugin:
+- **Feature bit 270/271** (`pluggable_channel_factories`) — advertised in `init` for peer discovery
+- **TLV 65600** (`channel_in_factory`) on `open_channel`/`accept_channel` — carries factory protocol ID, instance ID, and early warning time
+- **`fundchannel_start` factory params** — `factory_protocol_id`, `factory_instance_id`, `factory_early_warning_time` populate TLV 65600
 - **`fundchannel_complete` override** — `factory_funding_txid` param to reference DW tree leaf outpoint
-- **`factory-change` RPC** — updates channel funding outpoint after factory rotation
-- **`fundchannel_complete` override** — `factory_funding_txid` param to reference DW tree leaf outpoint
-- **Zero-conf** — `openchannel` hook returns `mindepth=0` for factory peers; skip funding watch for virtual outpoints
+- **`factory-change` RPC** — STFU quiescence + batch `commitment_signed` for channel funding outpoint update after rotation
+- **`factory-forget-channel` RPC** — drop a channel without commitment broadcast
 - **`checkutxo` RPC** — UTXO status query for breach detection
+- **Zero-conf** — `openchannel` hook returns `mindepth=0` for factory peers; skip funding watch for virtual outpoints
 
 Without the fork, the plugin cannot open factory channels with virtual funding outpoints or update them after rotation.
 
