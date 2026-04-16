@@ -61,9 +61,38 @@ static ladder_t *ss_ladder;
 #define DEFAULT_FUNDING_SATS		500000	   /* Per-channel funding amount */
 #define DEFAULT_FACTORY_FUNDING_SATS	1000000	   /* Total factory funding */
 #define DW_STEP_BLOCKS			144	   /* Blocks between DW states (~1 day) */
+#define DW_STATES_PER_LAYER		16	   /* States per DW layer */
 #define DIST_TX_LOCKTIME_DAYS		90	   /* nLockTime for distribution TX */
 #define MAX_DIST_OUTPUTS		65	   /* Max outputs in distribution TX */
 #define MAX_WIRE_BUF			32768	   /* Wire message buffer size */
+
+/* Compute worst-case DW tree unwind time for HTLC safety.
+ * This is the minimum early_warning_time: if an HTLC times out in
+ * fewer blocks than this, we can't force-close the factory in time
+ * to enforce it on-chain.
+ *
+ * Formula: n_layers * step_blocks * (states_per_layer - 1)
+ *          + n_layers * 6 (confirmation buffer per layer)
+ *          + 36 (flat safety margin ~6 hours) */
+static uint16_t compute_early_warning_time(size_t n_clients)
+{
+	/* DW tree depth: arity-1 for 2 participants, arity-2 for 3+ */
+	size_t n_layers;
+	if (n_clients <= 1)
+		n_layers = 1;
+	else {
+		/* ceil(log2(ceil(n_clients/2))) + 1 for arity-2 */
+		size_t leaves = (n_clients + 1) / 2;
+		n_layers = 1;
+		while ((1u << n_layers) < leaves)
+			n_layers++;
+		n_layers++; /* +1 for the root→state transition */
+	}
+	uint32_t total = n_layers * DW_STEP_BLOCKS * (DW_STATES_PER_LAYER - 1)
+		       + n_layers * 6 + 36;
+	if (total > 65535) total = 65535;
+	return (uint16_t)total;
+}
 
 /* SuperScalar protocol ID: first 32 bytes of "SuperScalar/v1" zero-padded */
 static const uint8_t SUPERSCALAR_PROTOCOL_ID[32] = {
@@ -638,7 +667,10 @@ static void open_factory_channels(struct command *cmd,
 		json_add_u32(req->js, "mindepth", 0);
 		json_add_string(req->js, "factory_protocol_id", proto_hex);
 		json_add_string(req->js, "factory_instance_id", inst_hex);
-		json_add_u64(req->js, "factory_early_warning_time", 6);
+		json_add_u64(req->js, "factory_early_warning_time",
+			     fi->early_warning_time > 0
+			     ? fi->early_warning_time
+			     : compute_early_warning_time(fi->n_clients));
 		send_outreq(req);
 
 		plugin_log(plugin_handle, LOG_INFORM,
@@ -1111,11 +1143,19 @@ static void ss_load_factories(struct command *cmd)
 							}
 							}
 
+							/* Fix early_warning_time
+							 * for old factories */
+							if (fi->early_warning_time == 0)
+								fi->early_warning_time =
+									compute_early_warning_time(
+										n_total > 1
+										? n_total - 1 : 1);
 							plugin_log(plugin_handle,
 								LOG_INFORM,
 								"Rebuilt factory tree "
-								"(%zu nodes)",
-								f->n_nodes);
+								"(%zu nodes, ewt=%u)",
+								f->n_nodes,
+								fi->early_warning_time);
 						} else {
 							free(f);
 						}
@@ -1428,6 +1468,8 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 			fi->creation_block = ss_state.current_blockheight;
 			fi->expiry_block = ss_state.current_blockheight + 4320 + 432;
 			fi->n_tree_nodes = nb->n_nodes > 0 ? nb->n_nodes : 2;
+			fi->early_warning_time = compute_early_warning_time(
+				fi->n_clients);
 
 			/* Store LSP peer_id as node_id */
 			if (strlen(peer_id) == 66) {
@@ -4800,6 +4842,12 @@ static struct command_result *json_factory_create(struct command *cmd,
 			? factory->cltv_timeout
 			: ss_state.current_blockheight + 4320; /* ~30 days */
 
+		/* Compute HTLC safety parameter from DW tree depth.
+		 * This is the minimum time needed to force-close the
+		 * factory before an HTLC times out. */
+		fi->early_warning_time = compute_early_warning_time(
+			fi->n_clients);
+
 		/* Initialize signing sessions */
 		rc = factory_sessions_init(factory);
 		if (rc == 0) {
@@ -5081,6 +5129,7 @@ static struct command_result *json_factory_list(struct command *cmd,
 				? fi->max_epochs - fi->epoch : 0);
 		json_add_u32(js, "creation_block", fi->creation_block);
 		json_add_u32(js, "expiry_block", fi->expiry_block);
+		json_add_u32(js, "early_warning_time", fi->early_warning_time);
 		json_add_bool(js, "rotation_in_progress",
 			fi->rotation_in_progress);
 		json_add_u32(js, "n_breach_epochs", fi->n_breach_epochs);
