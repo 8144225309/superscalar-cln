@@ -962,9 +962,14 @@ static void ss_load_factories(struct command *cmd)
 
 				/* Rebuild factory_t from persisted data so
 				 * rotation/force-close work after restart. */
-				if (fi->n_clients > 0
-				    && !fi->lib_factory) {
-					size_t n_total = 1 + fi->n_clients;
+				if (!fi->lib_factory) {
+					size_t n_total;
+					if (fi->n_clients > 0)
+						n_total = 1 + fi->n_clients;
+					else if (fi->n_tree_nodes == 2)
+						n_total = 2;
+					else
+						n_total = 0;
 					secp256k1_pubkey *pks = calloc(
 						n_total, sizeof(secp256k1_pubkey));
 					bool ok = pks != NULL;
@@ -980,26 +985,45 @@ static void ss_load_factories(struct command *cmd)
 							     : fi->our_participant_idx],
 							sk) != 0;
 					}
-					for (size_t ci = 0; ci < fi->n_clients
-					     && ok; ci++) {
-						int slot = fi->is_lsp
-							? (int)(ci + 1) : 0;
-						if (fi->clients[ci].has_factory_pubkey) {
+					if (fi->n_clients > 0) {
+						for (size_t ci = 0; ci < fi->n_clients
+						     && ok; ci++) {
+							int slot = fi->is_lsp
+								? (int)(ci + 1) : 0;
+							if (fi->clients[ci].has_factory_pubkey) {
+								ok = secp256k1_ec_pubkey_parse(
+									global_secp_ctx,
+									&pks[slot],
+									fi->clients[ci].factory_pubkey,
+									33) != 0;
+							} else {
+								unsigned char psk[32];
+								derive_placeholder_seckey(
+									psk,
+									fi->instance_id,
+									slot);
+								ok = secp256k1_ec_pubkey_create(
+									global_secp_ctx,
+									&pks[slot],
+									psk) != 0;
+							}
+						}
+					} else if (!fi->is_lsp && n_total == 2) {
+						/* Client: fill LSP slot (0) from
+						 * lsp_node_id or placeholder */
+						if (fi->lsp_node_id[0] != 0) {
 							ok = secp256k1_ec_pubkey_parse(
 								global_secp_ctx,
-								&pks[slot],
-								fi->clients[ci].factory_pubkey,
+								&pks[0],
+								fi->lsp_node_id,
 								33) != 0;
 						} else {
 							unsigned char psk[32];
 							derive_placeholder_seckey(
-								psk,
-								fi->instance_id,
-								slot);
+								psk, fi->instance_id, 0);
 							ok = secp256k1_ec_pubkey_create(
 								global_secp_ctx,
-								&pks[slot],
-								psk) != 0;
+								&pks[0], psk) != 0;
 						}
 					}
 					if (ok) {
