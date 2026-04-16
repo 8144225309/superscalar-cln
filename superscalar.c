@@ -5652,11 +5652,7 @@ static struct command_result *json_factory_close_departed(struct command *cmd,
 	return command_finished(cmd, js);
 }
 
-static const struct json_command factory_close_departed_command = {
-	"factory-close-departed",
-	json_factory_close_departed,
-};
-AUTODATA(json_command, &factory_close_departed_command);
+/* factory-close-departed registered in commands[] array below */
 
 /* Breach scan: callback after checkutxo returns for a factory's
  * root funding UTXO. If the UTXO is spent, attempt penalty TXs. */
@@ -6760,6 +6756,10 @@ static const struct plugin_command commands[] = {
 	{
 		"factory-migrate-complete",
 		json_factory_migrate_complete,
+	},
+	{
+		"factory-close-departed",
+		json_factory_close_departed,
 	},
 };
 
