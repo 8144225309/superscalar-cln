@@ -1354,6 +1354,8 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 				break;
 			}
 			fi->is_lsp = false;
+			fi->n_clients = nb->n_participants > 1
+				? nb->n_participants - 1 : 0;
 
 			/* Store LSP peer_id as node_id */
 			if (strlen(peer_id) == 66) {
