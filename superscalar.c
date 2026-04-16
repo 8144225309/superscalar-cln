@@ -4261,7 +4261,6 @@ static struct command_result *handle_htlc_accepted(struct command *cmd,
 						    const jsmntok_t *params)
 {
 	const jsmntok_t *htlc_tok = json_get_member(buf, params, "htlc");
-	const jsmntok_t *onion_tok = json_get_member(buf, params, "onion");
 	if (!htlc_tok)
 		return command_hook_success(cmd);
 
