@@ -960,6 +960,87 @@ static void ss_load_factories(struct command *cmd)
 					   fi->n_channels, fi->n_breach_epochs,
 					   fi->lifecycle);
 
+				/* Rebuild factory_t from persisted data so
+				 * rotation/force-close work after restart. */
+				if (fi->funding_spk_len > 0
+				    && fi->n_clients > 0
+				    && !fi->lib_factory) {
+					size_t n_total = 1 + fi->n_clients;
+					secp256k1_pubkey *pks = calloc(
+						n_total, sizeof(secp256k1_pubkey));
+					bool ok = pks != NULL;
+					if (ok) {
+						unsigned char sk[32];
+						derive_factory_seckey(sk,
+							fi->instance_id,
+							fi->is_lsp ? 0
+							: fi->our_participant_idx);
+						ok = secp256k1_ec_pubkey_create(
+							global_secp_ctx,
+							&pks[fi->is_lsp ? 0
+							     : fi->our_participant_idx],
+							sk) != 0;
+					}
+					for (size_t ci = 0; ci < fi->n_clients
+					     && ok; ci++) {
+						int slot = fi->is_lsp
+							? (int)(ci + 1) : 0;
+						if (fi->clients[ci].has_factory_pubkey) {
+							ok = secp256k1_ec_pubkey_parse(
+								global_secp_ctx,
+								&pks[slot],
+								fi->clients[ci].factory_pubkey,
+								33) != 0;
+						} else {
+							unsigned char psk[32];
+							derive_placeholder_seckey(
+								psk,
+								fi->instance_id,
+								slot);
+							ok = secp256k1_ec_pubkey_create(
+								global_secp_ctx,
+								&pks[slot],
+								psk) != 0;
+						}
+					}
+					if (ok) {
+						factory_t *f = calloc(1,
+							sizeof(factory_t));
+						factory_init_from_pubkeys(f,
+							global_secp_ctx,
+							pks, n_total,
+							DW_STEP_BLOCKS, 16);
+						factory_set_arity(f,
+							n_total <= 2
+							? FACTORY_ARITY_1
+							: FACTORY_ARITY_2);
+						factory_set_funding(f,
+							fi->funding_txid,
+							fi->funding_outnum,
+							fi->funding_amount_sats,
+							fi->funding_spk,
+							fi->funding_spk_len);
+						factory_set_lifecycle(f,
+							fi->creation_block,
+							4320, 432);
+						if (factory_build_tree(f)) {
+							apply_allocations_to_leaves(
+								fi, f, n_total);
+							fi->lib_factory = f;
+							fi->n_tree_nodes =
+								(uint32_t)f->n_nodes;
+							plugin_log(plugin_handle,
+								LOG_INFORM,
+								"Rebuilt factory tree "
+								"(%zu nodes)",
+								f->n_nodes);
+						} else {
+							free(f);
+						}
+					}
+					free(pks);
+				}
+
 				p += 32; rem -= 32;
 			}
 		}

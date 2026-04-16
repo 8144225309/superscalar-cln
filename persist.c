@@ -75,8 +75,8 @@ size_t ss_persist_serialize_meta(const factory_instance_t *fi, uint8_t **out)
 	uint8_t *buf = NULL;
 	size_t len = 0, cap = 0;
 
-	/* Version byte (3 adds funding_amount/spk) */
-	buf_u8(&buf, &len, &cap, 3);
+	/* Version byte (4 adds factory_pubkeys, allocations, departure) */
+	buf_u8(&buf, &len, &cap, 4);
 
 	/* Identity */
 	buf_append(&buf, &len, &cap, fi->instance_id, 32);
@@ -123,6 +123,39 @@ size_t ss_persist_serialize_meta(const factory_instance_t *fi, uint8_t **out)
 	if (fi->funding_spk_len > 0)
 		buf_append(&buf, &len, &cap, fi->funding_spk, fi->funding_spk_len);
 
+	/* v4: client factory pubkeys */
+	for (size_t i = 0; i < fi->n_clients; i++) {
+		buf_u8(&buf, &len, &cap,
+		       fi->clients[i].has_factory_pubkey ? 1 : 0);
+		if (fi->clients[i].has_factory_pubkey)
+			buf_append(&buf, &len, &cap,
+				   fi->clients[i].factory_pubkey, 33);
+	}
+
+	/* v4: allocations */
+	buf_u8(&buf, &len, &cap, fi->n_allocations);
+	for (uint8_t i = 0; i < fi->n_allocations; i++) {
+		uint64_t a = fi->allocations[i];
+		uint8_t ab[8] = { (a>>56)&0xFF, (a>>48)&0xFF,
+				   (a>>40)&0xFF, (a>>32)&0xFF,
+				   (a>>24)&0xFF, (a>>16)&0xFF,
+				   (a>>8)&0xFF, a&0xFF };
+		buf_append(&buf, &len, &cap, ab, 8);
+	}
+
+	/* v4: departure state */
+	buf_u16(&buf, &len, &cap, fi->n_departed);
+	for (size_t i = 0; i < fi->n_clients; i++) {
+		buf_u8(&buf, &len, &cap,
+		       fi->client_departed[i] ? 1 : 0);
+		if (fi->client_departed[i])
+			buf_append(&buf, &len, &cap,
+				   fi->extracted_keys[i], 32);
+	}
+
+	/* v4: our participant index */
+	buf_u8(&buf, &len, &cap, (uint8_t)fi->our_participant_idx);
+
 	*out = buf;
 	return len;
 }
@@ -136,7 +169,7 @@ bool ss_persist_deserialize_meta(factory_instance_t *fi,
 	uint8_t version, tmp8;
 	uint16_t tmp16;
 
-	if (!read_u8(&p, &rem, &version) || version < 1 || version > 3)
+	if (!read_u8(&p, &rem, &version) || version < 1 || version > 4)
 		return false;
 
 	if (!read_bytes(&p, &rem, fi->instance_id, 32)) return false;
@@ -195,6 +228,48 @@ bool ss_persist_deserialize_meta(factory_instance_t *fi,
 			if (!read_bytes(&p, &rem, fi->funding_spk, spk_len))
 				return false;
 		}
+	}
+
+	/* v4 fields: client pubkeys, allocations, departure */
+	if (version >= 4) {
+		for (size_t i = 0; i < fi->n_clients; i++) {
+			uint8_t has_pk;
+			if (!read_u8(&p, &rem, &has_pk)) return false;
+			fi->clients[i].has_factory_pubkey = (has_pk != 0);
+			if (has_pk) {
+				if (!read_bytes(&p, &rem,
+						fi->clients[i].factory_pubkey, 33))
+					return false;
+			}
+		}
+		uint8_t n_alloc;
+		if (!read_u8(&p, &rem, &n_alloc)) return false;
+		fi->n_allocations = n_alloc;
+		for (uint8_t i = 0; i < n_alloc; i++) {
+			uint8_t ab[8];
+			if (!read_bytes(&p, &rem, ab, 8)) return false;
+			fi->allocations[i] =
+				((uint64_t)ab[0]<<56) | ((uint64_t)ab[1]<<48) |
+				((uint64_t)ab[2]<<40) | ((uint64_t)ab[3]<<32) |
+				((uint64_t)ab[4]<<24) | ((uint64_t)ab[5]<<16) |
+				((uint64_t)ab[6]<<8) | ab[7];
+		}
+		uint16_t n_dep;
+		if (!read_u16(&p, &rem, &n_dep)) return false;
+		fi->n_departed = n_dep;
+		for (size_t i = 0; i < fi->n_clients; i++) {
+			uint8_t dep;
+			if (!read_u8(&p, &rem, &dep)) return false;
+			fi->client_departed[i] = (dep != 0);
+			if (dep) {
+				if (!read_bytes(&p, &rem,
+						fi->extracted_keys[i], 32))
+					return false;
+			}
+		}
+		uint8_t pidx;
+		if (!read_u8(&p, &rem, &pidx)) return false;
+		fi->our_participant_idx = (int)pidx;
 	}
 
 	return true;
