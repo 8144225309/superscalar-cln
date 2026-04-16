@@ -6055,11 +6055,7 @@ static const char *init(struct command *init_cmd,
 
 	ss_state_init(&ss_state);
 
-	/* Use secp256k1-zkp's context (renamed to avoid clash with CLN's
-	 * secp256k1). The musig module requires the ZKP version's context
-	 * struct layout, not CLN's wally-bundled secp256k1. */
-	extern secp256k1_context *ss_secp256k1_context_create(unsigned int flags);
-	global_secp_ctx = ss_secp256k1_context_create(
+	global_secp_ctx = secp256k1_context_create(
 		SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
 
 	/* Fetch current blockheight and our node_id from lightningd */
