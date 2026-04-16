@@ -1083,26 +1083,32 @@ static void ss_load_factories(struct command *cmd)
 								(uint32_t)f->n_nodes;
 							/* Load signed TXs from
 							 * datastore if available */
+							{
 							char stx_key[128];
 							ss_persist_key_signed_txs(
 								fi, stx_key,
 								sizeof(stx_key));
-							uint8_t *stx_data = NULL;
-							size_t stx_len = 0;
-							stx_data = rpc_scan_datastore_hex(
-								cmd, stx_key,
-								&stx_len);
-							if (stx_data && stx_len > 0) {
-								ss_persist_deserialize_signed_txs(
-									f, stx_data,
-									stx_len);
+							u8 *stx_data = NULL;
+							const char *stx_err;
+							stx_err = rpc_scan_datastore_hex(
+								tmpctx, cmd, stx_key,
+								JSON_SCAN_TAL(tmpctx,
+									json_tok_bin_from_hex,
+									&stx_data));
+							if (!stx_err && stx_data) {
+								size_t stx_len =
+									tal_bytelen(stx_data);
+								if (stx_len > 0)
+									ss_persist_deserialize_signed_txs(
+										f, stx_data,
+										stx_len);
 								plugin_log(plugin_handle,
 									LOG_INFORM,
 									"Loaded signed "
-									"TXs for factory");
+									"TXs (%zu bytes)",
+									stx_len);
 							}
-							if (stx_data)
-								tal_free(stx_data);
+							}
 
 							plugin_log(plugin_handle,
 								LOG_INFORM,
