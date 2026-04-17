@@ -888,6 +888,18 @@ static void ss_save_factory(struct command *cmd, factory_instance_t *fi)
 		}
 	}
 
+	/* Save signed distribution TX (inverted timeout default).
+	 * After expiry, this TX gives clients their funds without LSP. */
+	if (fi->dist_signed_tx && fi->dist_signed_tx_len > 0) {
+		ss_persist_key_dist_tx(fi, key, sizeof(key));
+		len = ss_persist_serialize_dist_tx(fi, &buf);
+		if (len > 0 && buf) {
+			jsonrpc_set_datastore_binary(cmd, key, buf, len,
+				"create-or-replace", rpc_done, rpc_err, fi);
+			free(buf);
+		}
+	}
+
 	plugin_log(plugin_handle, LOG_DBG,
 		   "Persisted factory state (epoch=%u, channels=%zu)",
 		   fi->epoch, fi->n_channels);
@@ -1194,6 +1206,34 @@ static void ss_load_factories(struct command *cmd)
 					free(pks);
 				}
 				skip_rebuild:
+
+				/* Load signed distribution TX (inverted timeout
+				 * default) — survives restart for auto-broadcast
+				 * at expiry. */
+				{
+					char dtx_key[128];
+					ss_persist_key_dist_tx(fi, dtx_key,
+						sizeof(dtx_key));
+					u8 *dtx_data = NULL;
+					const char *dtx_err;
+					dtx_err = rpc_scan_datastore_hex(
+						tmpctx, cmd, dtx_key,
+						JSON_SCAN_TAL(tmpctx,
+							json_tok_bin_from_hex,
+							&dtx_data));
+					if (!dtx_err && dtx_data) {
+						size_t dtx_len =
+							tal_bytelen(dtx_data);
+						if (dtx_len > 0 &&
+						    ss_persist_deserialize_dist_tx(
+							fi, dtx_data, dtx_len))
+							plugin_log(plugin_handle,
+								LOG_INFORM,
+								"Loaded dist TX "
+								"(%zu bytes)",
+								fi->dist_signed_tx_len);
+					}
+				}
 
 				p += 32; rem -= 32;
 			}
@@ -5912,6 +5952,45 @@ static struct command_result *breach_utxo_checked(struct command *cmd,
 			}
 			tx_buf_free(&burn_tx);
 		}
+
+		/* Set factory to DYING so block_added will re-broadcast
+		 * our latest signed state TXs (DW cascade). The newest
+		 * state has the shortest timelock and will confirm first,
+		 * invalidating the attacker's old state. */
+		if (fi->lifecycle == FACTORY_LIFECYCLE_ACTIVE) {
+			fi->lifecycle = FACTORY_LIFECYCLE_DYING;
+			fi->rotation_in_progress = false;
+			plugin_log(plugin_handle, LOG_UNUSUAL,
+				   "BREACH RESPONSE: factory set to DYING — "
+				   "will cascade latest state TXs");
+		}
+
+		/* Immediately broadcast our latest signed tree TXs to
+		 * race the attacker's old state (shorter timelock wins). */
+		for (size_t ni = 0; ni < f->n_nodes; ni++) {
+			if (!f->nodes[ni].is_signed ||
+			    !f->nodes[ni].signed_tx.data ||
+			    f->nodes[ni].signed_tx.len == 0)
+				continue;
+
+			char *tx_hex = tal_arr(cmd, char,
+				f->nodes[ni].signed_tx.len * 2 + 1);
+			for (size_t h = 0; h < f->nodes[ni].signed_tx.len; h++)
+				sprintf(tx_hex + h*2, "%02x",
+					f->nodes[ni].signed_tx.data[h]);
+
+			plugin_log(plugin_handle, LOG_UNUSUAL,
+				   "BREACH RESPONSE: broadcasting latest "
+				   "state node %zu (%zu bytes)",
+				   ni, f->nodes[ni].signed_tx.len);
+
+			struct out_req *sreq = jsonrpc_request_start(
+				cmd, "sendrawtransaction",
+				rpc_done, rpc_err, fi);
+			json_add_string(sreq->js, "tx", tx_hex);
+			json_add_bool(sreq->js, "allowhighfees", true);
+			send_outreq(sreq);
+		}
 	}
 
 	return notification_handled(cmd);
@@ -5942,12 +6021,14 @@ static struct command_result *handle_block_added(struct command *cmd,
 			continue;
 
 		if (ss_factory_should_close(fi, ss_state.current_blockheight)) {
-			plugin_log(plugin_handle, LOG_UNUSUAL,
-				   "FACTORY EXPIRED: factory %zu expired at "
-				   "block %u (current: %u) — force-close needed",
-				   i, fi->expiry_block,
-				   ss_state.current_blockheight);
-			fi->lifecycle = FACTORY_LIFECYCLE_DYING;
+			if (fi->lifecycle == FACTORY_LIFECYCLE_ACTIVE) {
+				plugin_log(plugin_handle, LOG_UNUSUAL,
+					   "FACTORY EXPIRED: factory %zu expired "
+					   "at block %u (current: %u)",
+					   i, fi->expiry_block,
+					   ss_state.current_blockheight);
+				fi->lifecycle = FACTORY_LIFECYCLE_DYING;
+			}
 
 			/* Broadcast signed distribution TX (nLockTime fallback).
 			 * After expiry, this TX is valid and sends each client
@@ -6089,7 +6170,8 @@ static struct command_result *handle_block_added(struct command *cmd,
 				break;
 			}
 		}
-		if (has_real_funding && fi->n_breach_epochs > 0) {
+		if (has_real_funding && fi->n_breach_epochs > 0
+		    && fi->lifecycle == FACTORY_LIFECYCLE_ACTIVE) {
 			char ftxid_hex[65];
 			for (int j = 0; j < 32; j++)
 				sprintf(ftxid_hex + j*2, "%02x",
