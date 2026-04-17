@@ -5896,16 +5896,20 @@ static struct command_result *breach_utxo_checked(struct command *cmd,
 
 	if (!exists) {
 		/* Funding UTXO has been spent — potential breach.
-		 * Try building penalty TX for each revoked epoch. */
+		 * Could be: (a) our own force-close, (b) cooperative close,
+		 * or (c) an attacker broadcasting an old state.
+		 * Cases (a) and (b) set lifecycle to DYING/EXPIRED before
+		 * this callback fires, so we only reach here for (c). */
 		plugin_log(plugin_handle, LOG_UNUSUAL,
 			   "BREACH ALERT: factory %zu funding UTXO spent! "
-			   "Checking %zu revoked epochs...",
-			   bctx->factory_idx, fi->n_breach_epochs);
+			   "breach_epochs=%zu, is_lsp=%d",
+			   bctx->factory_idx, fi->n_breach_epochs,
+			   fi->is_lsp);
 
 		factory_t *f = (factory_t *)fi->lib_factory;
 		if (!f) {
 			plugin_log(plugin_handle, LOG_UNUSUAL,
-				   "Cannot build penalty: no lib_factory");
+				   "Cannot respond to breach: no lib_factory");
 			return notification_handled(cmd);
 		}
 
@@ -6161,8 +6165,11 @@ static struct command_result *handle_block_added(struct command *cmd,
 		}
 
 		/* Breach scan: check if factory's funding UTXO is still
-		 * unspent. Only for factories with real (non-zero) funding
-		 * and at least one revoked epoch. */
+		 * unspent. Run for any ACTIVE factory with real funding
+		 * that has been rotated (epoch > 0). Both LSP and client
+		 * need this — LSP uses DW timelock defense (cascade newer
+		 * state with shorter timelock), client additionally uses
+		 * penalty TXs via stored revocation secrets. */
 		bool has_real_funding = false;
 		for (int fb = 0; fb < 32; fb++) {
 			if (fi->funding_txid[fb] != 0) {
@@ -6170,7 +6177,7 @@ static struct command_result *handle_block_added(struct command *cmd,
 				break;
 			}
 		}
-		if (has_real_funding && fi->n_breach_epochs > 0
+		if (has_real_funding && fi->epoch > 0
 		    && fi->lifecycle == FACTORY_LIFECYCLE_ACTIVE) {
 			char ftxid_hex[65];
 			for (int j = 0; j < 32; j++)
