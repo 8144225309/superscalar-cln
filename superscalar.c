@@ -5481,14 +5481,11 @@ static struct command_result *json_factory_rotate(struct command *cmd,
 		   old_epoch, fi->epoch);
 
 	/* Rebuild all node transactions for new epoch.
-	 * TODO(CRITICAL): This re-signs kickoff (node 0), giving it a new
-	 * txid each epoch. State TXs reference the new kickoff txid.
-	 * Old-epoch state TXs reference the old kickoff txid. If an attacker
-	 * broadcasts an old kickoff, we can't respond because our current
-	 * state TX references the new kickoff txid.
-	 * FIX NEEDED: Keep kickoff txid stable across rotations by skipping
-	 * node 0 in the MuSig2 ceremony during rotation. Requires library
-	 * support for partial-tree signing (factory_sessions_init_range). */
+	 * The kickoff (node 0) is re-signed but its txid stays stable:
+	 * segwit txid = hash of non-witness data, and the kickoff's
+	 * non-witness data never changes (same funding input, same output
+	 * P2TR key, same nSequence=0xFFFFFFFF). All epoch state TXs
+	 * reference the same kickoff txid — DW timelock race works. */
 	for (size_t ni = 0; ni < factory->n_nodes; ni++) {
 		if (!factory_rebuild_node_tx(factory, ni)) {
 			plugin_log(plugin_handle, LOG_BROKEN,
