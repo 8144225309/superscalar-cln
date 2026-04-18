@@ -6140,6 +6140,72 @@ static struct command_result *breach_utxo_checked(struct command *cmd,
 						   const char *method,
 						   const char *buf,
 						   const jsmntok_t *result,
+						   void *arg);
+
+/* Launch a single-shot checkutxo scan on a factory's funding UTXO.
+ * Returns without sending if the factory has no real funding txid
+ * (pre-funding-pending factories) or hasn't rotated yet. Used both
+ * by the per-block handler and by ss_catchup_breach_scan at startup
+ * so a breach that happened while the plugin was offline is caught
+ * on the next block tick even if CLN doesn't replay block_added
+ * notifications for the missed interval. */
+static void ss_launch_breach_scan(struct command *cmd,
+				  factory_instance_t *fi,
+				  size_t factory_idx)
+{
+	bool has_real_funding = false;
+	for (int fb = 0; fb < 32; fb++) {
+		if (fi->funding_txid[fb] != 0) {
+			has_real_funding = true;
+			break;
+		}
+	}
+	if (!has_real_funding || fi->epoch == 0)
+		return;
+
+	char ftxid_hex[65];
+	for (int j = 0; j < 32; j++)
+		sprintf(ftxid_hex + j*2, "%02x", fi->funding_txid[31-j]);
+	ftxid_hex[64] = '\0';
+
+	struct breach_scan_ctx *bctx = tal(cmd, struct breach_scan_ctx);
+	bctx->fi = fi;
+	bctx->factory_idx = factory_idx;
+
+	struct out_req *req = jsonrpc_request_start(cmd,
+		"checkutxo", breach_utxo_checked, rpc_err, bctx);
+	json_add_string(req->js, "txid", ftxid_hex);
+	json_add_u32(req->js, "vout", fi->funding_outnum);
+	send_outreq(req);
+}
+
+/* One-shot breach scan across every loaded factory. Called from init
+ * right after ss_load_factories so we don't rely on block_added
+ * notifications covering the interval we were offline. */
+static void ss_catchup_breach_scan(struct command *cmd)
+{
+	size_t scanned = 0;
+	for (size_t i = 0; i < ss_state.n_factories; i++) {
+		factory_instance_t *fi = ss_state.factories[i];
+		if (!fi) continue;
+		if (fi->lifecycle != FACTORY_LIFECYCLE_ACTIVE &&
+		    fi->lifecycle != FACTORY_LIFECYCLE_DYING)
+			continue;
+		ss_launch_breach_scan(cmd, fi, i);
+		scanned++;
+	}
+	if (scanned > 0) {
+		plugin_log(plugin_handle, LOG_INFORM,
+			   "Startup catch-up: launched breach scan on %zu "
+			   "factor%s", scanned,
+			   scanned == 1 ? "y" : "ies");
+	}
+}
+
+static struct command_result *breach_utxo_checked(struct command *cmd,
+						   const char *method,
+						   const char *buf,
+						   const jsmntok_t *result,
 						   void *arg)
 {
 	struct breach_scan_ctx *bctx = (struct breach_scan_ctx *)arg;
@@ -6547,33 +6613,12 @@ static struct command_result *handle_block_added(struct command *cmd,
 		 * logs LOG_BROKEN if nothing could be built. Also intentionally
 		 * drops the FACTORY_LIFECYCLE_ACTIVE gate from PR #2's version
 		 * — DYING factories still need breach monitoring (the DW cascade
-		 * race isn't over just because we called force-close). */
-		bool has_real_funding = false;
-		for (int fb = 0; fb < 32; fb++) {
-			if (fi->funding_txid[fb] != 0) {
-				has_real_funding = true;
-				break;
-			}
-		}
-		if (has_real_funding && fi->epoch > 0) {
-			char ftxid_hex[65];
-			for (int j = 0; j < 32; j++)
-				sprintf(ftxid_hex + j*2, "%02x",
-					fi->funding_txid[31-j]);
-			ftxid_hex[64] = '\0';
-
-			struct breach_scan_ctx *bctx =
-				tal(cmd, struct breach_scan_ctx);
-			bctx->fi = fi;
-			bctx->factory_idx = i;
-
-			struct out_req *req = jsonrpc_request_start(cmd,
-				"checkutxo", breach_utxo_checked,
-				rpc_err, bctx);
-			json_add_string(req->js, "txid", ftxid_hex);
-			json_add_u32(req->js, "vout", fi->funding_outnum);
-			send_outreq(req);
-		}
+		 * race isn't over just because we called force-close).
+		 *
+		 * Extracted to ss_launch_breach_scan() in the catch-up commit
+		 * so the startup-scan path (ss_catchup_breach_scan) and the
+		 * per-block path share the same guards. */
+		ss_launch_breach_scan(cmd, fi, i);
 	}
 
 	/* Ladder lifecycle: advance block, evict expired factories,
@@ -6980,6 +7025,15 @@ static const char *init(struct command *init_cmd,
 
 	/* Load persisted factories from datastore */
 	ss_load_factories(init_cmd);
+
+	/* Startup catch-up: one-shot breach scan across every active
+	 * factory. CLN's block_added notifications only fire on NEW
+	 * blocks after init — if the plugin was offline while a breach
+	 * occurred (peer published an old kickoff), we'd otherwise miss
+	 * it until the next block, at which point the DW state-TX
+	 * cascade window may have closed. Scanning now means the
+	 * response fires on the very first block tick after init. */
+	ss_catchup_breach_scan(init_cmd);
 
 	/* Initialize ladder (multi-factory lifecycle manager).
 	 * Uses LSP keypair derived from HSM master key. */
