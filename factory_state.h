@@ -61,6 +61,22 @@ typedef struct {
 	uint64_t allocation_sats;	/* Sats allocated to this client's channel.
 					 * 0 = use default even-split. Set by
 					 * factory-create `allocations` param. */
+	/* REVOKE delivery tracking (LSP-side only).
+	 *
+	 *   pending_revoke_epoch — epoch whose secret we sent REVOKE for
+	 *                          and are still waiting on REVOKE_ACK.
+	 *                          UINT32_MAX when nothing is pending.
+	 *   last_acked_epoch     — highest epoch this client has acked.
+	 *                          UINT32_MAX when no ack has ever been
+	 *                          received (pre-rotation factories).
+	 *
+	 * The rotation path consults these before sending the NEXT REVOKE
+	 * so we never race ahead of a client whose storage write is in
+	 * flight or whose peer connection is flapping. Both fields are
+	 * persisted in meta. On reconnect, any pending_revoke_epoch that
+	 * hasn't been acked triggers a REVOKE resend. */
+	uint32_t pending_revoke_epoch;
+	uint32_t last_acked_epoch;
 } client_state_t;
 
 /* Factory instance */
@@ -101,6 +117,15 @@ typedef struct factory_instance {
 
 	/* Rotation */
 	bool rotation_in_progress;
+
+	/* HTLC early-warning: set true the first time handle_block_added
+	 * sees ss_factory_should_warn() fire and triggers force-closes on
+	 * this factory's LN channels. Prevents repeated close RPCs on
+	 * subsequent blocks while the close is in flight / settling. Not
+	 * persisted on purpose — if the plugin restarts inside the early-
+	 * warning window, we want to re-trigger closes for any channels
+	 * that hadn't completed closing yet. */
+	bool warning_close_triggered;
 
 	/* Key turnover (assisted exit): per-client departure state.
 	 * When a client departs, we store their extracted secret key

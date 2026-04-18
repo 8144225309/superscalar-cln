@@ -749,9 +749,15 @@ static void rotate_finish_and_notify(struct command *cmd,
 			nid[66] = '\0';
 			send_factory_msg(cmd, nid,
 				SS_SUBMSG_REVOKE, rev_payload, 36);
+			/* Track pending ack per client. Cleared on
+			 * REVOKE_ACK receipt; resent on reconnect if still
+			 * UINT32_MAX != old_ep. Persisted in meta. */
+			fi->clients[ci].pending_revoke_epoch = old_ep;
 		}
+		ss_save_factory(cmd, fi);
 		plugin_log(plugin_handle, LOG_INFORM,
-			   "LSP: sent REVOKE for epoch %u", old_ep);
+			   "LSP: sent REVOKE for epoch %u (awaiting ack from "
+			   "%zu clients)", old_ep, fi->n_clients);
 	}
 
 	/* Send ROTATE_COMPLETE to clients */
@@ -1500,6 +1506,7 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 	if (len >= 32 && submsg_id != SS_SUBMSG_FACTORY_PROPOSE
 	    && submsg_id != SS_SUBMSG_ROTATE_PROPOSE
 	    && submsg_id != SS_SUBMSG_REVOKE
+	    && submsg_id != SS_SUBMSG_REVOKE_ACK
 	    && submsg_id != SS_SUBMSG_CLOSE_PROPOSE) {
 		fi = ss_factory_find(&ss_state, data);
 		if (!fi) {
@@ -3981,6 +3988,97 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 				   "Client: stored revocation for epoch %u, "
 				   "n_breach=%zu",
 				   rev_epoch, fi->n_breach_epochs);
+
+			/* Ack only AFTER ss_save_factory returns — if the
+			 * datastore write fails, we don't want to mislead
+			 * the LSP into advancing. The payload is just the
+			 * epoch we're acking; the LSP matches it against
+			 * its pending_revoke_epoch for this client. */
+			uint8_t ack_payload[4];
+			ack_payload[0] = (rev_epoch >> 24) & 0xFF;
+			ack_payload[1] = (rev_epoch >> 16) & 0xFF;
+			ack_payload[2] = (rev_epoch >> 8) & 0xFF;
+			ack_payload[3] = rev_epoch & 0xFF;
+			send_factory_msg(cmd, peer_id,
+				SS_SUBMSG_REVOKE_ACK, ack_payload, 4);
+			plugin_log(plugin_handle, LOG_INFORM,
+				   "Client: sent REVOKE_ACK for epoch %u",
+				   rev_epoch);
+		}
+		break;
+
+	case SS_SUBMSG_REVOKE_ACK:
+		plugin_log(plugin_handle, LOG_INFORM,
+			   "REVOKE_ACK from %s (len=%zu)", peer_id, len);
+		/* LSP-side: find the factory where this peer is a client
+		 * and clear the pending_revoke_epoch marker. Ignores acks
+		 * for factories we're not the LSP of, or for epochs that
+		 * don't match the currently-pending value (stale retry). */
+		if (len >= 4) {
+			uint32_t ack_epoch = ((uint32_t)data[0] << 24) |
+				((uint32_t)data[1] << 16) |
+				((uint32_t)data[2] << 8) | data[3];
+			/* Parse peer_id back to bytes for comparison */
+			uint8_t peer_bytes[33];
+			bool parsed = false;
+			if (strlen(peer_id) == 66) {
+				parsed = true;
+				for (int j = 0; j < 33; j++) {
+					unsigned int b;
+					if (sscanf(peer_id + j*2, "%02x",
+						   &b) != 1) {
+						parsed = false; break;
+					}
+					peer_bytes[j] = (uint8_t)b;
+				}
+			}
+			if (parsed) {
+				bool any = false;
+				for (size_t i = 0;
+				     i < ss_state.n_factories; i++) {
+					factory_instance_t *lsp_fi =
+						ss_state.factories[i];
+					if (!lsp_fi->is_lsp) continue;
+					for (size_t ci = 0;
+					     ci < lsp_fi->n_clients; ci++) {
+						if (memcmp(lsp_fi->clients[ci]
+							   .node_id,
+							   peer_bytes, 33) != 0)
+							continue;
+						if (lsp_fi->clients[ci]
+							.pending_revoke_epoch
+						    != ack_epoch)
+							continue;
+						lsp_fi->clients[ci]
+							.pending_revoke_epoch =
+							UINT32_MAX;
+						if (lsp_fi->clients[ci]
+							.last_acked_epoch
+						    == UINT32_MAX ||
+						    lsp_fi->clients[ci]
+							.last_acked_epoch
+						    < ack_epoch) {
+							lsp_fi->clients[ci]
+							  .last_acked_epoch =
+							  ack_epoch;
+						}
+						ss_save_factory(cmd, lsp_fi);
+						any = true;
+						plugin_log(plugin_handle,
+							LOG_INFORM,
+							"LSP: cleared pending "
+							"REVOKE for client %zu "
+							"epoch %u",
+							ci, ack_epoch);
+					}
+				}
+				if (!any) {
+					plugin_log(plugin_handle, LOG_DBG,
+						"REVOKE_ACK: no matching "
+						"pending entry (epoch %u)",
+						ack_epoch);
+				}
+			}
 		}
 		break;
 
@@ -4815,6 +4913,8 @@ static struct command_result *json_factory_create(struct command *cmd,
 			}
 			c->signer_slot = fi->n_clients + 1; /* 0=LSP */
 			c->allocation_sats = 0; /* Default: even split */
+			c->pending_revoke_epoch = UINT32_MAX;
+			c->last_acked_epoch = UINT32_MAX;
 			fi->n_clients++;
 		}
 	}
@@ -5570,6 +5670,23 @@ static struct command_result *json_factory_rotate(struct command *cmd,
 		return command_fail(cmd, LIGHTNINGD,
 				    "Factory not in signed state");
 
+	/* Refuse to rotate if we still owe a client the ack for the
+	 * previous REVOKE. Advancing now would reveal the NEXT epoch's
+	 * secret before we've confirmed the previous one was durably
+	 * stored — exactly the race this PR exists to close. Operator
+	 * must resolve the pending ack (usually by waiting for the peer
+	 * to reconnect so we resend) before calling factory-rotate
+	 * again. */
+	for (size_t ci = 0; ci < fi->n_clients; ci++) {
+		if (fi->clients[ci].pending_revoke_epoch != UINT32_MAX) {
+			return command_fail(cmd, LIGHTNINGD,
+				"Client %zu has unacked REVOKE for epoch %u. "
+				"Rotation blocked until ack received (will "
+				"auto-resend on reconnect).",
+				ci, fi->clients[ci].pending_revoke_epoch);
+		}
+	}
+
 	factory_t *factory = (factory_t *)fi->lib_factory;
 	if (!factory)
 		return command_fail(cmd, LIGHTNINGD, "No lib_factory handle");
@@ -6023,6 +6140,72 @@ static struct command_result *breach_utxo_checked(struct command *cmd,
 						   const char *method,
 						   const char *buf,
 						   const jsmntok_t *result,
+						   void *arg);
+
+/* Launch a single-shot checkutxo scan on a factory's funding UTXO.
+ * Returns without sending if the factory has no real funding txid
+ * (pre-funding-pending factories) or hasn't rotated yet. Used both
+ * by the per-block handler and by ss_catchup_breach_scan at startup
+ * so a breach that happened while the plugin was offline is caught
+ * on the next block tick even if CLN doesn't replay block_added
+ * notifications for the missed interval. */
+static void ss_launch_breach_scan(struct command *cmd,
+				  factory_instance_t *fi,
+				  size_t factory_idx)
+{
+	bool has_real_funding = false;
+	for (int fb = 0; fb < 32; fb++) {
+		if (fi->funding_txid[fb] != 0) {
+			has_real_funding = true;
+			break;
+		}
+	}
+	if (!has_real_funding || fi->epoch == 0)
+		return;
+
+	char ftxid_hex[65];
+	for (int j = 0; j < 32; j++)
+		sprintf(ftxid_hex + j*2, "%02x", fi->funding_txid[31-j]);
+	ftxid_hex[64] = '\0';
+
+	struct breach_scan_ctx *bctx = tal(cmd, struct breach_scan_ctx);
+	bctx->fi = fi;
+	bctx->factory_idx = factory_idx;
+
+	struct out_req *req = jsonrpc_request_start(cmd,
+		"checkutxo", breach_utxo_checked, rpc_err, bctx);
+	json_add_string(req->js, "txid", ftxid_hex);
+	json_add_u32(req->js, "vout", fi->funding_outnum);
+	send_outreq(req);
+}
+
+/* One-shot breach scan across every loaded factory. Called from init
+ * right after ss_load_factories so we don't rely on block_added
+ * notifications covering the interval we were offline. */
+static void ss_catchup_breach_scan(struct command *cmd)
+{
+	size_t scanned = 0;
+	for (size_t i = 0; i < ss_state.n_factories; i++) {
+		factory_instance_t *fi = ss_state.factories[i];
+		if (!fi) continue;
+		if (fi->lifecycle != FACTORY_LIFECYCLE_ACTIVE &&
+		    fi->lifecycle != FACTORY_LIFECYCLE_DYING)
+			continue;
+		ss_launch_breach_scan(cmd, fi, i);
+		scanned++;
+	}
+	if (scanned > 0) {
+		plugin_log(plugin_handle, LOG_INFORM,
+			   "Startup catch-up: launched breach scan on %zu "
+			   "factor%s", scanned,
+			   scanned == 1 ? "y" : "ies");
+	}
+}
+
+static struct command_result *breach_utxo_checked(struct command *cmd,
+						   const char *method,
+						   const char *buf,
+						   const jsmntok_t *result,
 						   void *arg)
 {
 	struct breach_scan_ctx *bctx = (struct breach_scan_ctx *)arg;
@@ -6036,66 +6219,119 @@ static struct command_result *breach_utxo_checked(struct command *cmd,
 	json_to_bool(buf, exists_tok, &exists);
 
 	if (!exists) {
-		/* Funding UTXO has been spent — potential breach.
-		 * Could be: (a) our own force-close, (b) cooperative close,
-		 * or (c) an attacker broadcasting an old state.
-		 * Cases (a) and (b) set lifecycle to DYING/EXPIRED before
-		 * this callback fires, so we only reach here for (c). */
-		plugin_log(plugin_handle, LOG_UNUSUAL,
-			   "BREACH ALERT: factory %zu funding UTXO spent! "
-			   "breach_epochs=%zu, is_lsp=%d",
-			   bctx->factory_idx, fi->n_breach_epochs,
-			   fi->is_lsp);
-
+		/* Funding UTXO has been spent. Could be:
+		 *   (a) our own force-close / intentional exit — expected
+		 *   (b) a genuine breach (peer published an old kickoff
+		 *       from a prior epoch, before we could advance)
+		 *   (c) a cooperative close we didn't drive
+		 *
+		 * We can't tell from checkutxo alone which it is — that's
+		 * left to the cascade logic elsewhere. What we CAN do here
+		 * is, for every old epoch where we hold the peer's
+		 * revocation secret, build L-stock burn TXs against that
+		 * epoch's leaf-state L-stock outputs so the moment those
+		 * state TXs confirm (if peer does publish them) our burn
+		 * TXs are ready in mempool to claim the L-stock.
+		 *
+		 * Previously this loop called factory_build_burn_tx with
+		 * (nodes[0].txid, 0) — the kickoff's output, which is NOT
+		 * an L-stock output. L-stock outputs live on LEAF STATE
+		 * nodes as the last output of each leaf. The burn TXs
+		 * built with the wrong outpoint would never be valid even
+		 * if broadcast. */
 		factory_t *f = (factory_t *)fi->lib_factory;
 		if (!f) {
 			plugin_log(plugin_handle, LOG_UNUSUAL,
-				   "Cannot respond to breach: no lib_factory");
+				   "BREACH ALERT: factory %zu funding UTXO spent "
+				   "but no lib_factory loaded — cannot build "
+				   "burn TXs. Check startup log for reload "
+				   "failures.",
+				   bctx->factory_idx);
 			return notification_handled(cmd);
 		}
 
-		/* For each old epoch with a revocation secret,
-		 * build and broadcast a penalty TX. We use the root
-		 * node (kickoff) txid as the L-stock outpoint. */
+		plugin_log(plugin_handle, LOG_UNUSUAL,
+			   "BREACH ALERT: factory %zu funding UTXO spent. "
+			   "Attempting burn TXs for %zu revoked epochs across "
+			   "%d leaf nodes...",
+			   bctx->factory_idx, fi->n_breach_epochs,
+			   f->n_leaf_nodes);
+
+		size_t burn_count = 0;
 		for (size_t bi = 0; bi < fi->n_breach_epochs; bi++) {
 			epoch_breach_data_t *bd = &fi->breach_data[bi];
 			if (!bd->has_revocation)
 				continue;
 			if (bd->epoch >= fi->epoch)
-				continue; /* current epoch, not a breach */
+				continue; /* current epoch — not a breach */
 
-			tx_buf_t burn_tx;
-			tx_buf_init(&burn_tx, 256);
+			/* Iterate leaf state nodes. Each leaf's last output
+			 * is its L-stock (see setup_leaf_outputs and
+			 * setup_single_leaf_outputs in factory.c). For burn
+			 * to be valid we need that leaf-state TX to be on
+			 * chain with the txid we computed at signing time.
+			 * If the breach is still only at the kickoff stage,
+			 * the state TX isn't confirmed yet — the burn TX
+			 * will stay in mempool until it is, or be rejected.
+			 * Either way, broadcasting early is fine: bitcoind
+			 * will hold it or reject it, and a second attempt
+			 * on a later block will succeed. */
+			for (int ls = 0; ls < f->n_leaf_nodes; ls++) {
+				size_t leaf_idx = f->leaf_node_indices[ls];
+				if (leaf_idx >= f->n_nodes) continue;
+				factory_node_t *leaf = &f->nodes[leaf_idx];
+				if (leaf->n_outputs == 0) continue;
 
-			/* Use root node txid:0 as the L-stock outpoint.
-			 * Amount is the factory's total funding. */
-			if (factory_build_burn_tx(f, &burn_tx,
-						  f->nodes[0].txid, 0,
-						  f->funding_amount_sats,
-						  bd->epoch)) {
-				char *burn_hex = tal_arr(cmd, char,
-					burn_tx.len * 2 + 1);
-				for (size_t h = 0; h < burn_tx.len; h++)
-					sprintf(burn_hex + h*2, "%02x",
-						burn_tx.data[h]);
+				uint32_t lstock_vout =
+					(uint32_t)(leaf->n_outputs - 1);
+				uint64_t lstock_amt =
+					leaf->outputs[lstock_vout].amount_sats;
 
-				plugin_log(plugin_handle, LOG_UNUSUAL,
-					   "Broadcasting penalty TX for epoch "
-					   "%u (%zu bytes)",
-					   bd->epoch, burn_tx.len);
+				tx_buf_t burn_tx;
+				tx_buf_init(&burn_tx, 256);
+				if (factory_build_burn_tx(f, &burn_tx,
+							  leaf->txid,
+							  lstock_vout,
+							  lstock_amt,
+							  bd->epoch)) {
+					char *burn_hex = tal_arr(cmd, char,
+						burn_tx.len * 2 + 1);
+					for (size_t h = 0; h < burn_tx.len; h++)
+						sprintf(burn_hex + h*2, "%02x",
+							burn_tx.data[h]);
 
-				struct out_req *breq = jsonrpc_request_start(
-					cmd, "sendrawtransaction",
-					rpc_done, rpc_err, fi);
-				json_add_string(breq->js, "tx", burn_hex);
-				json_add_bool(breq->js, "allowhighfees", true);
-				send_outreq(breq);
-			} else {
-				plugin_log(plugin_handle, LOG_UNUSUAL,
-					   "Failed to build penalty TX for "
-					   "epoch %u", bd->epoch);
+					struct out_req *breq =
+						jsonrpc_request_start(cmd,
+							"sendrawtransaction",
+							rpc_done, rpc_err, fi);
+					json_add_string(breq->js, "tx",
+							burn_hex);
+					json_add_bool(breq->js,
+						"allowhighfees", true);
+					send_outreq(breq);
+					burn_count++;
+
+					plugin_log(plugin_handle, LOG_UNUSUAL,
+						"Broadcast burn TX: leaf=%d "
+						"epoch=%u amt=%"PRIu64" "
+						"bytes=%zu",
+						ls, bd->epoch, lstock_amt,
+						burn_tx.len);
+				}
+				tx_buf_free(&burn_tx);
 			}
-			tx_buf_free(&burn_tx);
+		}
+
+		if (burn_count == 0 && fi->n_breach_epochs > 0) {
+			/* has_shachain must be true for burn TX construction;
+			 * if the factory was reloaded without secrets this
+			 * will silently fail. Log loudly so an operator can
+			 * investigate. */
+			plugin_log(plugin_handle, LOG_BROKEN,
+				   "Breach detected but no burn TX could be "
+				   "built for any leaf/epoch — check that "
+				   "L-stock secrets were loaded for this "
+				   "factory (has_shachain, n_revocation_secrets).");
 		}
 
 		/* Set factory to DYING so block_added will re-broadcast
@@ -6258,12 +6494,65 @@ static struct command_result *handle_block_added(struct command *cmd,
 			}
 		} else if (ss_factory_should_warn(fi,
 				ss_state.current_blockheight)) {
+			/* Early-warning window: current_block +
+			 * early_warning_time >= expiry_block. Any HTLC still
+			 * in flight whose cltv_expiry lands after the factory
+			 * expires would be unrecoverable — the factory's root
+			 * UTXO is gone, the state-TX race window has closed,
+			 * and only the CLTV unilateral exit is left (which
+			 * doesn't carry HTLC resolution). Force-close the
+			 * channels NOW so the commitment TX publishes while
+			 * the factory is still valid and HTLC timeout/success
+			 * paths can resolve on-chain via standard LN mechanics.
+			 *
+			 * Fire once per factory. The flag resets on plugin
+			 * restart so a crash during the close loop doesn't
+			 * strand channels. Both LSP and client run this path;
+			 * CLN de-dupes close requests on already-closing
+			 * channels. */
 			plugin_log(plugin_handle, LOG_UNUSUAL,
 				   "Factory %zu approaching expiry at block %u "
-				   "(current: %u, warning_time=%u)",
+				   "(current: %u, warning_time=%u) — force-"
+				   "closing %zu channel(s)",
 				   i, fi->expiry_block,
 				   ss_state.current_blockheight,
-				   fi->early_warning_time);
+				   fi->early_warning_time,
+				   fi->n_channels);
+
+			if (!fi->warning_close_triggered) {
+				fi->warning_close_triggered = true;
+				fi->lifecycle = FACTORY_LIFECYCLE_DYING;
+				for (size_t ch = 0; ch < fi->n_channels; ch++) {
+					char cid_hex[65];
+					for (int j = 0; j < 32; j++)
+						sprintf(cid_hex + j*2, "%02x",
+							fi->channels[ch]
+							   .channel_id[j]);
+					cid_hex[64] = '\0';
+					struct out_req *creq =
+						jsonrpc_request_start(cmd,
+							"close",
+							rpc_done, rpc_err,
+							fi);
+					json_add_string(creq->js, "id",
+							cid_hex);
+					/* unilateraltimeout=1 means "mutual
+					 * close if peer responds within 1s,
+					 * else unilateral". In the early-
+					 * warning window we want channels
+					 * closed on-chain promptly; we're
+					 * intentionally biased toward
+					 * unilateral rather than waiting out
+					 * a slow peer. */
+					json_add_u32(creq->js,
+						"unilateraltimeout", 1);
+					send_outreq(creq);
+					plugin_log(plugin_handle, LOG_INFORM,
+						"warning-close: factory %zu "
+						"channel %s", i, cid_hex);
+				}
+				ss_save_factory(cmd, fi);
+			}
 		}
 
 		/* DW epoch exhaustion warning: if epoch is within 10 of
@@ -6306,38 +6595,30 @@ static struct command_result *handle_block_added(struct command *cmd,
 		}
 
 		/* Breach scan: check if factory's funding UTXO is still
-		 * unspent. Run for any ACTIVE factory with real funding
-		 * that has been rotated (epoch > 0). Both LSP and client
-		 * need this — LSP uses DW timelock defense (cascade newer
-		 * state with shorter timelock), client additionally uses
-		 * penalty TXs via stored revocation secrets. */
-		bool has_real_funding = false;
-		for (int fb = 0; fb < 32; fb++) {
-			if (fi->funding_txid[fb] != 0) {
-				has_real_funding = true;
-				break;
-			}
-		}
-		if (has_real_funding && fi->epoch > 0
-		    && fi->lifecycle == FACTORY_LIFECYCLE_ACTIVE) {
-			char ftxid_hex[65];
-			for (int j = 0; j < 32; j++)
-				sprintf(ftxid_hex + j*2, "%02x",
-					fi->funding_txid[31-j]);
-			ftxid_hex[64] = '\0';
-
-			struct breach_scan_ctx *bctx =
-				tal(cmd, struct breach_scan_ctx);
-			bctx->fi = fi;
-			bctx->factory_idx = i;
-
-			struct out_req *req = jsonrpc_request_start(cmd,
-				"checkutxo", breach_utxo_checked,
-				rpc_err, bctx);
-			json_add_string(req->js, "txid", ftxid_hex);
-			json_add_u32(req->js, "vout", fi->funding_outnum);
-			send_outreq(req);
-		}
+		 * unspent. Runs for any active factory with a real on-chain
+		 * funding UTXO, regardless of role.
+		 *
+		 * Previously gated on `n_breach_epochs > 0`, which meant the
+		 * LSP never ran it (the LSP generates its own secrets and
+		 * doesn't accumulate breach_data — breach_data is populated
+		 * on the CLIENT side when LSP sends REVOKE). That left the
+		 * LSP blind to breaches of its own factories: if a client
+		 * published an old (pre-rotation) state TX, the LSP wouldn't
+		 * notice until channels went offline and by then the cascade
+		 * window may have closed.
+		 *
+		 * Now both sides scan. breach_utxo_checked handles the
+		 * no-secrets case gracefully: it attempts burn TXs only for
+		 * epochs where we actually have the revocation secret, and
+		 * logs LOG_BROKEN if nothing could be built. Also intentionally
+		 * drops the FACTORY_LIFECYCLE_ACTIVE gate from PR #2's version
+		 * — DYING factories still need breach monitoring (the DW cascade
+		 * race isn't over just because we called force-close).
+		 *
+		 * Extracted to ss_launch_breach_scan() in the catch-up commit
+		 * so the startup-scan path (ss_catchup_breach_scan) and the
+		 * per-block path share the same guards. */
+		ss_launch_breach_scan(cmd, fi, i);
 	}
 
 	/* Ladder lifecycle: advance block, evict expired factories,
@@ -6487,6 +6768,45 @@ static struct command_result *handle_connect(struct command *cmd,
 		if (sscanf(peer_id + pj*2, "%02x", &pb) != 1)
 			return notification_handled(cmd);
 		pid[pj] = (uint8_t)pb;
+	}
+
+	/* Resend REVOKE for any factory where this peer is a client with
+	 * an un-acked revocation secret. Separate from ceremony resumption
+	 * below because pending REVOKEs are tracked per-client in meta and
+	 * don't depend on the ceremony state machine. Idempotent on the
+	 * client side: re-storing the same secret doesn't break anything;
+	 * the client will just re-ack. */
+	for (size_t fi_i = 0; fi_i < ss_state.n_factories; fi_i++) {
+		factory_instance_t *lsp_fi = ss_state.factories[fi_i];
+		if (!lsp_fi || !lsp_fi->is_lsp) continue;
+		factory_t *lf = (factory_t *)lsp_fi->lib_factory;
+		if (!lf) continue;
+		for (size_t ci = 0; ci < lsp_fi->n_clients; ci++) {
+			client_state_t *c = &lsp_fi->clients[ci];
+			if (c->pending_revoke_epoch == UINT32_MAX) continue;
+			if (memcmp(c->node_id, pid, 33) != 0) continue;
+			unsigned char rs[32];
+			if (!factory_get_revocation_secret(lf,
+				c->pending_revoke_epoch, rs)) {
+				plugin_log(plugin_handle, LOG_UNUSUAL,
+					"Can't resend REVOKE: secret for "
+					"epoch %u missing on factory %zu",
+					c->pending_revoke_epoch, fi_i);
+				continue;
+			}
+			uint8_t pl[36];
+			uint32_t e = c->pending_revoke_epoch;
+			pl[0] = (e >> 24) & 0xFF;
+			pl[1] = (e >> 16) & 0xFF;
+			pl[2] = (e >> 8) & 0xFF;
+			pl[3] = e & 0xFF;
+			memcpy(pl + 4, rs, 32);
+			send_factory_msg(cmd, peer_id,
+				SS_SUBMSG_REVOKE, pl, 36);
+			plugin_log(plugin_handle, LOG_INFORM,
+				"LSP: resent REVOKE (epoch %u) to %s on "
+				"reconnect", e, peer_id);
+		}
 	}
 
 	for (size_t fi_i = 0; fi_i < ss_state.n_factories; fi_i++) {
@@ -6705,6 +7025,15 @@ static const char *init(struct command *init_cmd,
 
 	/* Load persisted factories from datastore */
 	ss_load_factories(init_cmd);
+
+	/* Startup catch-up: one-shot breach scan across every active
+	 * factory. CLN's block_added notifications only fire on NEW
+	 * blocks after init — if the plugin was offline while a breach
+	 * occurred (peer published an old kickoff), we'd otherwise miss
+	 * it until the next block, at which point the DW state-TX
+	 * cascade window may have closed. Scanning now means the
+	 * response fires on the very first block tick after init. */
+	ss_catchup_breach_scan(init_cmd);
 
 	/* Initialize ladder (multi-factory lifecycle manager).
 	 * Uses LSP keypair derived from HSM master key. */

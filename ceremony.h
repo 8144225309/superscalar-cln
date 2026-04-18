@@ -44,6 +44,12 @@
 #define SS_SUBMSG_ROTATE_PSIG		0x010A
 #define SS_SUBMSG_ROTATE_COMPLETE	0x010B
 #define SS_SUBMSG_REVOKE		0x010C
+/* Client -> LSP ack of REVOKE after the secret is durably persisted.
+ * Payload: epoch (u32 big-endian). LSP refuses to send the NEXT REVOKE
+ * for this client until the previous one has been acked. Resend on
+ * reconnect if still pending. See revoke-ack gap in the plugin PR
+ * trail for the why. */
+#define SS_SUBMSG_REVOKE_ACK		0x0116
 
 /* Distribution TX ceremony (signed after tree, before FACTORY_READY) */
 #define SS_SUBMSG_DIST_PROPOSE		0x010D
