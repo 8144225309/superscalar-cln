@@ -6036,66 +6036,119 @@ static struct command_result *breach_utxo_checked(struct command *cmd,
 	json_to_bool(buf, exists_tok, &exists);
 
 	if (!exists) {
-		/* Funding UTXO has been spent — potential breach.
-		 * Could be: (a) our own force-close, (b) cooperative close,
-		 * or (c) an attacker broadcasting an old state.
-		 * Cases (a) and (b) set lifecycle to DYING/EXPIRED before
-		 * this callback fires, so we only reach here for (c). */
-		plugin_log(plugin_handle, LOG_UNUSUAL,
-			   "BREACH ALERT: factory %zu funding UTXO spent! "
-			   "breach_epochs=%zu, is_lsp=%d",
-			   bctx->factory_idx, fi->n_breach_epochs,
-			   fi->is_lsp);
-
+		/* Funding UTXO has been spent. Could be:
+		 *   (a) our own force-close / intentional exit — expected
+		 *   (b) a genuine breach (peer published an old kickoff
+		 *       from a prior epoch, before we could advance)
+		 *   (c) a cooperative close we didn't drive
+		 *
+		 * We can't tell from checkutxo alone which it is — that's
+		 * left to the cascade logic elsewhere. What we CAN do here
+		 * is, for every old epoch where we hold the peer's
+		 * revocation secret, build L-stock burn TXs against that
+		 * epoch's leaf-state L-stock outputs so the moment those
+		 * state TXs confirm (if peer does publish them) our burn
+		 * TXs are ready in mempool to claim the L-stock.
+		 *
+		 * Previously this loop called factory_build_burn_tx with
+		 * (nodes[0].txid, 0) — the kickoff's output, which is NOT
+		 * an L-stock output. L-stock outputs live on LEAF STATE
+		 * nodes as the last output of each leaf. The burn TXs
+		 * built with the wrong outpoint would never be valid even
+		 * if broadcast. */
 		factory_t *f = (factory_t *)fi->lib_factory;
 		if (!f) {
 			plugin_log(plugin_handle, LOG_UNUSUAL,
-				   "Cannot respond to breach: no lib_factory");
+				   "BREACH ALERT: factory %zu funding UTXO spent "
+				   "but no lib_factory loaded — cannot build "
+				   "burn TXs. Check startup log for reload "
+				   "failures.",
+				   bctx->factory_idx);
 			return notification_handled(cmd);
 		}
 
-		/* For each old epoch with a revocation secret,
-		 * build and broadcast a penalty TX. We use the root
-		 * node (kickoff) txid as the L-stock outpoint. */
+		plugin_log(plugin_handle, LOG_UNUSUAL,
+			   "BREACH ALERT: factory %zu funding UTXO spent. "
+			   "Attempting burn TXs for %zu revoked epochs across "
+			   "%d leaf nodes...",
+			   bctx->factory_idx, fi->n_breach_epochs,
+			   f->n_leaf_nodes);
+
+		size_t burn_count = 0;
 		for (size_t bi = 0; bi < fi->n_breach_epochs; bi++) {
 			epoch_breach_data_t *bd = &fi->breach_data[bi];
 			if (!bd->has_revocation)
 				continue;
 			if (bd->epoch >= fi->epoch)
-				continue; /* current epoch, not a breach */
+				continue; /* current epoch — not a breach */
 
-			tx_buf_t burn_tx;
-			tx_buf_init(&burn_tx, 256);
+			/* Iterate leaf state nodes. Each leaf's last output
+			 * is its L-stock (see setup_leaf_outputs and
+			 * setup_single_leaf_outputs in factory.c). For burn
+			 * to be valid we need that leaf-state TX to be on
+			 * chain with the txid we computed at signing time.
+			 * If the breach is still only at the kickoff stage,
+			 * the state TX isn't confirmed yet — the burn TX
+			 * will stay in mempool until it is, or be rejected.
+			 * Either way, broadcasting early is fine: bitcoind
+			 * will hold it or reject it, and a second attempt
+			 * on a later block will succeed. */
+			for (int ls = 0; ls < f->n_leaf_nodes; ls++) {
+				size_t leaf_idx = f->leaf_node_indices[ls];
+				if (leaf_idx >= f->n_nodes) continue;
+				factory_node_t *leaf = &f->nodes[leaf_idx];
+				if (leaf->n_outputs == 0) continue;
 
-			/* Use root node txid:0 as the L-stock outpoint.
-			 * Amount is the factory's total funding. */
-			if (factory_build_burn_tx(f, &burn_tx,
-						  f->nodes[0].txid, 0,
-						  f->funding_amount_sats,
-						  bd->epoch)) {
-				char *burn_hex = tal_arr(cmd, char,
-					burn_tx.len * 2 + 1);
-				for (size_t h = 0; h < burn_tx.len; h++)
-					sprintf(burn_hex + h*2, "%02x",
-						burn_tx.data[h]);
+				uint32_t lstock_vout =
+					(uint32_t)(leaf->n_outputs - 1);
+				uint64_t lstock_amt =
+					leaf->outputs[lstock_vout].amount_sats;
 
-				plugin_log(plugin_handle, LOG_UNUSUAL,
-					   "Broadcasting penalty TX for epoch "
-					   "%u (%zu bytes)",
-					   bd->epoch, burn_tx.len);
+				tx_buf_t burn_tx;
+				tx_buf_init(&burn_tx, 256);
+				if (factory_build_burn_tx(f, &burn_tx,
+							  leaf->txid,
+							  lstock_vout,
+							  lstock_amt,
+							  bd->epoch)) {
+					char *burn_hex = tal_arr(cmd, char,
+						burn_tx.len * 2 + 1);
+					for (size_t h = 0; h < burn_tx.len; h++)
+						sprintf(burn_hex + h*2, "%02x",
+							burn_tx.data[h]);
 
-				struct out_req *breq = jsonrpc_request_start(
-					cmd, "sendrawtransaction",
-					rpc_done, rpc_err, fi);
-				json_add_string(breq->js, "tx", burn_hex);
-				json_add_bool(breq->js, "allowhighfees", true);
-				send_outreq(breq);
-			} else {
-				plugin_log(plugin_handle, LOG_UNUSUAL,
-					   "Failed to build penalty TX for "
-					   "epoch %u", bd->epoch);
+					struct out_req *breq =
+						jsonrpc_request_start(cmd,
+							"sendrawtransaction",
+							rpc_done, rpc_err, fi);
+					json_add_string(breq->js, "tx",
+							burn_hex);
+					json_add_bool(breq->js,
+						"allowhighfees", true);
+					send_outreq(breq);
+					burn_count++;
+
+					plugin_log(plugin_handle, LOG_UNUSUAL,
+						"Broadcast burn TX: leaf=%d "
+						"epoch=%u amt=%"PRIu64" "
+						"bytes=%zu",
+						ls, bd->epoch, lstock_amt,
+						burn_tx.len);
+				}
+				tx_buf_free(&burn_tx);
 			}
-			tx_buf_free(&burn_tx);
+		}
+
+		if (burn_count == 0 && fi->n_breach_epochs > 0) {
+			/* has_shachain must be true for burn TX construction;
+			 * if the factory was reloaded without secrets this
+			 * will silently fail. Log loudly so an operator can
+			 * investigate. */
+			plugin_log(plugin_handle, LOG_BROKEN,
+				   "Breach detected but no burn TX could be "
+				   "built for any leaf/epoch — check that "
+				   "L-stock secrets were loaded for this "
+				   "factory (has_shachain, n_revocation_secrets).");
 		}
 
 		/* Set factory to DYING so block_added will re-broadcast
@@ -6306,11 +6359,25 @@ static struct command_result *handle_block_added(struct command *cmd,
 		}
 
 		/* Breach scan: check if factory's funding UTXO is still
-		 * unspent. Run for any ACTIVE factory with real funding
-		 * that has been rotated (epoch > 0). Both LSP and client
-		 * need this — LSP uses DW timelock defense (cascade newer
-		 * state with shorter timelock), client additionally uses
-		 * penalty TXs via stored revocation secrets. */
+		 * unspent. Runs for any active factory with a real on-chain
+		 * funding UTXO, regardless of role.
+		 *
+		 * Previously gated on `n_breach_epochs > 0`, which meant the
+		 * LSP never ran it (the LSP generates its own secrets and
+		 * doesn't accumulate breach_data — breach_data is populated
+		 * on the CLIENT side when LSP sends REVOKE). That left the
+		 * LSP blind to breaches of its own factories: if a client
+		 * published an old (pre-rotation) state TX, the LSP wouldn't
+		 * notice until channels went offline and by then the cascade
+		 * window may have closed.
+		 *
+		 * Now both sides scan. breach_utxo_checked handles the
+		 * no-secrets case gracefully: it attempts burn TXs only for
+		 * epochs where we actually have the revocation secret, and
+		 * logs LOG_BROKEN if nothing could be built. Also intentionally
+		 * drops the FACTORY_LIFECYCLE_ACTIVE gate from PR #2's version
+		 * — DYING factories still need breach monitoring (the DW cascade
+		 * race isn't over just because we called force-close). */
 		bool has_real_funding = false;
 		for (int fb = 0; fb < 32; fb++) {
 			if (fi->funding_txid[fb] != 0) {
@@ -6318,8 +6385,7 @@ static struct command_result *handle_block_added(struct command *cmd,
 				break;
 			}
 		}
-		if (has_real_funding && fi->epoch > 0
-		    && fi->lifecycle == FACTORY_LIFECYCLE_ACTIVE) {
+		if (has_real_funding && fi->epoch > 0) {
 			char ftxid_hex[65];
 			for (int j = 0; j < 32; j++)
 				sprintf(ftxid_hex + j*2, "%02x",
