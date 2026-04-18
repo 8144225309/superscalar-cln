@@ -1,0 +1,108 @@
+# Plugin test CI.
+#
+# Runs on every push to main and every PR. Builds the plugin against
+# the CLN bLIP-56 fork + SuperScalar library, then runs pytest.
+#
+# Caveats for future contributors:
+#   - Both dependencies (CLN fork, SuperScalar) are fetched as sibling
+#     repos, not submodules. Keeps the plugin repo small but means CI
+#     always pulls latest of each. If that causes flakiness, pin to
+#     specific commits via env vars CLN_REF and SS_REF below.
+#   - The full build is slow (~10 min cold, ~2 min cached) because we
+#     compile CLN itself. Only worth running on PRs, not every push.
+#   - Tests that need signet (tests/signet/*.sh) are explicitly skipped
+#     by pytest's testpaths config; they require real chain setup.
+
+name: tests
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      CLN_REF: blip-56
+      SS_REF: main
+      CLN_DIR: ${{ github.workspace }}/cln-blip56
+      SS_DIR: ${{ github.workspace }}/SuperScalar
+
+    steps:
+      - name: Checkout plugin
+        uses: actions/checkout@v4
+        with:
+          path: superscalar-cln
+
+      - name: Install apt deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            autoconf automake build-essential libsqlite3-dev \
+            libsodium-dev libpq-dev libtool libunbound-dev \
+            libgmp-dev libsqlite3-dev pkg-config zlib1g-dev \
+            libssl-dev gettext cmake python3-pip
+
+      - name: Checkout CLN fork
+        uses: actions/checkout@v4
+        with:
+          repository: 8144225309/lightning
+          ref: ${{ env.CLN_REF }}
+          path: cln-blip56
+          submodules: recursive
+
+      - name: Checkout SuperScalar library
+        uses: actions/checkout@v4
+        with:
+          repository: 8144225309/SuperScalar
+          ref: ${{ env.SS_REF }}
+          path: SuperScalar
+
+      - name: Cache CLN externals
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CLN_DIR }}/external
+          key: cln-externals-${{ env.CLN_REF }}-${{ runner.os }}
+
+      - name: Build CLN
+        working-directory: ${{ env.CLN_DIR }}
+        run: |
+          ./configure --disable-valgrind
+          make -j$(nproc)
+
+      - name: Build SuperScalar
+        working-directory: ${{ env.SS_DIR }}
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release \
+            -DSECP256K1_ECMULT_WINDOW_SIZE=15
+          cmake --build build -j$(nproc)
+
+      - name: Install test deps
+        working-directory: superscalar-cln
+        run: |
+          pip install -r requirements-dev.txt
+
+      - name: Build plugin
+        working-directory: superscalar-cln
+        run: |
+          bash tests/build_plugin.sh
+
+      - name: Run pytest
+        working-directory: superscalar-cln
+        run: |
+          pytest tests/ -v --timeout=300
+
+      - name: Upload test logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cln-test-logs
+          path: |
+            superscalar-cln/tests/.pytest_cache
+            /tmp/ltests-*
+          if-no-files-found: ignore
+          retention-days: 7

@@ -1,0 +1,35 @@
+[tool.pytest.ini_options]
+# pyln-testing runs slow (spins up real lightningd + bitcoind subprocesses
+# per test). Generous default timeout; individual tests can override.
+timeout = 300
+timeout_method = "thread"
+
+# Where the tests live. tests/signet/ is shell scripts, not pytest, so
+# scope to the Python-only directories.
+testpaths = [
+    "tests",
+]
+python_files = ["test_*.py"]
+
+# Skip the signet manual tests during automated runs.
+norecursedirs = [
+    "tests/signet",
+    "build",
+    ".git",
+]
+
+# Log capture defaults. Failed tests dump the full log; otherwise silent.
+log_cli = false
+log_cli_level = "INFO"
+log_file_level = "DEBUG"
+
+# Markers used in test files to scope slow vs fast tests.
+markers = [
+    "slow: marks tests as slow (multi-minute — e.g. full factory rotation on regtest)",
+    "breach: breach-response scenarios (require mined reorgs)",
+    "htlc: scenarios involving in-flight HTLCs and CLTV windows",
+]
+
+[tool.pytest-timeout]
+# Hard cap per test — if a CLN node hangs, don't let the suite wedge.
+timeout = 600

@@ -1,0 +1,15 @@
+# Test dependencies for the superscalar-cln plugin.
+#
+# pyln-testing gives us CLN's own test framework (LightningNode fixtures,
+# bitcoind regtest management, log assertion helpers). Pinned to match
+# the CLN bLIP-56 fork's version to avoid test-vs-runtime skew.
+#
+# Install with:   pip install -r requirements-dev.txt
+# Run tests with: make test   (or: pytest tests/)
+
+pyln-testing>=25.12
+pyln-client>=25.12
+pytest>=8.0
+pytest-timeout>=2.3
+pytest-xdist>=3.6     # parallel test runs
+python-bitcoinlib>=0.12  # raw TX construction for breach/fuzz scenarios

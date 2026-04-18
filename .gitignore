@@ -1,0 +1,30 @@
+# Build output
+*.o
+*.a
+*.so
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.tox/
+.mypy_cache/
+*.egg-info/
+.venv/
+venv/
+
+# Test artifacts
+/tmp/ltests-*
+tests/.pytest_cache/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*~
+
+# macOS
+.DS_Store
+
+# Local-only notes (never commit)
+*_LOCAL.md
