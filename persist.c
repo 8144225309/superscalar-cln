@@ -498,3 +498,50 @@ bool ss_persist_deserialize_signed_txs(void *lib_factory,
 
 	return true;
 }
+
+void ss_persist_key_dist_tx(const factory_instance_t *fi, char *out, size_t len)
+{
+	char id_hex[65];
+	hex32(fi->instance_id, id_hex);
+	snprintf(out, len, "superscalar/factories/%s/dist_tx", id_hex);
+}
+
+/* Serialize signed distribution TX.
+ * Format: tx_len(u32) + tx_data(tx_len) */
+size_t ss_persist_serialize_dist_tx(const factory_instance_t *fi,
+                                    uint8_t **out)
+{
+	if (!fi->dist_signed_tx || fi->dist_signed_tx_len == 0) {
+		*out = NULL;
+		return 0;
+	}
+
+	uint8_t *buf = NULL;
+	size_t len = 0, cap = 0;
+
+	buf_u32(&buf, &len, &cap, (uint32_t)fi->dist_signed_tx_len);
+	buf_append(&buf, &len, &cap, fi->dist_signed_tx, fi->dist_signed_tx_len);
+
+	*out = buf;
+	return len;
+}
+
+/* Deserialize signed distribution TX */
+bool ss_persist_deserialize_dist_tx(factory_instance_t *fi,
+                                    const uint8_t *data, size_t len)
+{
+	const uint8_t *p = data;
+	size_t rem = len;
+	uint32_t tx_len;
+
+	if (!read_u32(&p, &rem, &tx_len)) return false;
+	if (rem < tx_len) return false;
+
+	free(fi->dist_signed_tx);
+	fi->dist_signed_tx = malloc(tx_len);
+	if (!fi->dist_signed_tx) return false;
+	memcpy(fi->dist_signed_tx, p, tx_len);
+	fi->dist_signed_tx_len = tx_len;
+
+	return true;
+}

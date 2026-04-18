@@ -55,4 +55,15 @@ size_t ss_persist_serialize_signed_txs(const void *lib_factory,
 bool ss_persist_deserialize_signed_txs(void *lib_factory,
                                        const uint8_t *data, size_t len);
 
+/* Datastore key for signed distribution TX */
+void ss_persist_key_dist_tx(const factory_instance_t *fi, char *out, size_t len);
+
+/* Serialize signed distribution TX (raw bytes + length) */
+size_t ss_persist_serialize_dist_tx(const factory_instance_t *fi,
+                                    uint8_t **out);
+
+/* Deserialize signed distribution TX into factory instance */
+bool ss_persist_deserialize_dist_tx(factory_instance_t *fi,
+                                    const uint8_t *data, size_t len);
+
 #endif /* SUPERSCALAR_PERSIST_H */
