@@ -6428,12 +6428,65 @@ static struct command_result *handle_block_added(struct command *cmd,
 			}
 		} else if (ss_factory_should_warn(fi,
 				ss_state.current_blockheight)) {
+			/* Early-warning window: current_block +
+			 * early_warning_time >= expiry_block. Any HTLC still
+			 * in flight whose cltv_expiry lands after the factory
+			 * expires would be unrecoverable — the factory's root
+			 * UTXO is gone, the state-TX race window has closed,
+			 * and only the CLTV unilateral exit is left (which
+			 * doesn't carry HTLC resolution). Force-close the
+			 * channels NOW so the commitment TX publishes while
+			 * the factory is still valid and HTLC timeout/success
+			 * paths can resolve on-chain via standard LN mechanics.
+			 *
+			 * Fire once per factory. The flag resets on plugin
+			 * restart so a crash during the close loop doesn't
+			 * strand channels. Both LSP and client run this path;
+			 * CLN de-dupes close requests on already-closing
+			 * channels. */
 			plugin_log(plugin_handle, LOG_UNUSUAL,
 				   "Factory %zu approaching expiry at block %u "
-				   "(current: %u, warning_time=%u)",
+				   "(current: %u, warning_time=%u) — force-"
+				   "closing %zu channel(s)",
 				   i, fi->expiry_block,
 				   ss_state.current_blockheight,
-				   fi->early_warning_time);
+				   fi->early_warning_time,
+				   fi->n_channels);
+
+			if (!fi->warning_close_triggered) {
+				fi->warning_close_triggered = true;
+				fi->lifecycle = FACTORY_LIFECYCLE_DYING;
+				for (size_t ch = 0; ch < fi->n_channels; ch++) {
+					char cid_hex[65];
+					for (int j = 0; j < 32; j++)
+						sprintf(cid_hex + j*2, "%02x",
+							fi->channels[ch]
+							   .channel_id[j]);
+					cid_hex[64] = '\0';
+					struct out_req *creq =
+						jsonrpc_request_start(cmd,
+							"close",
+							rpc_done, rpc_err,
+							fi);
+					json_add_string(creq->js, "id",
+							cid_hex);
+					/* unilateraltimeout=1 means "mutual
+					 * close if peer responds within 1s,
+					 * else unilateral". In the early-
+					 * warning window we want channels
+					 * closed on-chain promptly; we're
+					 * intentionally biased toward
+					 * unilateral rather than waiting out
+					 * a slow peer. */
+					json_add_u32(creq->js,
+						"unilateraltimeout", 1);
+					send_outreq(creq);
+					plugin_log(plugin_handle, LOG_INFORM,
+						"warning-close: factory %zu "
+						"channel %s", i, cid_hex);
+				}
+				ss_save_factory(cmd, fi);
+			}
 		}
 
 		/* DW epoch exhaustion warning: if epoch is within 10 of

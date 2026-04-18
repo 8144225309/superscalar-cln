@@ -118,6 +118,15 @@ typedef struct factory_instance {
 	/* Rotation */
 	bool rotation_in_progress;
 
+	/* HTLC early-warning: set true the first time handle_block_added
+	 * sees ss_factory_should_warn() fire and triggers force-closes on
+	 * this factory's LN channels. Prevents repeated close RPCs on
+	 * subsequent blocks while the close is in flight / settling. Not
+	 * persisted on purpose — if the plugin restarts inside the early-
+	 * warning window, we want to re-trigger closes for any channels
+	 * that hadn't completed closing yet. */
+	bool warning_close_triggered;
+
 	/* Key turnover (assisted exit): per-client departure state.
 	 * When a client departs, we store their extracted secret key
 	 * so the LSP can sign on their behalf for the factory's lifetime. */
