@@ -2162,7 +2162,49 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 						factory_set_lifecycle(tmp_f,
 							ss_state.current_blockheight,
 							4320, 432);
-						factory_build_tree(tmp_f);
+						/* Match the MAIN factory-create path (which
+						 * sets flat_secrets before build_tree in
+						 * PR #3). If the tmp tree diverges from the
+						 * real tree on has_shachain, downstream
+						 * sighashes / key derivations disagree. Keep
+						 * both paths bit-identical. */
+						if (ss_state.has_master_key) {
+							static unsigned char
+								tmp_secrets[256][32];
+							derive_l_stock_secrets(
+								tmp_secrets, 256,
+								fi->instance_id);
+							factory_set_flat_secrets(tmp_f,
+								(const unsigned char (*)[32])
+								tmp_secrets, 256);
+						}
+						/* factory_build_tree returns 0 on validation
+						 * failure (e.g. funding below min, invalid
+						 * participant count, lib version mismatch). It
+						 * logs to STDERR which the plugin-manager
+						 * doesn't capture — so a silent failure here
+						 * leaves tmp_f->nodes[0].spending_spk_len == 0,
+						 * and we copy zero bytes into fctx->funding_spk.
+						 * The tal-allocated fctx then has uninitialized
+						 * memory at spending_spk's slot, and
+						 * segwit_addr_encode encodes that garbage into
+						 * the withdraw destination — real sats out to
+						 * a degenerate P2TR. Check explicitly. */
+						if (!factory_build_tree(tmp_f)) {
+							plugin_log(plugin_handle, LOG_BROKEN,
+								"factory_build_tree(tmp_f) failed "
+								"— aborting funding TX. This is "
+								"usually a validation error from the "
+								"library (funding below min, bad "
+								"participant count, or config "
+								"mismatch). stderr has details.");
+							factory_free(tmp_f);
+							free(tmp_f);
+							free(apks);
+							free(cnb);
+							fi->ceremony = CEREMONY_FAILED;
+							return notification_handled(cmd);
+						}
 
 						/* Extract the root node's tweaked P2TR
 						 * scriptPubKey — this is what the
@@ -2175,6 +2217,23 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 						       tmp_f->nodes[0].spending_spk_len);
 						fctx->funding_spk_len =
 							tmp_f->nodes[0].spending_spk_len;
+						/* Defense in depth: if somehow the copy left
+						 * us with a non-34-byte spk (the library
+						 * always populates 34 on success, but older
+						 * library versions may differ), reject before
+						 * we broadcast. */
+						if (fctx->funding_spk_len != 34) {
+							plugin_log(plugin_handle, LOG_BROKEN,
+								"tmp_f->nodes[0].spending_spk_len "
+								"= %zu (expected 34) — aborting.",
+								fctx->funding_spk_len);
+							factory_free(tmp_f);
+							free(tmp_f);
+							free(apks);
+							free(cnb);
+							fi->ceremony = CEREMONY_FAILED;
+							return notification_handled(cmd);
+						}
 
 						/* Encode bech32m address from tweaked key
 						 * (skip OP_1 0x20 prefix = bytes 2-33) */
