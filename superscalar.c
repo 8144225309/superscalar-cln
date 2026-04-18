@@ -4458,7 +4458,7 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 							fi->clients[ci < fi->n_clients ? ci : 0].node_id[j]);
 					peer_nid[66] = '\0';
 					struct out_req *creq = jsonrpc_request_start(
-						cmd, "factory-forget-channel",
+						cmd, "dev-forget-channel",
 						rpc_done, rpc_err, fi);
 					json_add_string(creq->js, "id", peer_nid);
 					json_add_string(creq->js, "channel_id", cid_hex);
@@ -4496,7 +4496,7 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 						fi->lsp_node_id[j]);
 				lsp_hex[66] = '\0';
 				struct out_req *creq = jsonrpc_request_start(
-					cmd, "factory-forget-channel",
+					cmd, "dev-forget-channel",
 					rpc_done, rpc_err, fi);
 				json_add_string(creq->js, "id", lsp_hex);
 				json_add_string(creq->js, "channel_id", cid_hex);
@@ -6165,7 +6165,7 @@ static struct command_result *json_factory_close_departed(struct command *cmd,
 					fi->clients[*client_idx].node_id[j]);
 			peer_nid[66] = '\0';
 			struct out_req *creq = jsonrpc_request_start(
-				cmd, "factory-forget-channel",
+				cmd, "dev-forget-channel",
 				rpc_done, rpc_err, fi);
 			json_add_string(creq->js, "id", peer_nid);
 			json_add_string(creq->js, "channel_id", cid_hex);

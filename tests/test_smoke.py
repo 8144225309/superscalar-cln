@@ -23,7 +23,6 @@ REQUIRED_RPCS = [
     "factory-rotate",
     "factory-force-close",
     "factory-check-breach",
-    "factory-forget-channel",
     "factory-ladder-status",
 ]
 
