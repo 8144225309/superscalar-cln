@@ -1241,6 +1241,42 @@ static void ss_load_factories(struct command *cmd)
 
 	plugin_log(plugin_handle, LOG_INFORM,
 		   "Loaded %zu factories from datastore", loaded);
+
+	/* Reconcile factories that may have been mid-creation at shutdown.
+	 * A factory is "funding-pending" if we persisted its meta (so we
+	 * know the instance_id and expected funding_spk) but the
+	 * funding_txid is still all-zeros — meaning the withdraw RPC hadn't
+	 * returned when the plugin last exited, or the callback hadn't
+	 * finished writing. Log these loudly so the operator can check
+	 * on-chain whether the funding TX actually went out; if it did,
+	 * the funds are recoverable because we have every non-chain piece
+	 * of state (participants, iid, funding_spk). Before this PR those
+	 * factories became unrecoverable: instance_id was only in memory,
+	 * so the keys needed to spend the funding UTXO were lost on any
+	 * crash between withdraw-broadcast and persistence. */
+	for (size_t i = 0; i < ss_state.n_factories; i++) {
+		factory_instance_t *fi = ss_state.factories[i];
+		if (!fi || !fi->is_lsp) continue;
+		bool txid_zero = true;
+		for (int j = 0; j < 32 && txid_zero; j++)
+			if (fi->funding_txid[j] != 0) txid_zero = false;
+		if (txid_zero && fi->funding_spk_len == 34) {
+			char iid_hex[65];
+			for (int j = 0; j < 32; j++)
+				sprintf(iid_hex + j*2, "%02x", fi->instance_id[j]);
+			iid_hex[64] = '\0';
+			char addr[100];
+			if (segwit_addr_encode(addr, chainparams->onchain_hrp,
+				1, fi->funding_spk + 2, 32)) {
+				plugin_log(plugin_handle, LOG_UNUSUAL,
+					"Factory %s: funding-pending at startup "
+					"(no txid recorded). Expected funding "
+					"address: %s. Check on-chain and either "
+					"complete the ceremony or delete the "
+					"factory.", iid_hex, addr);
+			}
+		}
+	}
 }
 
 /* Dispatch SuperScalar protocol submessages.
@@ -2108,6 +2144,25 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 							   "withdraw %"PRIu64" to %s",
 							   fi->funding_amount_sats,
 							   addr);
+
+						/* Persist factory state BEFORE broadcasting the
+						 * funding TX. If the withdraw succeeds on-chain
+						 * but the plugin crashes before the callback
+						 * runs, the instance_id and participant set
+						 * would otherwise be lost — the funds would be
+						 * stuck at the funding address with no way to
+						 * derive the keys needed to spend them.
+						 *
+						 * We also need funding_spk on fi at this point
+						 * so startup reconciliation (checking whether a
+						 * funding UTXO appeared for us) has something to
+						 * match against. The funding_txid itself is
+						 * filled in later by withdraw_funding_ok. */
+						memcpy(fi->funding_spk,
+						       fctx->funding_spk,
+						       fctx->funding_spk_len);
+						fi->funding_spk_len = fctx->funding_spk_len;
+						ss_save_factory(cmd, fi);
 
 						/* Call withdraw RPC */
 						struct out_req *wreq =
