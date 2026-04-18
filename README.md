@@ -109,6 +109,35 @@ CLN handles channels. The plugin handles the factory.
 - **Tree reconstruction**: On restart, factory trees are rebuilt from persisted metadata + participant pubkeys. Signed transactions are loaded from datastore so `factory-force-close` works immediately after restart.
 - **HTLC safety**: The `htlc_accepted` hook rejects incoming HTLCs whose CLTV timeout doesn't leave enough headroom for the factory's DW tree to fully unwind via force-close.
 
+### Wire Protocol
+
+All peer-to-peer factory traffic rides a single **ODD** custommsg type (`33001`) carrying the bLIP-56 `factory_piggyback` envelope. The layering:
+
+```
+┌─ CLN custommsg ────────────────────────────────────────────────────┐
+│  u16 message_type = 33001 (ODD)                                     │
+├─ bLIP-56 envelope (generic across all factory styles) ─────────────┤
+│  u16 factory_submessage_id                                          │
+│    │  0x0002 supported_factory_protocols (discovery)                │
+│    │  0x0004 factory_piggyback          (protocol-specific wrapper) │
+│    │  0x0006–0x000C  factory_change_*   (rotation coordination)     │
+│  TLV stream                                                         │
+│    │  TLV 0    (len 32) factory_protocol_id                         │
+│    │  TLV 1024        factory_piggyback_payload (opaque)            │
+├─ SuperScalar payload (opaque to bLIP-56, owned by this plugin) ─────┤
+│  u16 app_submsg_id (see ceremony.h SS_SUBMSG_*)                     │
+│    │  FACTORY_PROPOSE / NONCE_BUNDLE / ALL_NONCES / PSIG_BUNDLE     │
+│    │  FACTORY_READY / ROTATE_PROPOSE / REVOKE / REVOKE_ACK          │
+│  <app-specific bytes>                                               │
+└────────────────────────────────────────────────────────────────────┘
+```
+
+**Why ODD 33001 (not the draft's EVEN 32800):** CLN's plugin API dispatches only ODD custom types to plugins, and feature-bit 270/271 negotiation already provides the must-understand guarantee that EVEN was intended to supply. This follows bLIP-17 (Hosted Channels) precedent, which uses only ODD types for a feature-bit-gated plugin-implemented state-machine protocol. See the [fork README](https://github.com/8144225309/lightning/tree/blip-56#bLIP-56-Wire-Protocol) for the full rationale; this is proposed upstream as feedback on [bLIP-56 PR #56](https://github.com/lightning/blips/pull/56).
+
+**`factory_protocol_id` value:** This plugin's SuperScalar protocol id is the 32-byte constant `"SuperScalar/v1"` padded with zeros, i.e. hex `5375706572536361 6c61722f763100000000000000000000 00000000000000000000000000000000`. Carried in TLV 0 of every `factory_piggyback` envelope; receivers ignore messages whose protocol id doesn't match their supported set.
+
+**Per-protocol submessage namespace:** `app_submsg_id` values inside `factory_piggyback_payload` are scoped to this `factory_protocol_id`. Different factory protocols may reuse the same `app_submsg_id` numbers without collision because the outer `factory_protocol_id` routes to the correct handler.
+
 ### Factory Creation Ceremony (MuSig2)
 
 Factory creation is a multi-round MuSig2 protocol between 1 LSP and N clients:
