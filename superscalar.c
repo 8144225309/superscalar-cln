@@ -2203,7 +2203,8 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 							free(apks);
 							free(cnb);
 							fi->ceremony = CEREMONY_FAILED;
-							return notification_handled(cmd);
+							(void)notification_handled(cmd);
+							return;
 						}
 
 						/* Extract the root node's tweaked P2TR
@@ -2232,7 +2233,8 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 							free(apks);
 							free(cnb);
 							fi->ceremony = CEREMONY_FAILED;
-							return notification_handled(cmd);
+							(void)notification_handled(cmd);
+							return;
 						}
 
 						/* Encode bech32m address from tweaked key

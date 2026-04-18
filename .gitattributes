@@ -1,0 +1,9 @@
+# Enforce LF line endings across the repo.
+# Prevents CRLF drift when files are edited from Windows hosts and
+# produces honest git diffs.
+* text=auto eol=lf
+*.sh text eol=lf
+*.py text eol=lf
+*.c text eol=lf
+*.h text eol=lf
+*.md text eol=lf
