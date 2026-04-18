@@ -1,0 +1,184 @@
+#!/bin/bash
+# smoke_basic.sh — factory create + rotate happy path on signet.
+#
+# Validates that the superscalar plugin, loaded on two live CLN signet nodes,
+# can successfully:
+#   1. Create a factory with one client
+#   2. Persist the factory meta to the LSP datastore
+#   3. Rotate the factory once
+#   4. Exchange REVOKE + REVOKE_ACK durably
+#
+# Exits non-zero on first failed assertion. Prints enough context on failure
+# that you can paste the log excerpt into a bug report.
+#
+# This is not CI — it assumes you have set up the two nodes manually per the
+# README in this directory. A future pyln-testing harness will automate the
+# whole thing from scratch per run.
+
+set -euo pipefail
+
+LSP_DIR="${LSP_DIR:-/var/lib/cln-blip56}"
+CLIENT_DIR="${CLIENT_DIR:-/var/lib/cln-signet-b}"
+CLI="${CLI:-/root/lightning/cli/lightning-cli}"
+BTC="${BTC:-bitcoin-cli -signet -conf=/var/lib/bitcoind-signet/bitcoin.conf}"
+
+# Funding amount chosen to be unique-ish so we can identify this run's
+# factory in logs without confusion. Keep it small — signet sats aren't
+# free even if they're cheap.
+FUNDING_SATS="${FUNDING_SATS:-$((50000 + RANDOM % 1000))}"
+
+red()   { printf '\033[31m%s\033[0m\n' "$*"; }
+green() { printf '\033[32m%s\033[0m\n' "$*"; }
+info()  { printf '\033[36m[smoke]\033[0m %s\n' "$*"; }
+die()   { red "FAIL: $*"; exit 1; }
+
+lsp()    { $CLI --lightning-dir=$LSP_DIR    "$@"; }
+client() { $CLI --lightning-dir=$CLIENT_DIR "$@"; }
+
+# Confirm both nodes are reachable before doing anything irreversible.
+info "Checking node reachability..."
+lsp    getinfo >/dev/null    || die "LSP RPC unreachable at $LSP_DIR"
+client getinfo >/dev/null    || die "client RPC unreachable at $CLIENT_DIR"
+
+LSP_ID=$(lsp    getinfo | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')
+CLIENT_ID=$(client getinfo | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')
+info "LSP=${LSP_ID:0:16}... CLIENT=${CLIENT_ID:0:16}..."
+
+# Factory creation needs enough on-chain funds on the LSP wallet for the
+# funding TX + fees. Fail early with a clear message if not.
+AVAIL=$(lsp listfunds | python3 -c '
+import sys, json
+d = json.load(sys.stdin)
+total = sum(o.get("amount_msat", 0) for o in d.get("outputs", []) if o.get("status") == "confirmed")
+print(total // 1000)
+')
+if [ "$AVAIL" -lt "$((FUNDING_SATS + 10000))" ]; then
+    die "LSP has only $AVAIL sats on-chain; need >= $((FUNDING_SATS + 10000))"
+fi
+info "LSP has $AVAIL sats available"
+
+# -----------------------------------------------------------------------------
+# Phase 1: factory-create
+# -----------------------------------------------------------------------------
+info "Creating factory (funding=$FUNDING_SATS, client=$CLIENT_ID)"
+CREATE_OUT=$(lsp factory-create "$FUNDING_SATS" "[\"$CLIENT_ID\"]" 2>&1)
+echo "$CREATE_OUT" | head -20
+
+IID=$(echo "$CREATE_OUT" | python3 -c '
+import sys, json, re
+try:
+    d = json.load(sys.stdin)
+    print(d.get("instance_id", ""))
+except Exception:
+    # Not JSON — maybe the RPC returned on error or mid-ceremony. Try grep.
+    sys.stdin.seek(0)
+    for line in sys.stdin:
+        m = re.search(r"\"instance_id\":\"([a-f0-9]{64})\"", line)
+        if m:
+            print(m.group(1)); break
+')
+[ -n "$IID" ] || die "factory-create did not return instance_id — check LSP log"
+info "Factory instance_id=$IID"
+
+# The ceremony is async — tree-build fires early, real persistence happens
+# later. Poll the datastore directly until the meta blob appears (or time
+# out). This also correctly handles the atomic-persist-before-withdraw path
+# added in PR #3 (where meta shows up BEFORE the on-chain withdraw has
+# returned).
+info "Waiting for factory meta to appear in datastore..."
+timeout=90
+while [ $timeout -gt 0 ]; do
+    # listdatastore with a path prefix returns { "datastore": [ { ... } ] }.
+    # Filter by the iid we expect.
+    HITS=$(lsp listdatastore superscalar/factories/$IID 2>&1 | \
+        python3 -c 'import sys,json; print(len(json.load(sys.stdin).get("datastore", [])))' 2>/dev/null || echo 0)
+    if [ "$HITS" -gt 0 ]; then
+        break
+    fi
+    sleep 1
+    timeout=$((timeout - 1))
+done
+[ $timeout -gt 0 ] || die "Factory meta did not appear in datastore within 90s — ceremony likely stalled between FACTORY_PROPOSE and NONCE_BUNDLE. Check $CLIENT_DIR/cln.log for receipt of 33001 custommsg and plugin hook dispatch. Note: daemons load plugins at startup, so binary changes require a daemon restart."
+green "Factory persisted to datastore"
+
+# Sanity-check the meta key specifically exists.
+META=$(lsp listdatastore superscalar/factories/$IID/meta 2>&1)
+if echo "$META" | grep -q '"hex"'; then
+    green "Meta key present"
+else
+    die "Meta key missing despite entries under factories/$IID: $META"
+fi
+
+# factory-ladder-status should report the factory as tracked.
+LADDER=$(lsp factory-ladder-status 2>&1)
+if echo "$LADDER" | grep -q "$IID"; then
+    green "Factory visible in ladder-status"
+else
+    info "Note: factory not yet in ladder-status (may take a beat after creation)"
+fi
+
+# -----------------------------------------------------------------------------
+# Phase 3: rotate
+# -----------------------------------------------------------------------------
+info "Rotating factory"
+ROTATE_OUT=$(lsp factory-rotate "$IID" 2>&1 || true)
+echo "$ROTATE_OUT" | head -10
+
+# Wait for LSP to send REVOKE.
+info "Waiting for LSP to send REVOKE..."
+timeout=30
+while [ $timeout -gt 0 ]; do
+    if grep -q "LSP: sent REVOKE for epoch 0" "$LSP_DIR/cln.log" 2>/dev/null; then
+        break
+    fi
+    sleep 1
+    timeout=$((timeout - 1))
+done
+[ $timeout -gt 0 ] || die "LSP did not log REVOKE send within 30s"
+green "LSP sent REVOKE for epoch 0"
+
+# Wait for the round-trip: client persists, acks, LSP clears pending.
+info "Waiting for REVOKE_ACK..."
+timeout=30
+while [ $timeout -gt 0 ]; do
+    if grep -q "LSP: cleared pending REVOKE" "$LSP_DIR/cln.log" 2>/dev/null; then
+        break
+    fi
+    sleep 1
+    timeout=$((timeout - 1))
+done
+[ $timeout -gt 0 ] || die "LSP did not log REVOKE_ACK receipt within 30s"
+green "LSP received REVOKE_ACK, cleared pending"
+
+# Client side: was the secret stored?
+if grep -q "Client: stored revocation for epoch 0" "$CLIENT_DIR/cln.log" 2>/dev/null; then
+    green "Client stored revocation secret for epoch 0"
+else
+    die "Client did not log revocation secret storage"
+fi
+
+# -----------------------------------------------------------------------------
+# Phase 4: second rotate should succeed (no pending ack blocking)
+# -----------------------------------------------------------------------------
+info "Attempting second rotate (should succeed — previous ack cleared)"
+ROTATE2=$(lsp factory-rotate "$IID" 2>&1 || true)
+if echo "$ROTATE2" | grep -q "unacked REVOKE"; then
+    die "Second rotate blocked — pending ack not cleared properly"
+fi
+green "Second rotate not blocked by stale pending ack"
+
+info "All assertions passed"
+info "Factory $IID at epoch $(lsp factory-ladder-status | python3 -c '
+import sys, json, re
+try:
+    d = json.load(sys.stdin)
+    for f in d.get("factories", []):
+        if f.get("instance_id") == "'"$IID"'":
+            print(f.get("epoch", "?")); break
+    else:
+        print("?")
+except Exception:
+    print("?")
+') — ok to leave running or close via factory-close"
+
+green "PASS"
