@@ -749,9 +749,15 @@ static void rotate_finish_and_notify(struct command *cmd,
 			nid[66] = '\0';
 			send_factory_msg(cmd, nid,
 				SS_SUBMSG_REVOKE, rev_payload, 36);
+			/* Track pending ack per client. Cleared on
+			 * REVOKE_ACK receipt; resent on reconnect if still
+			 * UINT32_MAX != old_ep. Persisted in meta. */
+			fi->clients[ci].pending_revoke_epoch = old_ep;
 		}
+		ss_save_factory(cmd, fi);
 		plugin_log(plugin_handle, LOG_INFORM,
-			   "LSP: sent REVOKE for epoch %u", old_ep);
+			   "LSP: sent REVOKE for epoch %u (awaiting ack from "
+			   "%zu clients)", old_ep, fi->n_clients);
 	}
 
 	/* Send ROTATE_COMPLETE to clients */
@@ -1500,6 +1506,7 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 	if (len >= 32 && submsg_id != SS_SUBMSG_FACTORY_PROPOSE
 	    && submsg_id != SS_SUBMSG_ROTATE_PROPOSE
 	    && submsg_id != SS_SUBMSG_REVOKE
+	    && submsg_id != SS_SUBMSG_REVOKE_ACK
 	    && submsg_id != SS_SUBMSG_CLOSE_PROPOSE) {
 		fi = ss_factory_find(&ss_state, data);
 		if (!fi) {
@@ -3981,6 +3988,97 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 				   "Client: stored revocation for epoch %u, "
 				   "n_breach=%zu",
 				   rev_epoch, fi->n_breach_epochs);
+
+			/* Ack only AFTER ss_save_factory returns — if the
+			 * datastore write fails, we don't want to mislead
+			 * the LSP into advancing. The payload is just the
+			 * epoch we're acking; the LSP matches it against
+			 * its pending_revoke_epoch for this client. */
+			uint8_t ack_payload[4];
+			ack_payload[0] = (rev_epoch >> 24) & 0xFF;
+			ack_payload[1] = (rev_epoch >> 16) & 0xFF;
+			ack_payload[2] = (rev_epoch >> 8) & 0xFF;
+			ack_payload[3] = rev_epoch & 0xFF;
+			send_factory_msg(cmd, peer_id,
+				SS_SUBMSG_REVOKE_ACK, ack_payload, 4);
+			plugin_log(plugin_handle, LOG_INFORM,
+				   "Client: sent REVOKE_ACK for epoch %u",
+				   rev_epoch);
+		}
+		break;
+
+	case SS_SUBMSG_REVOKE_ACK:
+		plugin_log(plugin_handle, LOG_INFORM,
+			   "REVOKE_ACK from %s (len=%zu)", peer_id, len);
+		/* LSP-side: find the factory where this peer is a client
+		 * and clear the pending_revoke_epoch marker. Ignores acks
+		 * for factories we're not the LSP of, or for epochs that
+		 * don't match the currently-pending value (stale retry). */
+		if (len >= 4) {
+			uint32_t ack_epoch = ((uint32_t)data[0] << 24) |
+				((uint32_t)data[1] << 16) |
+				((uint32_t)data[2] << 8) | data[3];
+			/* Parse peer_id back to bytes for comparison */
+			uint8_t peer_bytes[33];
+			bool parsed = false;
+			if (strlen(peer_id) == 66) {
+				parsed = true;
+				for (int j = 0; j < 33; j++) {
+					unsigned int b;
+					if (sscanf(peer_id + j*2, "%02x",
+						   &b) != 1) {
+						parsed = false; break;
+					}
+					peer_bytes[j] = (uint8_t)b;
+				}
+			}
+			if (parsed) {
+				bool any = false;
+				for (size_t i = 0;
+				     i < ss_state.n_factories; i++) {
+					factory_instance_t *lsp_fi =
+						ss_state.factories[i];
+					if (!lsp_fi->is_lsp) continue;
+					for (size_t ci = 0;
+					     ci < lsp_fi->n_clients; ci++) {
+						if (memcmp(lsp_fi->clients[ci]
+							   .node_id,
+							   peer_bytes, 33) != 0)
+							continue;
+						if (lsp_fi->clients[ci]
+							.pending_revoke_epoch
+						    != ack_epoch)
+							continue;
+						lsp_fi->clients[ci]
+							.pending_revoke_epoch =
+							UINT32_MAX;
+						if (lsp_fi->clients[ci]
+							.last_acked_epoch
+						    == UINT32_MAX ||
+						    lsp_fi->clients[ci]
+							.last_acked_epoch
+						    < ack_epoch) {
+							lsp_fi->clients[ci]
+							  .last_acked_epoch =
+							  ack_epoch;
+						}
+						ss_save_factory(cmd, lsp_fi);
+						any = true;
+						plugin_log(plugin_handle,
+							LOG_INFORM,
+							"LSP: cleared pending "
+							"REVOKE for client %zu "
+							"epoch %u",
+							ci, ack_epoch);
+					}
+				}
+				if (!any) {
+					plugin_log(plugin_handle, LOG_DBG,
+						"REVOKE_ACK: no matching "
+						"pending entry (epoch %u)",
+						ack_epoch);
+				}
+			}
 		}
 		break;
 
@@ -4815,6 +4913,8 @@ static struct command_result *json_factory_create(struct command *cmd,
 			}
 			c->signer_slot = fi->n_clients + 1; /* 0=LSP */
 			c->allocation_sats = 0; /* Default: even split */
+			c->pending_revoke_epoch = UINT32_MAX;
+			c->last_acked_epoch = UINT32_MAX;
 			fi->n_clients++;
 		}
 	}
@@ -5569,6 +5669,23 @@ static struct command_result *json_factory_rotate(struct command *cmd,
 	    fi->ceremony != CEREMONY_REVOKED)
 		return command_fail(cmd, LIGHTNINGD,
 				    "Factory not in signed state");
+
+	/* Refuse to rotate if we still owe a client the ack for the
+	 * previous REVOKE. Advancing now would reveal the NEXT epoch's
+	 * secret before we've confirmed the previous one was durably
+	 * stored — exactly the race this PR exists to close. Operator
+	 * must resolve the pending ack (usually by waiting for the peer
+	 * to reconnect so we resend) before calling factory-rotate
+	 * again. */
+	for (size_t ci = 0; ci < fi->n_clients; ci++) {
+		if (fi->clients[ci].pending_revoke_epoch != UINT32_MAX) {
+			return command_fail(cmd, LIGHTNINGD,
+				"Client %zu has unacked REVOKE for epoch %u. "
+				"Rotation blocked until ack received (will "
+				"auto-resend on reconnect).",
+				ci, fi->clients[ci].pending_revoke_epoch);
+		}
+	}
 
 	factory_t *factory = (factory_t *)fi->lib_factory;
 	if (!factory)
@@ -6553,6 +6670,45 @@ static struct command_result *handle_connect(struct command *cmd,
 		if (sscanf(peer_id + pj*2, "%02x", &pb) != 1)
 			return notification_handled(cmd);
 		pid[pj] = (uint8_t)pb;
+	}
+
+	/* Resend REVOKE for any factory where this peer is a client with
+	 * an un-acked revocation secret. Separate from ceremony resumption
+	 * below because pending REVOKEs are tracked per-client in meta and
+	 * don't depend on the ceremony state machine. Idempotent on the
+	 * client side: re-storing the same secret doesn't break anything;
+	 * the client will just re-ack. */
+	for (size_t fi_i = 0; fi_i < ss_state.n_factories; fi_i++) {
+		factory_instance_t *lsp_fi = ss_state.factories[fi_i];
+		if (!lsp_fi || !lsp_fi->is_lsp) continue;
+		factory_t *lf = (factory_t *)lsp_fi->lib_factory;
+		if (!lf) continue;
+		for (size_t ci = 0; ci < lsp_fi->n_clients; ci++) {
+			client_state_t *c = &lsp_fi->clients[ci];
+			if (c->pending_revoke_epoch == UINT32_MAX) continue;
+			if (memcmp(c->node_id, pid, 33) != 0) continue;
+			unsigned char rs[32];
+			if (!factory_get_revocation_secret(lf,
+				c->pending_revoke_epoch, rs)) {
+				plugin_log(plugin_handle, LOG_UNUSUAL,
+					"Can't resend REVOKE: secret for "
+					"epoch %u missing on factory %zu",
+					c->pending_revoke_epoch, fi_i);
+				continue;
+			}
+			uint8_t pl[36];
+			uint32_t e = c->pending_revoke_epoch;
+			pl[0] = (e >> 24) & 0xFF;
+			pl[1] = (e >> 16) & 0xFF;
+			pl[2] = (e >> 8) & 0xFF;
+			pl[3] = e & 0xFF;
+			memcpy(pl + 4, rs, 32);
+			send_factory_msg(cmd, peer_id,
+				SS_SUBMSG_REVOKE, pl, 36);
+			plugin_log(plugin_handle, LOG_INFORM,
+				"LSP: resent REVOKE (epoch %u) to %s on "
+				"reconnect", e, peer_id);
+		}
 	}
 
 	for (size_t fi_i = 0; fi_i < ss_state.n_factories; fi_i++) {

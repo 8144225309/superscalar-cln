@@ -77,7 +77,7 @@ size_t ss_persist_serialize_meta(const factory_instance_t *fi, uint8_t **out)
 	size_t len = 0, cap = 0;
 
 	/* Version byte (4 adds factory_pubkeys, allocations, departure) */
-	buf_u8(&buf, &len, &cap, 4);
+	buf_u8(&buf, &len, &cap, 5);
 
 	/* Identity */
 	buf_append(&buf, &len, &cap, fi->instance_id, 32);
@@ -157,6 +157,17 @@ size_t ss_persist_serialize_meta(const factory_instance_t *fi, uint8_t **out)
 	/* v4: our participant index */
 	buf_u8(&buf, &len, &cap, (uint8_t)fi->our_participant_idx);
 
+	/* v5: REVOKE-ACK delivery tracking per client. Persists so that a
+	 * restart mid-rotation doesn't forget that we owe a resend, and so
+	 * that the next rotation's gating can distinguish "client acked"
+	 * from "never sent". UINT32_MAX serializes as 0xFFFFFFFF. */
+	for (size_t i = 0; i < fi->n_clients; i++) {
+		buf_u32(&buf, &len, &cap,
+			fi->clients[i].pending_revoke_epoch);
+		buf_u32(&buf, &len, &cap,
+			fi->clients[i].last_acked_epoch);
+	}
+
 	*out = buf;
 	return len;
 }
@@ -170,7 +181,7 @@ bool ss_persist_deserialize_meta(factory_instance_t *fi,
 	uint8_t version, tmp8;
 	uint16_t tmp16;
 
-	if (!read_u8(&p, &rem, &version) || version < 1 || version > 4)
+	if (!read_u8(&p, &rem, &version) || version < 1 || version > 5)
 		return false;
 
 	if (!read_bytes(&p, &rem, fi->instance_id, 32)) return false;
@@ -271,6 +282,25 @@ bool ss_persist_deserialize_meta(factory_instance_t *fi,
 		uint8_t pidx;
 		if (!read_u8(&p, &rem, &pidx)) return false;
 		fi->our_participant_idx = (int)pidx;
+	}
+
+	/* Default ack fields: older (v1-v4) meta blobs don't carry them.
+	 * UINT32_MAX means "never sent / never acked" — the rotation path
+	 * treats that as not-blocking so factories loaded from old blobs
+	 * keep working. A fresh REVOKE after upgrade will populate them. */
+	for (size_t i = 0; i < fi->n_clients; i++) {
+		fi->clients[i].pending_revoke_epoch = UINT32_MAX;
+		fi->clients[i].last_acked_epoch = UINT32_MAX;
+	}
+
+	if (version >= 5) {
+		for (size_t i = 0; i < fi->n_clients; i++) {
+			uint32_t pe, la;
+			if (!read_u32(&p, &rem, &pe)) return false;
+			if (!read_u32(&p, &rem, &la)) return false;
+			fi->clients[i].pending_revoke_epoch = pe;
+			fi->clients[i].last_acked_epoch = la;
+		}
 	}
 
 	return true;
