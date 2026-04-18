@@ -151,6 +151,45 @@ static void derive_placeholder_seckey(unsigned char seckey[32],
 	if (seckey[0] == 0) seckey[0] = 0x01;
 }
 
+/* Derive N L-stock revocation secrets deterministically from the HSM master
+ * key and instance_id. Previously used /dev/urandom which made recovery
+ * impossible after datastore loss — secrets were never persisted.
+ *
+ * Construction: secret[i] = SHA256(master_key || "ss-l-stock-v1" || iid || i_le4).
+ * This is a straightforward HKDF-style expansion. Same security model as
+ * before: the LSP holds all secrets; reveals secret[epoch-1] to the client
+ * during rotation so the client can burn the old L-stock if the LSP cheats.
+ *
+ * Output: fills `secrets_out[n_epochs][32]` with derived secrets.
+ * Callers must have ss_state.has_master_key == true. */
+static void derive_l_stock_secrets(unsigned char secrets_out[][32],
+				   size_t n_epochs,
+				   const uint8_t instance_id[32])
+{
+	static const char INFO[] = "ss-l-stock-v1";
+	for (size_t i = 0; i < n_epochs; i++) {
+		struct sha256 hash;
+		struct sha256_ctx sctx;
+		sha256_init(&sctx);
+		sha256_update(&sctx, ss_state.factory_master_key, 32);
+		sha256_update(&sctx, INFO, sizeof(INFO) - 1);
+		sha256_update(&sctx, instance_id, 32);
+		uint8_t ibuf[4];
+		ibuf[0] = (uint8_t)(i & 0xFF);
+		ibuf[1] = (uint8_t)((i >> 8) & 0xFF);
+		ibuf[2] = (uint8_t)((i >> 16) & 0xFF);
+		ibuf[3] = (uint8_t)((i >> 24) & 0xFF);
+		sha256_update(&sctx, ibuf, 4);
+		sha256_done(&sctx, &hash);
+		memcpy(secrets_out[i], hash.u.u8, 32);
+		/* Avoid the vanishingly unlikely zero/curve-order cases by
+		 * never producing a zero first byte. Revocation secrets are
+		 * just hash preimages — strict validity not required, but
+		 * nonzero is cheap insurance. */
+		if (secrets_out[i][0] == 0) secrets_out[i][0] = 0x01;
+	}
+}
+
 /* Forward declarations */
 static void ss_save_factory(struct command *cmd, factory_instance_t *fi);
 
@@ -1202,6 +1241,42 @@ static void ss_load_factories(struct command *cmd)
 
 	plugin_log(plugin_handle, LOG_INFORM,
 		   "Loaded %zu factories from datastore", loaded);
+
+	/* Reconcile factories that may have been mid-creation at shutdown.
+	 * A factory is "funding-pending" if we persisted its meta (so we
+	 * know the instance_id and expected funding_spk) but the
+	 * funding_txid is still all-zeros — meaning the withdraw RPC hadn't
+	 * returned when the plugin last exited, or the callback hadn't
+	 * finished writing. Log these loudly so the operator can check
+	 * on-chain whether the funding TX actually went out; if it did,
+	 * the funds are recoverable because we have every non-chain piece
+	 * of state (participants, iid, funding_spk). Before this PR those
+	 * factories became unrecoverable: instance_id was only in memory,
+	 * so the keys needed to spend the funding UTXO were lost on any
+	 * crash between withdraw-broadcast and persistence. */
+	for (size_t i = 0; i < ss_state.n_factories; i++) {
+		factory_instance_t *fi = ss_state.factories[i];
+		if (!fi || !fi->is_lsp) continue;
+		bool txid_zero = true;
+		for (int j = 0; j < 32 && txid_zero; j++)
+			if (fi->funding_txid[j] != 0) txid_zero = false;
+		if (txid_zero && fi->funding_spk_len == 34) {
+			char iid_hex[65];
+			for (int j = 0; j < 32; j++)
+				sprintf(iid_hex + j*2, "%02x", fi->instance_id[j]);
+			iid_hex[64] = '\0';
+			char addr[100];
+			if (segwit_addr_encode(addr, chainparams->onchain_hrp,
+				1, fi->funding_spk + 2, 32)) {
+				plugin_log(plugin_handle, LOG_UNUSUAL,
+					"Factory %s: funding-pending at startup "
+					"(no txid recorded). Expected funding "
+					"address: %s. Check on-chain and either "
+					"complete the ceremony or delete the "
+					"factory.", iid_hex, addr);
+			}
+		}
+	}
 }
 
 /* Dispatch SuperScalar protocol submessages.
@@ -1246,6 +1321,16 @@ static void continue_after_funding(struct command *cmd,
 			real_pks, n_total, DW_STEP_BLOCKS, 16);
 		factory_set_arity(new_f, n_total <= 2
 			? FACTORY_ARITY_1 : FACTORY_ARITY_2);
+		/* Restore L-stock secrets BEFORE build_tree so build_l_stock_spk
+		 * produces the same P2TR keys that went on-chain originally.
+		 * Without this, the rebuilt tree has no taptree on L-stock
+		 * outputs and every output key differs from the actual state. */
+		if (ss_state.has_master_key) {
+			static unsigned char rsecrets[256][32];
+			derive_l_stock_secrets(rsecrets, 256, fi->instance_id);
+			factory_set_flat_secrets(new_f,
+				(const unsigned char (*)[32])rsecrets, 256);
+		}
 		/* Use REAL funding from fi */
 		factory_set_funding(new_f, fi->funding_txid,
 			fi->funding_outnum, fi->funding_amount_sats,
@@ -2059,6 +2144,25 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 							   "withdraw %"PRIu64" to %s",
 							   fi->funding_amount_sats,
 							   addr);
+
+						/* Persist factory state BEFORE broadcasting the
+						 * funding TX. If the withdraw succeeds on-chain
+						 * but the plugin crashes before the callback
+						 * runs, the instance_id and participant set
+						 * would otherwise be lost — the funds would be
+						 * stuck at the funding address with no way to
+						 * derive the keys needed to spend them.
+						 *
+						 * We also need funding_spk on fi at this point
+						 * so startup reconciliation (checking whether a
+						 * funding UTXO appeared for us) has something to
+						 * match against. The funding_txid itself is
+						 * filled in later by withdraw_funding_ok. */
+						memcpy(fi->funding_spk,
+						       fctx->funding_spk,
+						       fctx->funding_spk_len);
+						fi->funding_spk_len = fctx->funding_spk_len;
+						ss_save_factory(cmd, fi);
 
 						/* Call withdraw RPC */
 						struct out_req *wreq =
@@ -4783,6 +4887,20 @@ static struct command_result *json_factory_create(struct command *cmd,
 			4320,   /* active period: ~30 days */
 			432);   /* dying period: ~3 days */
 
+		/* Derive L-stock revocation secrets BEFORE building the tree so
+		 * build_l_stock_spk() produces hashlocked P2TR outputs from
+		 * epoch 0 onward. This matters because the L-stock output keys
+		 * are committed when the tree is built; setting secrets later
+		 * would leave epoch-0 L-stock as bare-key (recoverable only by
+		 * LSP with no hashlock). Deterministic derivation from HSM
+		 * guarantees identical secrets after any restart. */
+		if (ss_state.has_master_key) {
+			static unsigned char secrets[256][32];
+			derive_l_stock_secrets(secrets, 256, fi->instance_id);
+			factory_set_flat_secrets(factory,
+				(const unsigned char (*)[32])secrets, 256);
+		}
+
 		/* Build the DW tree */
 		int rc = factory_build_tree(factory);
 		if (rc == 0) {
@@ -4852,15 +4970,23 @@ static struct command_result *json_factory_create(struct command *cmd,
 			}
 		}
 
-		/* Generate L-stock hashes (revocation-based) and store them.
-		 * These allow clients to build identical L-stock taptrees. */
-		if (factory_generate_flat_secrets(factory, 256)) {
+		/* L-stock secrets were set before build_tree when the HSM is
+		 * available (see above). Non-HSM fallback handled here —
+		 * generates random secrets that will NOT survive restart.
+		 * This path is for dev/test only. */
+		if (!ss_state.has_master_key
+		    && factory_generate_flat_secrets(factory, 256)) {
 			factory_set_l_stock_hashes(factory,
 				(const unsigned char (*)[32])factory->l_stock_hashes,
 				factory->n_l_stock_hashes);
-			plugin_log(plugin_handle, LOG_INFORM,
-				   "Generated %zu L-stock hashes",
+			plugin_log(plugin_handle, LOG_UNUSUAL,
+				   "Generated %zu L-stock hashes from urandom "
+				   "(no HSM — secrets will be lost on restart)",
 				   factory->n_l_stock_hashes);
+		} else if (factory->n_revocation_secrets > 0) {
+			plugin_log(plugin_handle, LOG_INFORM,
+				   "Using %zu HSM-derived L-stock secrets",
+				   factory->n_revocation_secrets);
 		}
 
 		/* Store factory handle + populate metadata from tree */
@@ -5411,9 +5537,19 @@ static struct command_result *json_factory_rotate(struct command *cmd,
 	secp256k1_context *ctx = global_secp_ctx;
 	uint32_t old_epoch = fi->epoch;
 
-	/* Generate revocation secret for current epoch before advancing */
-	if (factory->n_revocation_secrets == 0)
-		factory_generate_flat_secrets(factory, 256);
+	/* If secrets aren't loaded (e.g. factory was reloaded from datastore
+	 * after a restart), regenerate them deterministically from HSM so
+	 * the L-stock hashes match what went on-chain at factory creation. */
+	if (factory->n_revocation_secrets == 0) {
+		if (ss_state.has_master_key) {
+			static unsigned char secrets[256][32];
+			derive_l_stock_secrets(secrets, 256, fi->instance_id);
+			factory_set_flat_secrets(factory,
+				(const unsigned char (*)[32])secrets, 256);
+		} else {
+			factory_generate_flat_secrets(factory, 256);
+		}
+	}
 
 	/* Check proximity to exhaustion before advancing */
 	if (fi->max_epochs > 0 && fi->epoch >= fi->max_epochs - 1) {
