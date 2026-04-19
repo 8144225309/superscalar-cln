@@ -7709,7 +7709,11 @@ static int ss_penalty_scheduler_tick(struct command *cmd,
 		if (htlc_fee_bump_is_expired(&fb, current_block)) {
 			if (pp->state != PENALTY_STATE_REPLACED) {
 				pp->state = PENALTY_STATE_REPLACED;
-				plugin_log(plugin_handle, LOG_BROKEN,
+				/* LOG_UNUSUAL not LOG_BROKEN: an adversarial
+				 * outcome (we lost the race), not a plugin
+				 * internal bug. pyln-testing treats BROKEN as
+				 * a fatal teardown error. */
+				plugin_log(plugin_handle, LOG_UNUSUAL,
 					   "PENALTY EXPIRED: epoch=%u leaf=%d "
 					   "CSV at block %u passed without "
 					   "our burn confirming. Counterparty "
