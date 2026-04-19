@@ -380,10 +380,25 @@ static void ss_snapshot_current_epoch_kickoff_sig(factory_instance_t *fi)
 	size_t slot = fi->n_history_kickoff_sigs;
 	fi->history_kickoff_epochs[slot] = fi->epoch;
 	memcpy(fi->history_kickoff_sigs[slot], sig, 64);
+
+	/* Phase 3b: also snapshot the state-tree-root TXID for this
+	 * epoch. nodes[1] is the state TX that spends the kickoff's
+	 * output; its txid is epoch-specific (different revocation
+	 * commitments per epoch produce different output scripts → different
+	 * txid). Stored alongside the kickoff sig under the same slot so
+	 * the downstream classifier can match by either signal. */
+	if (f->n_nodes > 1) {
+		memcpy(fi->history_state_root_txids[slot],
+		       f->nodes[1].txid, 32);
+	} else {
+		memset(fi->history_state_root_txids[slot], 0, 32);
+	}
+
 	fi->n_history_kickoff_sigs++;
 
 	plugin_log(plugin_handle, LOG_DBG,
-		   "Captured kickoff witness sig for epoch %u (history slot %zu)",
+		   "Captured kickoff witness sig + state-root txid for epoch %u "
+		   "(history slot %zu)",
 		   fi->epoch, slot);
 }
 
@@ -4718,12 +4733,8 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 					for (size_t h = 0; h < ctx_buf->len; h++)
 						sprintf(ctx_hex + h*2, "%02x",
 							ctx_buf->data[h]);
-					struct out_req *btx = jsonrpc_request_start(
-						cmd, "sendrawtransaction",
-						rpc_done, rpc_err, fi);
-					json_add_string(btx->js, "tx", ctx_hex);
-					json_add_bool(btx->js, "allowhighfees", true);
-					send_outreq(btx);
+					ss_broadcast_factory_tx(cmd, fi, ctx_hex,
+								FACTORY_TX_DIST);
 					plugin_log(plugin_handle, LOG_INFORM,
 						   "LSP: broadcast cooperative close TX");
 				}
@@ -5829,6 +5840,33 @@ static struct command_result *json_factory_list(struct command *cmd,
 		if (fi->n_history_kickoff_sigs > 0)
 			json_add_u32(js, "kickoff_sig_history_epochs_cached",
 				     (u32)fi->n_history_kickoff_sigs);
+
+		/* Phase 3b: signals observed + state-TX scan result. */
+		if (fi->signals_observed) {
+			json_add_u32(js, "signals_observed",
+				     (u32)fi->signals_observed);
+			json_array_start(js, "signals");
+			if (fi->signals_observed & SIGNAL_UTXO_SPENT)
+				json_add_string(js, NULL, "utxo_spent");
+			if (fi->signals_observed & SIGNAL_BROADCAST_MISSING)
+				json_add_string(js, NULL, "broadcast_missing");
+			if (fi->signals_observed & SIGNAL_BROADCAST_KNOWN)
+				json_add_string(js, NULL, "broadcast_known");
+			if (fi->signals_observed & SIGNAL_DIST_TXID_MATCHED)
+				json_add_string(js, NULL, "dist_txid_matched");
+			if (fi->signals_observed & SIGNAL_KICKOFF_TXID_MATCHED)
+				json_add_string(js, NULL, "kickoff_txid_matched");
+			if (fi->signals_observed & SIGNAL_WITNESS_CURRENT_MATCH)
+				json_add_string(js, NULL, "witness_current_match");
+			if (fi->signals_observed & SIGNAL_WITNESS_PAST_MATCH)
+				json_add_string(js, NULL, "witness_past_match");
+			if (fi->signals_observed & SIGNAL_STATE_TX_MATCH)
+				json_add_string(js, NULL, "state_tx_match");
+			json_array_end(js);
+		}
+		if (fi->state_tx_match_epoch != UINT32_MAX)
+			json_add_u32(js, "state_tx_match_epoch",
+				     fi->state_tx_match_epoch);
 		json_add_string(js, "ceremony",
 			fi->ceremony == CEREMONY_IDLE ? "idle" :
 			fi->ceremony == CEREMONY_PROPOSED ? "proposed" :
@@ -6374,13 +6412,12 @@ static struct command_result *json_factory_force_close(struct command *cmd,
 			   factory->nodes[ni].type == 0 ? "kickoff" : "state",
 			   stx->len, txid_hex);
 
-		/* Broadcast via sendrawtransaction */
-		struct out_req *breq = jsonrpc_request_start(
-			cmd, "sendrawtransaction",
-			rpc_done, rpc_err, fi);
-		json_add_string(breq->js, "tx", tx_hex);
-		json_add_bool(breq->js, "allowhighfees", true);
-		send_outreq(breq);
+		/* Broadcast via classified wrapper — each broadcast gets its
+		 * own aux_command so replies survive this RPC's lifetime and
+		 * the classifier can refine lifecycle on -25/-26/-27 replies. */
+		ss_broadcast_factory_tx(cmd, fi, tx_hex,
+					ni == 0 ? FACTORY_TX_KICKOFF
+						: FACTORY_TX_STATE);
 		plugin_log(plugin_handle, LOG_INFORM,
 			   "force-close: broadcast node %zu (txid=%s)",
 			   ni, txid_hex);
@@ -7081,6 +7118,389 @@ static void ss_catchup_breach_scan(struct command *cmd)
 	}
 }
 
+/* ============================================================
+ * Phase 3b: layered signal interpretation.
+ *
+ * Three orthogonal evidence sources combine in ss_apply_signals():
+ *   - SIGNAL_UTXO_SPENT          (heartbeat)
+ *   - SIGNAL_BROADCAST_MISSING   (sendrawtransaction → -25)
+ *   - SIGNAL_BROADCAST_KNOWN     (sendrawtransaction → -27/-26)
+ *   - SIGNAL_DIST_TXID_MATCHED   (spending tx == dist_signed_txid)
+ *   - SIGNAL_KICKOFF_TXID_MATCHED(spending tx == kickoff txid)
+ *   - SIGNAL_WITNESS_CURRENT_MATCH/PAST_MATCH  (witness sig match)
+ *   - SIGNAL_STATE_TX_MATCH      (downstream state-TX match)
+ *
+ * Sources may fire in any order. ss_apply_signals reads the bitmask
+ * AND state_tx_match_epoch / breach_epoch / dist match results, then
+ * derives a single canonical lifecycle decision. Idempotent — re-
+ * running with new evidence can only refine, never downgrade.
+ * ============================================================ */
+
+/* Set lifecycle + closed_by + breach_epoch from the union of signals.
+ * Called whenever a new signal is set on fi->signals_observed. Persists. */
+static void ss_apply_signals(struct command *cmd, factory_instance_t *fi)
+{
+	uint8_t s = fi->signals_observed;
+
+	/* Skip if already in a more-specific terminal state — we don't
+	 * downgrade. CLOSED_EXTERNALLY is the weakest closed-* label;
+	 * we'll happily upgrade away from it but won't move backwards. */
+	bool can_refine = !factory_is_closed(fi->lifecycle)
+		|| fi->lifecycle == FACTORY_LIFECYCLE_CLOSED_EXTERNALLY;
+	if (!can_refine) return;
+
+	factory_lifecycle_t new_lifecycle = fi->lifecycle;
+	uint8_t new_closed_by = fi->closed_by;
+
+	if (s & SIGNAL_DIST_TXID_MATCHED) {
+		new_lifecycle = FACTORY_LIFECYCLE_CLOSED_COOPERATIVE;
+		new_closed_by = CLOSED_BY_UNKNOWN;
+	} else if (s & SIGNAL_WITNESS_PAST_MATCH) {
+		/* Strongest breach signal: explicit witness match to past
+		 * epoch. breach_epoch already populated by the path that
+		 * set this bit. */
+		new_lifecycle = FACTORY_LIFECYCLE_CLOSED_BREACHED;
+		new_closed_by = CLOSED_BY_COUNTERPARTY;
+	} else if (s & SIGNAL_STATE_TX_MATCH) {
+		/* Downstream scan found a state TX. state_tx_match_epoch
+		 * tells us which epoch. Match against current_epoch tells
+		 * us whether normal-exit or breach. */
+		if (fi->state_tx_match_epoch == fi->epoch) {
+			new_lifecycle = FACTORY_LIFECYCLE_CLOSED_UNILATERAL;
+			new_closed_by = CLOSED_BY_COUNTERPARTY;
+		} else {
+			new_lifecycle = FACTORY_LIFECYCLE_CLOSED_BREACHED;
+			new_closed_by = CLOSED_BY_COUNTERPARTY;
+			fi->breach_epoch = fi->state_tx_match_epoch;
+		}
+	} else if (s & SIGNAL_WITNESS_CURRENT_MATCH) {
+		new_lifecycle = FACTORY_LIFECYCLE_CLOSED_UNILATERAL;
+		new_closed_by = CLOSED_BY_COUNTERPARTY;
+	} else if (s & SIGNAL_BROADCAST_KNOWN) {
+		/* "Already in mempool/blockchain" on a kickoff broadcast:
+		 * someone broadcast a kickoff. Without finer signals we
+		 * can only label as CLOSED_UNILATERAL with epoch unknown.
+		 * Phase 2b's witness path or downstream scan will refine. */
+		new_lifecycle = FACTORY_LIFECYCLE_CLOSED_UNILATERAL;
+		new_closed_by = CLOSED_BY_COUNTERPARTY;
+	} else if ((s & SIGNAL_UTXO_SPENT) || (s & SIGNAL_BROADCAST_MISSING)) {
+		/* Root spent but we have no specific match — either external
+		 * sweep (recovery tool, HSM-lost) or coop/breach we couldn't
+		 * resolve. Phase 2a's spending-TX scan continues working;
+		 * any later signal will refine via this same function. */
+		new_lifecycle = FACTORY_LIFECYCLE_CLOSED_EXTERNALLY;
+		new_closed_by = CLOSED_BY_COUNTERPARTY;
+	} else {
+		/* No closed-* signals fired; nothing to do. */
+		return;
+	}
+
+	if (new_lifecycle == fi->lifecycle && new_closed_by == fi->closed_by)
+		return;
+
+	char iid_hex[65];
+	for (int j = 0; j < 32; j++)
+		sprintf(iid_hex + j*2, "%02x", fi->instance_id[j]);
+	iid_hex[64] = '\0';
+	plugin_log(plugin_handle, LOG_INFORM,
+		   "ss_apply_signals: factory %s signals=0x%02x → lifecycle "
+		   "%d (was %d), closed_by %d (was %d), breach_epoch %u",
+		   iid_hex, s, (int)new_lifecycle, (int)fi->lifecycle,
+		   (int)new_closed_by, (int)fi->closed_by, fi->breach_epoch);
+
+	fi->lifecycle = new_lifecycle;
+	fi->closed_by = new_closed_by;
+	if (cmd) ss_save_factory(cmd, fi);
+}
+
+/* Phase 3b: broadcast-reply hook context. */
+struct broadcast_reply_ctx {
+	factory_instance_t *fi;
+	enum {
+		FACTORY_TX_KICKOFF = 0,
+		FACTORY_TX_STATE = 1,
+		FACTORY_TX_BURN = 2,
+		FACTORY_TX_DIST = 3,
+	} kind;
+};
+
+static const char *factory_tx_kind_name(int k)
+{
+	switch (k) {
+	case FACTORY_TX_KICKOFF: return "kickoff";
+	case FACTORY_TX_STATE:   return "state";
+	case FACTORY_TX_BURN:    return "burn";
+	case FACTORY_TX_DIST:    return "dist";
+	default: return "unknown";
+	}
+}
+
+/* Reply callback for ss_broadcast_factory_tx. Reads the result for
+ * specific bitcoind error codes that tell us about chain state, sets
+ * the appropriate signal on the factory, and runs ss_apply_signals to
+ * update lifecycle. */
+static struct command_result *
+broadcast_reply_classified(struct command *cmd,
+			   const char *method,
+			   const char *buf,
+			   const jsmntok_t *result,
+			   void *arg)
+{
+	struct broadcast_reply_ctx *bc =
+		(struct broadcast_reply_ctx *)arg;
+	factory_instance_t *fi = bc->fi;
+
+	const jsmntok_t *succ_tok = json_get_member(buf, result, "success");
+	bool success = false;
+	if (succ_tok) json_to_bool(buf, succ_tok, &success);
+
+	const jsmntok_t *errmsg_tok = json_get_member(buf, result, "errmsg");
+	const char *errmsg = errmsg_tok ? buf + errmsg_tok->start : NULL;
+
+	if (success) {
+		/* Our broadcast was accepted to mempool. No new signal —
+		 * we initiated, lifecycle is presumably already DYING.
+		 * Just log for the audit trail. */
+		plugin_log(plugin_handle, LOG_DBG,
+			   "broadcast_reply: %s TX accepted",
+			   factory_tx_kind_name(bc->kind));
+		return aux_command_done(cmd);
+	}
+
+	/* Parse known error patterns. errmsg looks like:
+	 *   "error code: -25\nerror message:\nbad-txns-inputs-missingorspent"
+	 */
+	uint8_t signal_to_set = 0;
+	const char *what = "unknown";
+	if (errmsg) {
+		if (strstr(errmsg, "missingorspent")) {
+			signal_to_set = SIGNAL_BROADCAST_MISSING;
+			what = "missingorspent";
+		} else if (strstr(errmsg, "already in")
+			   || strstr(errmsg, "already in utxo set")
+			   || strstr(errmsg, "already known")) {
+			/* "Transaction outputs already in utxo set" is the
+			 * code -27 message we see in production logs. */
+			signal_to_set = SIGNAL_BROADCAST_KNOWN;
+			what = "already-known";
+		}
+	}
+
+	if (signal_to_set && bc->kind == FACTORY_TX_KICKOFF) {
+		fi->signals_observed |= signal_to_set;
+		char iid_hex[65];
+		for (int j = 0; j < 32; j++)
+			sprintf(iid_hex + j*2, "%02x", fi->instance_id[j]);
+		iid_hex[64] = '\0';
+		plugin_log(plugin_handle, LOG_INFORM,
+			   "broadcast_reply: factory %s kickoff broadcast "
+			   "→ %s (signal 0x%02x set), running classifier",
+			   iid_hex, what, signal_to_set);
+		ss_apply_signals(cmd, fi);
+	} else if (signal_to_set) {
+		plugin_log(plugin_handle, LOG_DBG,
+			   "broadcast_reply: %s TX %s — informational only",
+			   factory_tx_kind_name(bc->kind), what);
+	} else {
+		plugin_log(plugin_handle, LOG_DBG,
+			   "broadcast_reply: %s TX failed (no recognized "
+			   "error pattern): %s",
+			   factory_tx_kind_name(bc->kind),
+			   errmsg ? errmsg : "(no errmsg)");
+	}
+
+	return aux_command_done(cmd);
+}
+
+/* Wrapper around sendrawtransaction that classifies the reply for
+ * factory-related TXs. Use this instead of raw sendrawtransaction for
+ * any kickoff/state/burn/dist broadcast we want to learn from. */
+static void ss_broadcast_factory_tx(struct command *cmd,
+				    factory_instance_t *fi,
+				    const char *tx_hex,
+				    int kind)
+{
+	struct command *acmd = aux_command(cmd);
+	struct broadcast_reply_ctx *bc = tal(acmd, struct broadcast_reply_ctx);
+	bc->fi = fi;
+	bc->kind = kind;
+
+	struct out_req *req = jsonrpc_request_start(acmd,
+		"sendrawtransaction",
+		broadcast_reply_classified,
+		broadcast_reply_classified, /* same handler for errors */
+		bc);
+	json_add_string(req->js, "tx", tx_hex);
+	json_add_bool(req->js, "allowhighfees", true);
+	send_outreq(req);
+}
+
+/* Phase 3b: downstream state-TX scan. After observing the kickoff
+ * spent (root UTXO consumed), scan recent blocks for the state TX
+ * that spends the kickoff's tree-root output. Match against the
+ * per-epoch state_root_txid cache to identify the epoch. */
+struct state_tx_scan_ctx {
+	factory_instance_t *fi;
+	uint8_t kickoff_txid[32];
+	uint32_t scan_height;
+	uint32_t scan_remaining;
+};
+
+static struct command_result *state_scan_blockhash_cb(struct command *cmd,
+						       const char *method,
+						       const char *buf,
+						       const jsmntok_t *result,
+						       void *arg);
+static struct command_result *state_scan_block_cb(struct command *cmd,
+						   const char *method,
+						   const char *buf,
+						   const jsmntok_t *result,
+						   void *arg);
+
+static void request_blockhash_for_state_scan(struct command *cmd,
+					     struct state_tx_scan_ctx *ctx)
+{
+	struct out_req *req = jsonrpc_request_start(cmd, "getblockhash",
+		state_scan_blockhash_cb, breach_scan_rpc_err, ctx);
+	json_add_u32(req->js, "height", ctx->scan_height);
+	send_outreq(req);
+}
+
+static struct command_result *state_scan_blockhash_cb(struct command *cmd,
+						       const char *method,
+						       const char *buf,
+						       const jsmntok_t *result,
+						       void *arg)
+{
+	struct state_tx_scan_ctx *ctx = (struct state_tx_scan_ctx *)arg;
+	if (!result || result->type != JSMN_STRING)
+		return aux_command_done(cmd);
+	int hash_len = result->end - result->start;
+	char *hash = tal_arr(cmd, char, hash_len + 1);
+	memcpy(hash, buf + result->start, hash_len);
+	hash[hash_len] = '\0';
+
+	struct out_req *req = jsonrpc_request_start(cmd, "getblock",
+		state_scan_block_cb, breach_scan_rpc_err, ctx);
+	json_add_string(req->js, "blockhash", hash);
+	json_add_u32(req->js, "verbosity", 2);
+	send_outreq(req);
+	return command_still_pending(cmd);
+}
+
+static struct command_result *state_scan_block_cb(struct command *cmd,
+						   const char *method,
+						   const char *buf,
+						   const jsmntok_t *result,
+						   void *arg)
+{
+	struct state_tx_scan_ctx *ctx = (struct state_tx_scan_ctx *)arg;
+	factory_instance_t *fi = ctx->fi;
+
+	/* We're looking for a TX whose vin includes
+	 * (kickoff_txid, vout=0). Build the display-order hex of our
+	 * kickoff_txid for string compare. */
+	char want_hex[65];
+	for (int j = 0; j < 32; j++)
+		sprintf(want_hex + j*2, "%02x", ctx->kickoff_txid[31-j]);
+	want_hex[64] = '\0';
+
+	const jsmntok_t *txs = json_get_member(buf, result, "tx");
+	if (!txs || txs->type != JSMN_ARRAY) goto next;
+
+	const jsmntok_t *tx_tok;
+	size_t ti;
+	json_for_each_arr(ti, tx_tok, txs) {
+		const jsmntok_t *vins = json_get_member(buf, tx_tok, "vin");
+		if (!vins || vins->type != JSMN_ARRAY) continue;
+		const jsmntok_t *vin_tok;
+		size_t vi;
+		json_for_each_arr(vi, vin_tok, vins) {
+			const jsmntok_t *txid_tok =
+				json_get_member(buf, vin_tok, "txid");
+			if (!txid_tok
+			    || txid_tok->end - txid_tok->start != 64)
+				continue;
+			if (memcmp(buf + txid_tok->start, want_hex, 64) != 0)
+				continue;
+
+			/* Found a TX spending our kickoff. Get its txid. */
+			const jsmntok_t *spending_txid_tok =
+				json_get_member(buf, tx_tok, "txid");
+			if (!spending_txid_tok) continue;
+			uint8_t spending_txid[32];
+			for (int j = 0; j < 32; j++) {
+				unsigned int b;
+				if (sscanf(buf + spending_txid_tok->start
+					   + j*2, "%02x", &b) != 1)
+					goto next;
+				spending_txid[31-j] = (uint8_t)b;
+			}
+
+			/* Match against per-epoch state-root TXID cache. */
+			for (size_t i = 0; i < fi->n_history_kickoff_sigs; i++) {
+				if (memcmp(spending_txid,
+					   fi->history_state_root_txids[i], 32) == 0) {
+					fi->state_tx_match_epoch =
+						fi->history_kickoff_epochs[i];
+					fi->signals_observed |=
+						SIGNAL_STATE_TX_MATCH;
+					plugin_log(plugin_handle, LOG_INFORM,
+						"State-TX scan: kickoff "
+						"output spent at epoch %u "
+						"(current %u). Setting "
+						"SIGNAL_STATE_TX_MATCH.",
+						fi->state_tx_match_epoch,
+						fi->epoch);
+					ss_apply_signals(cmd, fi);
+					return aux_command_done(cmd);
+				}
+			}
+
+			plugin_log(plugin_handle, LOG_UNUSUAL,
+				   "State-TX scan: kickoff output spent by "
+				   "TX whose txid doesn't match any cached "
+				   "per-epoch state root. Either pre-Phase-3b "
+				   "rotation (unrecoverable) or genuine "
+				   "external sweep.");
+			return aux_command_done(cmd);
+		}
+	}
+
+next:
+	if (ctx->scan_height == 0 || ctx->scan_remaining == 0) {
+		plugin_log(plugin_handle, LOG_DBG,
+			   "State-TX scan: no spend of kickoff output found "
+			   "in scan window.");
+		return aux_command_done(cmd);
+	}
+	ctx->scan_height--;
+	ctx->scan_remaining--;
+	request_blockhash_for_state_scan(cmd, ctx);
+	return command_still_pending(cmd);
+}
+
+/* Entry point for the downstream state-TX scan. Caller passes the
+ * kickoff txid (the parent of the state TX we're searching for). */
+static void ss_launch_state_tx_scan(struct command *cmd,
+				    factory_instance_t *fi,
+				    const uint8_t *kickoff_txid,
+				    uint32_t window)
+{
+	if (ss_state.current_blockheight == 0) return;
+
+	struct command *acmd = aux_command(cmd);
+	struct state_tx_scan_ctx *ctx =
+		tal(acmd, struct state_tx_scan_ctx);
+	ctx->fi = fi;
+	memcpy(ctx->kickoff_txid, kickoff_txid, 32);
+	ctx->scan_height = fi->first_noticed_block
+		? fi->first_noticed_block
+		: ss_state.current_blockheight;
+	ctx->scan_remaining = window;
+	request_blockhash_for_state_scan(acmd, ctx);
+}
+
 static struct command_result *breach_utxo_checked(struct command *cmd,
 						   const char *method,
 						   const char *buf,
@@ -7124,18 +7544,21 @@ static struct command_result *breach_utxo_checked(struct command *cmd,
 		 * ready to sweep its L-stock. The two concerns (lifecycle
 		 * flag vs burn-tx assembly) are complementary, not mutually
 		 * exclusive. */
-		/* Phase 3a: transition any non-DYING, non-already-closed
-		 * factory to CLOSED_EXTERNALLY when a spend is observed.
-		 * DYING means we initiated the close; the spend is expected
-		 * (don't relabel). ACTIVE is the normal case. INIT covers
-		 * the "ceremony-not-complete-but-funded" zombies (the 9
-		 * signet recovery factories). */
-		bool should_mark =
-			fi->lifecycle == FACTORY_LIFECYCLE_ACTIVE
-			|| fi->lifecycle == FACTORY_LIFECYCLE_INIT;
-		if (should_mark) {
-			factory_lifecycle_t prior = fi->lifecycle;
-			fi->lifecycle = FACTORY_LIFECYCLE_CLOSED_EXTERNALLY;
+		/* Phase 3b: feed the UTXO-spent signal into the unified
+		 * classifier. apply_signals handles the lifecycle transition
+		 * idempotently, so this path is safe to re-enter. The
+		 * ancillary fields (closed_externally_at_block etc.) are set
+		 * here because they're specific to THIS signal firing first
+		 * — apply_signals only owns lifecycle + closed_by. */
+		factory_lifecycle_t prior = fi->lifecycle;
+		bool first_spent_observation =
+			!(fi->signals_observed & SIGNAL_UTXO_SPENT);
+		fi->signals_observed |= SIGNAL_UTXO_SPENT;
+
+		if (first_spent_observation
+		    && (prior == FACTORY_LIFECYCLE_ACTIVE
+			|| prior == FACTORY_LIFECYCLE_INIT
+			|| prior == FACTORY_LIFECYCLE_DYING)) {
 			fi->closed_externally_at_block =
 				ss_state.current_blockheight;
 			fi->first_noticed_block =
@@ -7146,23 +7569,40 @@ static struct command_result *breach_utxo_checked(struct command *cmd,
 					fi->instance_id[j]);
 			iid_hex[64] = '\0';
 			plugin_log(plugin_handle, LOG_BROKEN,
-				   "FACTORY CLOSED EXTERNALLY: instance_id=%s "
+				   "FACTORY ROOT SPENT: instance_id=%s "
 				   "funding root spent at block %u (was in "
-				   "lifecycle %d) without plugin-initiated "
-				   "close. Marked closed_externally. Phase 2a "
-				   "scan will attempt to identify the spending "
-				   "TX. Run factory-confirm-closed %s to reap "
-				   "after verifying funds are safe.",
+				   "lifecycle %d). Feeding SIGNAL_UTXO_SPENT "
+				   "to classifier; Phase 2a spending-TX scan "
+				   "and Phase 3b state-TX scan will refine.",
 				   iid_hex, ss_state.current_blockheight,
-				   (int)prior, iid_hex);
+				   (int)prior);
+
+			ss_apply_signals(cmd, fi);
 			ss_save_factory(cmd, fi);
 
-			/* Phase 2a: launch spending-TX scan. Default window is
-			 * 144 blocks (~1 day) which covers the common case where
-			 * the heartbeat fires on the same or next block the
-			 * spend actually confirmed. Operator can widen via
-			 * factory-scan-external-close if needed. */
+			/* Phase 2a: identify the spending TX (match against
+			 * our own dist/kickoff/state txids). 144-block window
+			 * covers the common case where the heartbeat fires on
+			 * the same or next block the spend confirmed. */
 			ss_launch_spending_tx_scan(cmd, fi, 144);
+
+			/* Phase 3b: downstream state-TX scan. If someone
+			 * published a kickoff, the state TX spending its
+			 * tree-root output should be in a nearby block.
+			 * Matching against history_state_root_txids tells us
+			 * which epoch — the strongest breach-vs-normal-exit
+			 * signal we have. */
+			factory_t *ftmp = (factory_t *)fi->lib_factory;
+			if (ftmp && ftmp->n_nodes > 0)
+				ss_launch_state_tx_scan(cmd, fi,
+							ftmp->nodes[0].txid,
+							144);
+		} else if (first_spent_observation) {
+			/* prior was EXPIRED/CLOSED_* — still record the
+			 * signal + re-run classifier but don't stomp the
+			 * ancillary block-tag fields. */
+			ss_apply_signals(cmd, fi);
+			ss_save_factory(cmd, fi);
 		}
 
 		/* Previously this loop called factory_build_burn_tx with
@@ -7232,15 +7672,9 @@ static struct command_result *breach_utxo_checked(struct command *cmd,
 						sprintf(burn_hex + h*2, "%02x",
 							burn_tx.data[h]);
 
-					struct out_req *breq =
-						jsonrpc_request_start(cmd,
-							"sendrawtransaction",
-							rpc_done, rpc_err, fi);
-					json_add_string(breq->js, "tx",
-							burn_hex);
-					json_add_bool(breq->js,
-						"allowhighfees", true);
-					send_outreq(breq);
+					ss_broadcast_factory_tx(cmd, fi,
+								burn_hex,
+								FACTORY_TX_BURN);
 					burn_count++;
 
 					plugin_log(plugin_handle, LOG_UNUSUAL,
@@ -7297,12 +7731,9 @@ static struct command_result *breach_utxo_checked(struct command *cmd,
 				   "state node %zu (%zu bytes)",
 				   ni, f->nodes[ni].signed_tx.len);
 
-			struct out_req *sreq = jsonrpc_request_start(
-				cmd, "sendrawtransaction",
-				rpc_done, rpc_err, fi);
-			json_add_string(sreq->js, "tx", tx_hex);
-			json_add_bool(sreq->js, "allowhighfees", true);
-			send_outreq(sreq);
+			ss_broadcast_factory_tx(cmd, fi, tx_hex,
+						ni == 0 ? FACTORY_TX_KICKOFF
+							: FACTORY_TX_STATE);
 		}
 	}
 
@@ -7356,12 +7787,8 @@ static struct command_result *handle_block_added(struct command *cmd,
 				for (size_t h = 0; h < fi->dist_signed_tx_len; h++)
 					sprintf(dist_hex + h*2, "%02x",
 						fi->dist_signed_tx[h]);
-				struct out_req *dreq = jsonrpc_request_start(
-					cmd, "sendrawtransaction",
-					rpc_done, rpc_err, fi);
-				json_add_string(dreq->js, "tx", dist_hex);
-				json_add_bool(dreq->js, "allowhighfees", true);
-				send_outreq(dreq);
+				ss_broadcast_factory_tx(cmd, fi, dist_hex,
+							FACTORY_TX_DIST);
 				plugin_log(plugin_handle, LOG_INFORM,
 					   "Broadcasting distribution TX "
 					   "(%zu bytes) — client fallback",
@@ -7411,14 +7838,9 @@ static struct command_result *handle_block_added(struct command *cmd,
 							     h < timeout_tx.len; h++)
 								sprintf(th + h*2, "%02x",
 									timeout_tx.data[h]);
-							struct out_req *treq =
-								jsonrpc_request_start(cmd,
-									"sendrawtransaction",
-									rpc_done, rpc_err, fi);
-							json_add_string(treq->js, "tx", th);
-							json_add_bool(treq->js,
-								"allowhighfees", true);
-							send_outreq(treq);
+							ss_broadcast_factory_tx(cmd, fi,
+										th,
+										FACTORY_TX_STATE);
 							plugin_log(plugin_handle, LOG_INFORM,
 								   "Timeout spend: node %zu "
 								   "(%zu bytes)", ni,
@@ -7518,14 +7940,9 @@ static struct command_result *handle_block_added(struct command *cmd,
 					for (size_t h = 0; h < stx->len; h++)
 						sprintf(tx_hex + h*2, "%02x",
 							stx->data[h]);
-					struct out_req *breq =
-						jsonrpc_request_start(cmd,
-							"sendrawtransaction",
-							rpc_done, rpc_err, fi);
-					json_add_string(breq->js, "tx", tx_hex);
-					json_add_bool(breq->js, "allowhighfees",
-						      true);
-					send_outreq(breq);
+					ss_broadcast_factory_tx(cmd, fi, tx_hex,
+								ni == 0 ? FACTORY_TX_KICKOFF
+									: FACTORY_TX_STATE);
 				}
 			}
 		}
@@ -7655,13 +8072,8 @@ static struct command_result *json_factory_check_breach(struct command *cmd,
 		   "Breach penalty tx built for epoch %u (%zu bytes)",
 		   *epoch, burn_tx.len);
 
-	/* Broadcast penalty TX immediately */
-	struct out_req *breq = jsonrpc_request_start(
-		cmd, "sendrawtransaction",
-		rpc_done, rpc_err, fi);
-	json_add_string(breq->js, "tx", burn_hex);
-	json_add_bool(breq->js, "allowhighfees", true);
-	send_outreq(breq);
+	/* Broadcast penalty TX immediately via classified wrapper. */
+	ss_broadcast_factory_tx(cmd, fi, burn_hex, FACTORY_TX_BURN);
 	plugin_log(plugin_handle, LOG_INFORM,
 		   "Breach penalty tx broadcast for epoch %u", *epoch);
 

@@ -23,6 +23,8 @@ factory_instance_t *ss_factory_new(superscalar_state_t *state,
 	memcpy(fi->instance_id, instance_id, 32);
 	fi->lifecycle = FACTORY_LIFECYCLE_INIT;
 	fi->ceremony = CEREMONY_IDLE;
+	fi->breach_epoch = UINT32_MAX;
+	fi->state_tx_match_epoch = UINT32_MAX;
 
 	state->factories[state->n_factories++] = fi;
 	return fi;
