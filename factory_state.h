@@ -112,6 +112,12 @@ typedef enum {
 	PENALTY_STATE_CONFIRMED = 2, /* on chain with >=1 conf */
 	PENALTY_STATE_REPLACED  = 3, /* counterparty won the race (RBF or
 				      * CSV-expired claim) — we lost */
+	PENALTY_STATE_STALE     = 4, /* Phase 4b: source UTXO no longer
+				      * exists (counterparty RBF'd the
+				      * state TX). Burn references a dead
+				      * outpoint; need to re-scan to find
+				      * the new state TX and rebuild. v2
+				      * will auto-rebuild; v1 just flags. */
 } penalty_state_t;
 
 typedef struct {

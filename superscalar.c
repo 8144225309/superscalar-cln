@@ -5976,7 +5976,9 @@ static struct command_result *json_factory_list(struct command *cmd,
 					pp->state == PENALTY_STATE_CONFIRMED
 						? "confirmed" :
 					pp->state == PENALTY_STATE_REPLACED
-						? "replaced" : "unknown");
+						? "replaced" :
+					pp->state == PENALTY_STATE_STALE
+						? "stale" : "unknown");
 				json_object_end(js);
 			}
 			json_array_end(js);
@@ -7746,7 +7748,8 @@ static int ss_penalty_scheduler_tick(struct command *cmd,
 	for (size_t i = 0; i < fi->n_pending_penalties; i++) {
 		pending_penalty_t *pp = &fi->pending_penalties[i];
 		if (pp->state == PENALTY_STATE_CONFIRMED
-		    || pp->state == PENALTY_STATE_REPLACED)
+		    || pp->state == PENALTY_STATE_REPLACED
+		    || pp->state == PENALTY_STATE_STALE)
 			continue;
 
 		htlc_fee_bump_t fb;
@@ -7977,6 +7980,128 @@ static void ss_penalty_reorg_check_stub(factory_instance_t *fi)
 	 * working or (b) track (height, blockhash) per penalty so we can
 	 * detect the reorg without eagerly probing. */
 	(void)fi;
+}
+
+/* ============================================================
+ * Phase 4b: RBF / mempool-race detection.
+ *
+ * Scenario: counterparty publishes state TX A, we build burn against
+ * A's L-stock output, broadcast it. Before our burn confirms, they
+ * RBF replace A with state TX B (different epoch or fee). Our burn
+ * now references a dead outpoint and will never confirm.
+ *
+ * Detection: for each pending_penalty in BROADCAST or PENDING state,
+ * gettxout the source UTXO. If null AND our burn hasn't confirmed,
+ * the source TX got replaced — flip state to PENALTY_STATE_STALE.
+ *
+ * V1 (this PR): detection + state flag + operator visibility. Auto-
+ * rebuild against the new outpoint is V2 — needs the state-TX scanner
+ * to find the replacement first, then ss_register_pending_penalty
+ * with the new (epoch, leaf, source). For now, operators see "stale"
+ * in factory-list and can manually trigger factory-scan-external-
+ * close + factory-check-breach to drive the rebuild.
+ *
+ * Algorithm parallel to Phase 4e reorg_check, but checks the SOURCE
+ * UTXO our burn spends, not the burn TXID itself.
+ * ============================================================ */
+
+struct source_check_ctx {
+	factory_instance_t *fi;
+	size_t penalty_idx;
+};
+
+static struct command_result *
+source_check_gettxout_reply(struct command *cmd,
+			    const char *method UNUSED,
+			    const char *buf,
+			    const jsmntok_t *result,
+			    void *arg)
+{
+	struct source_check_ctx *ctx = (struct source_check_ctx *)arg;
+	factory_instance_t *fi = ctx->fi;
+	if (ctx->penalty_idx >= fi->n_pending_penalties)
+		return aux_command_done(cmd);
+	pending_penalty_t *pp = &fi->pending_penalties[ctx->penalty_idx];
+
+	/* Re-check state — caller may have raced. We only act on
+	 * BROADCAST/PENDING. CONFIRMED/REPLACED/STALE are terminal-ish. */
+	if (pp->state != PENALTY_STATE_BROADCAST
+	    && pp->state != PENALTY_STATE_PENDING)
+		return aux_command_done(cmd);
+
+	/* Plugin's checkutxo wraps gettxout. The result has an "exists"
+	 * boolean. true = source UTXO present; false = spent or never
+	 * existed. For our purposes, false on a previously-broadcastable
+	 * source means the state TX was RBF'd or the leaf TX confirmed
+	 * AND was already swept (the latter is the "we won" case but our
+	 * confirmed_block would be set, gating us out above). */
+	bool source_present = false;
+	if (result) {
+		const jsmntok_t *exists = json_get_member(buf, result,
+							  "exists");
+		if (exists)
+			json_to_bool(buf, exists, &source_present);
+	}
+
+	if (!source_present) {
+		plugin_log(plugin_handle, LOG_UNUSUAL,
+			   "RBF DETECTED: penalty epoch=%u leaf=%d source "
+			   "UTXO no longer exists. State TX likely RBF'd; "
+			   "marking penalty STALE. Re-scan for replacement "
+			   "via factory-scan-external-close.",
+			   pp->epoch, pp->leaf_index);
+		pp->state = PENALTY_STATE_STALE;
+		ss_save_factory(cmd, fi);
+	}
+	return aux_command_done(cmd);
+}
+
+/* For each PENDING/BROADCAST pending penalty, fire off a checkutxo
+ * probe on the source UTXO via aux_command. Returns probes issued. */
+static int ss_penalty_source_check(struct command *cmd,
+				   factory_instance_t *fi)
+{
+	int probes = 0;
+	factory_t *f = (factory_t *)fi->lib_factory;
+	if (!f)
+		return 0;
+
+	for (size_t i = 0; i < fi->n_pending_penalties; i++) {
+		pending_penalty_t *pp = &fi->pending_penalties[i];
+		if (pp->state != PENALTY_STATE_BROADCAST
+		    && pp->state != PENALTY_STATE_PENDING)
+			continue;
+		if (pp->leaf_index < 0
+		    || (size_t)pp->leaf_index >= f->n_nodes)
+			continue;
+
+		factory_node_t *leaf = &f->nodes[pp->leaf_index];
+		if (leaf->n_outputs == 0)
+			continue;
+		uint32_t lstock_vout = (uint32_t)(leaf->n_outputs - 1);
+
+		struct command *acmd = aux_command(cmd);
+		struct source_check_ctx *sctx =
+			tal(acmd, struct source_check_ctx);
+		sctx->fi = fi;
+		sctx->penalty_idx = i;
+
+		char txid_hex[65];
+		for (int j = 0; j < 32; j++)
+			sprintf(txid_hex + j*2, "%02x", leaf->txid[31-j]);
+		txid_hex[64] = '\0';
+
+		struct out_req *req = jsonrpc_request_start(acmd,
+			"checkutxo",
+			source_check_gettxout_reply,
+			source_check_gettxout_reply,
+			sctx);
+		json_add_string(req->js, "txid", txid_hex);
+		json_add_u32(req->js, "vout", lstock_vout);
+		send_outreq(req);
+		probes++;
+	}
+	return probes;
 }
 
 /* ============================================================
@@ -10067,6 +10192,114 @@ json_dev_factory_trigger_deep_unwind_scan(struct command *cmd,
 	return command_finished(cmd, js);
 }
 
+/* factory-source-check — operator-facing RPC that probes the source
+ * UTXO each pending burn-TX spends. Flips matching pending_penalty
+ * entries to STALE if the source is gone (state TX RBF'd). Phase 4b. */
+static struct command_result *
+json_factory_source_check(struct command *cmd,
+			  const char *buf,
+			  const jsmntok_t *params)
+{
+	const char *id_hex;
+
+	if (!param(cmd, buf, params,
+		   p_req("instance_id", param_string, &id_hex),
+		   NULL))
+		return command_param_failed();
+
+	if (strlen(id_hex) != 64)
+		return command_fail(cmd, LIGHTNINGD, "Bad instance_id");
+
+	uint8_t instance_id[32];
+	for (int j = 0; j < 32; j++) {
+		unsigned int b;
+		if (sscanf(id_hex + j*2, "%02x", &b) != 1)
+			return command_fail(cmd, LIGHTNINGD,
+					    "Bad instance_id hex");
+		instance_id[j] = (uint8_t)b;
+	}
+
+	factory_instance_t *fi = ss_factory_find(&ss_state, instance_id);
+	if (!fi)
+		return command_fail(cmd, LIGHTNINGD, "Factory not found");
+
+	int probes = ss_penalty_source_check(cmd, fi);
+
+	struct json_stream *js = jsonrpc_stream_success(cmd);
+	json_add_string(js, "instance_id", id_hex);
+	json_add_u32(js, "probes_issued", (u32)probes);
+	json_add_u32(js, "n_pending_penalties",
+		     (u32)fi->n_pending_penalties);
+	return command_finished(cmd, js);
+}
+
+/* dev-factory-trigger-source-check — test alias of factory-source-check. */
+static struct command_result *
+json_dev_factory_trigger_source_check(struct command *cmd,
+				      const char *buf,
+				      const jsmntok_t *params)
+{
+	return json_factory_source_check(cmd, buf, params);
+}
+
+/* dev-factory-mark-penalty-stale — directly flip a penalty to STALE
+ * for tests that don't need to drive the async checkutxo flow.
+ * Mirrors dev-factory-mark-penalty-confirmed. */
+static struct command_result *
+json_dev_factory_mark_penalty_stale(struct command *cmd,
+				    const char *buf,
+				    const jsmntok_t *params)
+{
+	const char *id_hex;
+	u32 *epoch;
+	u32 *leaf_index;
+
+	if (!param(cmd, buf, params,
+		   p_req("instance_id", param_string, &id_hex),
+		   p_req("epoch", param_u32, &epoch),
+		   p_req("leaf_index", param_u32, &leaf_index),
+		   NULL))
+		return command_param_failed();
+
+	if (strlen(id_hex) != 64)
+		return command_fail(cmd, LIGHTNINGD, "Bad instance_id");
+
+	uint8_t instance_id[32];
+	for (int j = 0; j < 32; j++) {
+		unsigned int b;
+		if (sscanf(id_hex + j*2, "%02x", &b) != 1)
+			return command_fail(cmd, LIGHTNINGD,
+					    "Bad instance_id hex");
+		instance_id[j] = (uint8_t)b;
+	}
+
+	factory_instance_t *fi = ss_factory_find(&ss_state, instance_id);
+	if (!fi)
+		return command_fail(cmd, LIGHTNINGD, "Factory not found");
+
+	pending_penalty_t *pp = NULL;
+	for (size_t i = 0; i < fi->n_pending_penalties; i++) {
+		if (fi->pending_penalties[i].epoch == *epoch
+		    && fi->pending_penalties[i].leaf_index
+		       == (int)*leaf_index) {
+			pp = &fi->pending_penalties[i];
+			break;
+		}
+	}
+	if (!pp)
+		return command_fail(cmd, LIGHTNINGD,
+				    "No penalty for (epoch=%u, leaf=%u)",
+				    *epoch, *leaf_index);
+
+	pp->state = PENALTY_STATE_STALE;
+	ss_save_factory(cmd, fi);
+
+	struct json_stream *js = jsonrpc_stream_success(cmd);
+	json_add_string(js, "instance_id", id_hex);
+	json_add_string(js, "state", "stale");
+	return command_finished(cmd, js);
+}
+
 /* dev-factory-inject-sweep — test-only hook for Phase 4d. Registers
  * a pending_sweep_t for the scheduler to walk. */
 static struct command_result *
@@ -10405,6 +10638,18 @@ static const struct plugin_command commands[] = {
 	{
 		"dev-factory-mark-sweep-confirmed",
 		json_dev_factory_mark_sweep_confirmed,
+	},
+	{
+		"dev-factory-trigger-source-check",
+		json_dev_factory_trigger_source_check,
+	},
+	{
+		"dev-factory-mark-penalty-stale",
+		json_dev_factory_mark_penalty_stale,
+	},
+	{
+		"factory-source-check",
+		json_factory_source_check,
 	},
 	{
 		"factory-create",
