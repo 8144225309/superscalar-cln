@@ -41,6 +41,26 @@ static secp256k1_context *global_secp_ctx;
  * NULL until initialized (requires LSP mode + HSM key). */
 static ladder_t *ss_ladder;
 
+/* Phase 3b: factory-TX kind tag for ss_broadcast_factory_tx. Values are
+ * stored in struct broadcast_reply_ctx.kind and inform classification of
+ * bitcoind's reply (only kickoff replies feed back into the signal
+ * machine; other kinds are informational). Kept at file scope so it can
+ * be referenced from call sites above the helper definitions. */
+typedef enum {
+	FACTORY_TX_KICKOFF = 0,
+	FACTORY_TX_STATE   = 1,
+	FACTORY_TX_BURN    = 2,
+	FACTORY_TX_DIST    = 3,
+} factory_tx_kind_t;
+
+/* Forward decl: helper lives near the Phase 3b signal machine, far
+ * below; call sites in the cooperative-close and force-close paths
+ * reference it earlier. */
+static void ss_broadcast_factory_tx(struct command *cmd,
+				    factory_instance_t *fi,
+				    const char *tx_hex,
+				    int kind);
+
 
 /* bLIP-56 factory message type */
 /* ODD type = CLN allows it through connectd without any fork changes.
@@ -7216,12 +7236,7 @@ static void ss_apply_signals(struct command *cmd, factory_instance_t *fi)
 /* Phase 3b: broadcast-reply hook context. */
 struct broadcast_reply_ctx {
 	factory_instance_t *fi;
-	enum {
-		FACTORY_TX_KICKOFF = 0,
-		FACTORY_TX_STATE = 1,
-		FACTORY_TX_BURN = 2,
-		FACTORY_TX_DIST = 3,
-	} kind;
+	int kind; /* factory_tx_kind_t values */
 };
 
 static const char *factory_tx_kind_name(int k)
