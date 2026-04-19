@@ -62,6 +62,11 @@ static void ss_broadcast_factory_tx(struct command *cmd,
 				    const char *tx_hex,
 				    int kind);
 
+/* Forward decls: Phase 4d sweep-state name helpers used by
+ * factory-list before their definitions lower in the file. */
+static const char *sweep_state_name(uint8_t s);
+static const char *sweep_type_name(uint8_t t);
+
 
 /* bLIP-56 factory message type */
 /* ODD type = CLN allows it through connectd without any fork changes.
