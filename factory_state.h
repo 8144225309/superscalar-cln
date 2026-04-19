@@ -74,6 +74,18 @@ static inline bool factory_is_closed(factory_lifecycle_t l) {
 #define CLOSED_BY_COUNTERPARTY  2 /* scan found a TX we didn't sign — Phase 2b
 				   * refines into normal-exit vs. breach */
 
+/* Phase 3b: signal-observation bits for factory_instance_t.signals_observed.
+ * The unified classifier (ss_apply_signals) reads these to decide lifecycle.
+ * Persisted as a u8; don't renumber. */
+#define SIGNAL_UTXO_SPENT          (1u << 0) /* heartbeat saw root spent */
+#define SIGNAL_BROADCAST_MISSING   (1u << 1) /* sendrawtransaction got bad-txns-inputs-missingorspent */
+#define SIGNAL_BROADCAST_KNOWN     (1u << 2) /* sendrawtransaction got "already in mempool/blockchain" */
+#define SIGNAL_DIST_TXID_MATCHED   (1u << 3) /* spending TXID == dist_signed_txid */
+#define SIGNAL_KICKOFF_TXID_MATCHED (1u << 4) /* spending TXID == kickoff txid */
+#define SIGNAL_WITNESS_CURRENT_MATCH (1u << 5) /* witness sig matched current epoch */
+#define SIGNAL_WITNESS_PAST_MATCH  (1u << 6) /* witness sig matched a past epoch */
+#define SIGNAL_STATE_TX_MATCH      (1u << 7) /* downstream state TX matched a cached state root */
+
 /* Per-epoch breach data */
 typedef struct {
 	uint32_t epoch;
@@ -258,6 +270,36 @@ typedef struct factory_instance {
 	uint8_t history_kickoff_sigs[MAX_HISTORY_SIGS][64];
 	uint32_t history_kickoff_epochs[MAX_HISTORY_SIGS];
 	size_t n_history_kickoff_sigs;
+
+	/* Phase 3b: per-epoch state-tree-root TXID cache.
+	 *
+	 * Sibling to history_kickoff_sigs. The kickoff (nodes[0]) txid is
+	 * stable across epochs, but the state-tree-root TX (nodes[1]) that
+	 * spends the kickoff's output IS epoch-specific — its outputs
+	 * encode the per-epoch revocation commitments. Matching a
+	 * downstream-scan-found state-TX-spend against this cache tells us
+	 * which epoch's state was actually broadcast.
+	 *
+	 * Same indexing as history_kickoff_*: history_state_root_txids[i]
+	 * pairs with history_kickoff_epochs[i]. Snapshotted at rotation
+	 * time alongside the kickoff sig.
+	 *
+	 * Pre-Phase-3b factories start empty. Phase 3b's downstream classifier
+	 * falls back to "no past-epoch state TXIDs cached" when this is empty
+	 * for an epoch the counterparty broadcast. */
+	uint8_t history_state_root_txids[MAX_HISTORY_SIGS][32];
+
+	/* Phase 3b: signal observation bitmask. Tracks which evidence
+	 * sources contributed to the current lifecycle decision. Used by
+	 * ss_apply_signals() to make idempotent classification decisions
+	 * and by factory-list to surface the evidence trail. */
+	uint8_t signals_observed;
+
+	/* Phase 3b: matched epoch from downstream state-TX scan.
+	 * UINT32_MAX when no match. Independent of breach_epoch (which
+	 * comes from the witness-sig path); both can populate concurrently
+	 * and the unified classifier reconciles them. */
+	uint32_t state_tx_match_epoch;
 
 	/* Cached tree node count (persisted so factory-list works after restart
 	 * even when lib_factory hasn't been rebuilt yet). */

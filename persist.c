@@ -83,8 +83,10 @@ size_t ss_persist_serialize_meta(const factory_instance_t *fi, uint8_t **out)
 	 *   v7 adds spending_txid + first_noticed_block + closed_by
 	 *      (watcher Phase 2a)
 	 *   v8 adds dist_signed_txid + breach_epoch + per-epoch kickoff
-	 *      signature cache (watcher Phase 2b) */
-	buf_u8(&buf, &len, &cap, 8);
+	 *      signature cache (watcher Phase 2b)
+	 *   v9 adds per-epoch state-root TXID cache + signals_observed
+	 *      bitmask + state_tx_match_epoch (watcher Phase 3b) */
+	buf_u8(&buf, &len, &cap, 9);
 
 	/* Identity */
 	buf_append(&buf, &len, &cap, fi->instance_id, 32);
@@ -202,6 +204,15 @@ size_t ss_persist_serialize_meta(const factory_instance_t *fi, uint8_t **out)
 		buf_append(&buf, &len, &cap, fi->history_kickoff_sigs[i], 64);
 	}
 
+	/* v9: Phase 3b. Per-epoch state-root TXIDs (paired with kickoff
+	 * sig array above), signals_observed bitmask, state_tx_match_epoch.
+	 * The TXID array length equals n_history_kickoff_sigs. */
+	for (size_t i = 0; i < fi->n_history_kickoff_sigs; i++)
+		buf_append(&buf, &len, &cap,
+			   fi->history_state_root_txids[i], 32);
+	buf_u8(&buf, &len, &cap, fi->signals_observed);
+	buf_u32(&buf, &len, &cap, fi->state_tx_match_epoch);
+
 	*out = buf;
 	return len;
 }
@@ -215,7 +226,7 @@ bool ss_persist_deserialize_meta(factory_instance_t *fi,
 	uint8_t version, tmp8;
 	uint16_t tmp16;
 
-	if (!read_u8(&p, &rem, &version) || version < 1 || version > 8)
+	if (!read_u8(&p, &rem, &version) || version < 1 || version > 9)
 		return false;
 
 	if (!read_bytes(&p, &rem, fi->instance_id, 32)) return false;
@@ -393,6 +404,27 @@ bool ss_persist_deserialize_meta(factory_instance_t *fi,
 				return false;
 		}
 		fi->n_history_kickoff_sigs = n_sigs;
+	}
+
+	/* v9: Phase 3b. State-root TXIDs (one per cached kickoff sig
+	 * epoch), signals_observed bitmask, state_tx_match_epoch. Pre-v9
+	 * blobs default to all-zero TXIDs, no signals, UINT32_MAX match. */
+	memset(fi->history_state_root_txids, 0,
+	       sizeof(fi->history_state_root_txids));
+	fi->signals_observed = 0;
+	fi->state_tx_match_epoch = UINT32_MAX;
+	if (version >= 9) {
+		for (size_t i = 0; i < fi->n_history_kickoff_sigs; i++) {
+			if (!read_bytes(&p, &rem,
+					fi->history_state_root_txids[i], 32))
+				return false;
+		}
+		uint8_t sig_bits;
+		if (!read_u8(&p, &rem, &sig_bits))
+			return false;
+		fi->signals_observed = sig_bits;
+		if (!read_u32(&p, &rem, &fi->state_tx_match_epoch))
+			return false;
 	}
 
 	return true;
