@@ -6214,6 +6214,11 @@ static struct command_result *breach_utxo_checked(struct command *cmd,
 						   const char *buf,
 						   const jsmntok_t *result,
 						   void *arg);
+static struct command_result *breach_scan_rpc_err(struct command *cmd,
+						  const char *method,
+						  const char *buf,
+						  const jsmntok_t *result,
+						  void *arg);
 
 /* Launch a single-shot checkutxo scan on a factory's funding UTXO.
  * Returns without sending if the factory has no real funding txid
@@ -6250,15 +6255,56 @@ static void ss_launch_breach_scan(struct command *cmd,
 		sprintf(ftxid_hex + j*2, "%02x", fi->funding_txid[31-j]);
 	ftxid_hex[64] = '\0';
 
-	struct breach_scan_ctx *bctx = tal(cmd, struct breach_scan_ctx);
+	/* Phase 3a: spawn an aux_command so the checkutxo reply callback
+	 * survives the parent's lifetime. The original `cmd` here is
+	 * usually a notification-handler cmd (block_added) which the
+	 * libplugin framework cleans up as soon as notification_handled()
+	 * runs — well before our async checkutxo reply arrives. The reply
+	 * then orphans ("JSON reply with unknown id" in logs) and
+	 * breach_utxo_checked never fires, so the lifecycle transition
+	 * to CLOSED_EXTERNALLY never happens. aux_command() creates a
+	 * sibling cmd that lives until we explicitly free it via
+	 * aux_command_done() in the callback. This is the canonical
+	 * libplugin pattern for "I want my reply to survive my parent."
+	 *
+	 * tal-allocate the breach_scan_ctx on the aux cmd so it gets
+	 * freed with the aux cmd. */
+	struct command *acmd = aux_command(cmd);
+	struct breach_scan_ctx *bctx = tal(acmd, struct breach_scan_ctx);
 	bctx->fi = fi;
 	bctx->factory_idx = factory_idx;
 
-	struct out_req *req = jsonrpc_request_start(cmd,
-		"checkutxo", breach_utxo_checked, rpc_err, bctx);
+	struct out_req *req = jsonrpc_request_start(acmd,
+		"checkutxo", breach_utxo_checked, breach_scan_rpc_err, bctx);
 	json_add_string(req->js, "txid", ftxid_hex);
 	json_add_u32(req->js, "vout", fi->funding_outnum);
 	send_outreq(req);
+}
+
+/* Phase 3a: aux-cmd-aware error handler for the breach scan path. The
+ * generic rpc_err() returns command_still_pending which is fine for the
+ * notification-cmd lifetime model but leaks the aux cmd we created in
+ * ss_launch_breach_scan. Use aux_command_done so the framework reclaims
+ * the cmd + bctx (tal-allocated on it) cleanly. */
+static struct command_result *breach_scan_rpc_err(struct command *cmd,
+						  const char *method,
+						  const char *buf,
+						  const jsmntok_t *result,
+						  void *arg)
+{
+	(void)arg;
+	const jsmntok_t *msg_tok = json_get_member(buf, result, "message");
+	if (msg_tok) {
+		const char *errmsg = json_strdup(cmd, buf, msg_tok);
+		plugin_log(plugin_handle, LOG_UNUSUAL,
+			   "Breach scan RPC %s failed: %s — aux cmd freed",
+			   method, errmsg ? errmsg : "(null)");
+	} else {
+		plugin_log(plugin_handle, LOG_UNUSUAL,
+			   "Breach scan RPC %s failed (no message) — aux cmd freed",
+			   method);
+	}
+	return aux_command_done(cmd);
 }
 
 /* One-shot breach scan across every loaded factory. Called from init
@@ -6295,7 +6341,7 @@ static struct command_result *breach_utxo_checked(struct command *cmd,
 
 	const jsmntok_t *exists_tok = json_get_member(buf, result, "exists");
 	if (!exists_tok)
-		return notification_handled(cmd);
+		return aux_command_done(cmd);
 
 	bool exists;
 	json_to_bool(buf, exists_tok, &exists);
@@ -6361,7 +6407,7 @@ static struct command_result *breach_utxo_checked(struct command *cmd,
 				   "burn TXs. Check startup log for reload "
 				   "failures.",
 				   bctx->factory_idx);
-			return notification_handled(cmd);
+			return aux_command_done(cmd);
 		}
 
 		plugin_log(plugin_handle, LOG_UNUSUAL,
@@ -6488,7 +6534,7 @@ static struct command_result *breach_utxo_checked(struct command *cmd,
 		}
 	}
 
-	return notification_handled(cmd);
+	return aux_command_done(cmd);
 }
 
 /* Handle block_added notification — check for breach (old state on-chain).
