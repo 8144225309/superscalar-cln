@@ -119,16 +119,20 @@ jobs:
           sed -i 's/\[--enable-module-ecdsa-s2c\]/[--enable-module-ecdsa-s2c], [--enable-module-musig]/' \
             external/libwally-core/configure.ac
 
-      # Two Python dep sets:
+      # Python deps in three buckets:
       #   - mako: CLN's tools/generate-wire.py uses it to render wire headers.
       #     Without it, `make` on CLN fails at the first wiregen step.
-      #     (Upstream CLN's own CI pip-installs this via their requirements.)
-      #   - requirements-dev.txt: pyln-testing + pytest plugins we need for the
+      #   - grpcio-tools: CLN compiles its pyln-grpc Python bindings via
+      #     `python3 -m grpc_tools.protoc`. Without it, `make` fails after
+      #     libwally builds, trying to regenerate protobuf stubs.
+      #   - requirements-dev.txt: pyln-testing + pytest plugins for the
       #     test suite itself.
-      - name: Install Python deps (CLN wire gen + pytest)
+      # (Upstream CLN's own CI pip-installs this whole set via their
+      # requirements.txt; we're reproducing the relevant pieces.)
+      - name: Install Python deps (CLN wire gen + grpc stubs + pytest)
         working-directory: superscalar-cln
         run: |
-          pip install mako
+          pip install mako grpcio-tools
           pip install -r requirements-dev.txt
 
       - name: Build CLN
