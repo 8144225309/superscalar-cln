@@ -79,8 +79,10 @@ size_t ss_persist_serialize_meta(const factory_instance_t *fi, uint8_t **out)
 	/* Version byte:
 	 *   v4 adds factory_pubkeys, allocations, departure
 	 *   v5 adds per-client REVOKE-ACK tracking
-	 *   v6 adds closed_externally_at_block (watcher Phase 1) */
-	buf_u8(&buf, &len, &cap, 6);
+	 *   v6 adds closed_externally_at_block (watcher Phase 1)
+	 *   v7 adds spending_txid + first_noticed_block + closed_by
+	 *      (watcher Phase 2a) */
+	buf_u8(&buf, &len, &cap, 7);
 
 	/* Identity */
 	buf_append(&buf, &len, &cap, fi->instance_id, 32);
@@ -176,6 +178,14 @@ size_t ss_persist_serialize_meta(const factory_instance_t *fi, uint8_t **out)
 	 * forensic/reap tooling. */
 	buf_u32(&buf, &len, &cap, fi->closed_externally_at_block);
 
+	/* v7: Phase 2a spending-TX identification output. All-zero
+	 * spending_txid means "not yet classified" or "scan didn't find it
+	 * within the window"; first_noticed_block==0 means "heartbeat has
+	 * not fired"; closed_by==CLOSED_BY_UNKNOWN is the safe default. */
+	buf_append(&buf, &len, &cap, fi->spending_txid, 32);
+	buf_u32(&buf, &len, &cap, fi->first_noticed_block);
+	buf_u8(&buf, &len, &cap, fi->closed_by);
+
 	*out = buf;
 	return len;
 }
@@ -189,7 +199,7 @@ bool ss_persist_deserialize_meta(factory_instance_t *fi,
 	uint8_t version, tmp8;
 	uint16_t tmp16;
 
-	if (!read_u8(&p, &rem, &version) || version < 1 || version > 6)
+	if (!read_u8(&p, &rem, &version) || version < 1 || version > 7)
 		return false;
 
 	if (!read_bytes(&p, &rem, fi->instance_id, 32)) return false;
@@ -318,6 +328,24 @@ bool ss_persist_deserialize_meta(factory_instance_t *fi,
 	if (version >= 6) {
 		if (!read_u32(&p, &rem, &fi->closed_externally_at_block))
 			return false;
+	}
+
+	/* v7: Phase 2a classification output. Pre-v7 blobs default to
+	 * zero spending_txid and CLOSED_BY_UNKNOWN. Existing CLOSED_EXTERNALLY
+	 * records from Phase 1 will read as unclassified — the operator can
+	 * re-trigger classification via factory-scan-external-close. */
+	memset(fi->spending_txid, 0, 32);
+	fi->first_noticed_block = 0;
+	fi->closed_by = CLOSED_BY_UNKNOWN;
+	if (version >= 7) {
+		if (!read_bytes(&p, &rem, fi->spending_txid, 32))
+			return false;
+		if (!read_u32(&p, &rem, &fi->first_noticed_block))
+			return false;
+		uint8_t cb;
+		if (!read_u8(&p, &rem, &cb))
+			return false;
+		fi->closed_by = cb;
 	}
 
 	return true;

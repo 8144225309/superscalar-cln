@@ -56,6 +56,7 @@ The plugin registers CLN hooks (`custommsg`, `openchannel`, `htlc_accepted`, `bl
 | `factory-forget-channel` | `id`, `channel_id` | Drop a factory channel from CLN without broadcasting a commitment transaction |
 | `factory-close-departed` | `instance_id`, `client_idx` | Close a departed client's channel using their extracted key (after key turnover) |
 | `factory-confirm-closed` | `instance_id`, `[force]` | Reap a factory the watcher has flagged as closed (lifecycle `closed_externally` or other closed-* state). Removes the factory from memory and deletes its datastore entries. Pass `force=true` to reap regardless of lifecycle — only do this after verifying funds are safe. |
+| `factory-scan-external-close` | `instance_id`, `[blocks=1000]` | Manually launch (or re-launch) the Phase 2a spending-TX scan with a configurable block window. Useful when Phase 1's 144-block auto-scan missed the spending TX (e.g., plugin was offline across the close). Populates `spending_txid`, `closed_by`, and may upgrade lifecycle `closed_externally` → `closed_unilateral` if the spender was our own kickoff. |
 | `factory-migrate` | `instance_id` | Initiate key turnover for all clients, preparing to move channels to a new factory |
 | `factory-migrate-complete` | `instance_id`, `[new_funding_sats]` | Finalize migration after all cooperative clients have departed |
 | `factory-buy-liquidity` | `instance_id`, `client_idx`, `amount_sats` | Rebalance L-stock to client on a leaf (requires re-signing) |
@@ -97,8 +98,11 @@ The plugin registers CLN hooks (`custommsg`, `openchannel`, `htlc_accepted`, `bl
 Key fields:
 - `early_warning_time` — minimum CLTV headroom (in blocks) for HTLCs on this factory's channels. Derived from the DW tree depth. HTLCs with tighter timeouts are rejected by the `htlc_accepted` hook.
 - `epochs_remaining` — rotations left before DW exhaustion triggers migration.
-- `lifecycle` — state string. Active factories are `active`; `dying` means a close was initiated; `closed_externally` means the watcher observed the factory root spent without a plugin-initiated close (manual sweep, HSM-lost recovery, or a close driven outside this plugin). `closed_cooperative` / `closed_unilateral` / `closed_breached` are reserved for Phase 2 of the trustless-watcher plan.
-- `closed_externally_at_block` — present only when `lifecycle == "closed_externally"`; the block height at which the root-spend was observed. Useful for forensics and for deciding when to reap via `factory-confirm-closed`.
+- `lifecycle` — state string. Active factories are `active`; `dying` means a close was initiated; `closed_externally` means the watcher observed the factory root spent without a plugin-initiated close. `closed_unilateral` (populated by Phase 2a) indicates the scan matched our own kickoff TX. `closed_cooperative` / `closed_breached` are reserved for Phase 2b.
+- `closed_externally_at_block` — present only when `lifecycle == "closed_externally"`; the block height at which the root-spend was observed.
+- `spending_txid` — Phase 2a: hex txid of the TX that spent the factory root, once the scan identifies it.
+- `first_noticed_block` — Phase 2a: block height when the UTXO-heartbeat first saw the spend (scan starts here and walks backwards).
+- `closed_by` — Phase 2a classification result: `self`, `counterparty`, or `unknown`. `self` means our own kickoff drove the close. `counterparty` means the scan found a spending TX that wasn't ours (Phase 2b will refine into counterparty-normal-exit vs. breach). `unknown` means either the scan hasn't run yet or it failed to find the spending TX within its window.
 
 ## Architecture
 

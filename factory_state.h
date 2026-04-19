@@ -67,6 +67,13 @@ static inline bool factory_is_closed(factory_lifecycle_t l) {
 	    || l == FACTORY_LIFECYCLE_CLOSED_BREACHED;
 }
 
+/* Phase 2a: values for factory_instance_t.closed_by. Stored as uint8_t
+ * in persistence; do not renumber without a meta-version bump. */
+#define CLOSED_BY_UNKNOWN       0 /* haven't classified, or scan found nothing */
+#define CLOSED_BY_SELF          1 /* our dist_tx or our kickoff matched */
+#define CLOSED_BY_COUNTERPARTY  2 /* scan found a TX we didn't sign — Phase 2b
+				   * refines into normal-exit vs. breach */
+
 /* Per-epoch breach data */
 typedef struct {
 	uint32_t epoch;
@@ -182,6 +189,30 @@ typedef struct factory_instance {
 	 * show "zombie since block N" and forensics can line up with chain
 	 * history. */
 	uint32_t closed_externally_at_block;
+
+	/* Phase 2a: spending-TX identification.
+	 *
+	 * Populated by the block scan launched after the UTXO heartbeat
+	 * detects the funding root spent. The scan walks recent blocks
+	 * looking for a TX whose vin references our funding outpoint; once
+	 * found, we match its txid against our own signed artifacts
+	 * (dist_signed_tx for cooperative, lib_factory->nodes[0].txid for
+	 * our unilateral kickoff) and set lifecycle/closed_by accordingly.
+	 *
+	 * When the scan fails to find the spending TX (the spend predates
+	 * our scan window), spending_txid stays all-zero and classification
+	 * remains CLOSED_EXTERNALLY with closed_by = CLOSED_BY_UNKNOWN.
+	 *
+	 * Phase 2b will add per-epoch tree reconstruction to distinguish
+	 * counterparty-normal-exit from breach within the
+	 * "closed_by != self" bucket. */
+	uint8_t spending_txid[32];
+	uint32_t first_noticed_block; /* block_added height when UTXO was first seen spent */
+
+	/* Who drove the close, per Phase 2a classification. Values match the
+	 * CLOSED_BY_* constants below. Stored as uint8_t for portable
+	 * persistence; don't renumber the constants without a version bump. */
+	uint8_t closed_by;
 
 	/* Cached tree node count (persisted so factory-list works after restart
 	 * even when lib_factory hasn't been rebuilt yet). */

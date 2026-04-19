@@ -5483,6 +5483,28 @@ static struct command_result *json_factory_list(struct command *cmd,
 		if (fi->closed_externally_at_block > 0)
 			json_add_u32(js, "closed_externally_at_block",
 				     fi->closed_externally_at_block);
+
+		/* Phase 2a classification output. Only render when we have
+		 * something meaningful — all-zero spending_txid means the
+		 * scan never ran or didn't find a spending TX. */
+		bool any_nonzero = false;
+		for (int b = 0; b < 32; b++)
+			if (fi->spending_txid[b] != 0) { any_nonzero = true; break; }
+		if (any_nonzero) {
+			char stxid_hex[65];
+			for (int j = 0; j < 32; j++)
+				sprintf(stxid_hex + j*2, "%02x",
+					fi->spending_txid[31-j]);
+			stxid_hex[64] = '\0';
+			json_add_string(js, "spending_txid", stxid_hex);
+		}
+		if (fi->first_noticed_block > 0)
+			json_add_u32(js, "first_noticed_block",
+				     fi->first_noticed_block);
+		json_add_string(js, "closed_by",
+			fi->closed_by == CLOSED_BY_SELF ? "self" :
+			fi->closed_by == CLOSED_BY_COUNTERPARTY ? "counterparty" :
+			"unknown");
 		json_add_string(js, "ceremony",
 			fi->ceremony == CEREMONY_IDLE ? "idle" :
 			fi->ceremony == CEREMONY_PROPOSED ? "proposed" :
@@ -6202,6 +6224,270 @@ static struct command_result *json_factory_close_departed(struct command *cmd,
 
 /* factory-close-departed registered in commands[] array below */
 
+/* Phase 2a: spending-TX identification.
+ *
+ * When Phase 1 detects the factory root spent via checkutxo, we want
+ * more than just "something happened." The classifier below walks
+ * recent blocks looking for the specific TX that spent our funding
+ * outpoint, then matches the spending TX's txid against our own
+ * signed artifacts to decide whether this was a self-initiated close
+ * (closed_by = SELF, lifecycle upgrades to CLOSED_UNILATERAL) or
+ * something we didn't drive (closed_by = COUNTERPARTY, lifecycle
+ * remains CLOSED_EXTERNALLY; Phase 2b will further distinguish
+ * counterparty-normal from breach via tree reconstruction).
+ *
+ * Scan mechanics: getblockhash(height) → getblock(hash, 2), iterate
+ * txs, check each vin for (funding_txid, funding_outnum). Scan walks
+ * backwards from first_noticed_block for up to scan_window blocks.
+ * Missing the window just leaves the factory in CLOSED_EXTERNALLY
+ * with closed_by = UNKNOWN — safe default, operator can re-trigger
+ * with a wider window via factory-scan-external-close. */
+
+struct spending_tx_scan_ctx {
+	factory_instance_t *fi;
+	uint32_t scan_height;        /* block currently being examined */
+	uint32_t scan_remaining;     /* blocks left to check after this one */
+};
+
+static struct command_result *scan_tx_blockhash_cb(struct command *cmd,
+						   const char *method,
+						   const char *buf,
+						   const jsmntok_t *result,
+						   void *arg);
+static struct command_result *scan_tx_block_cb(struct command *cmd,
+					       const char *method,
+					       const char *buf,
+					       const jsmntok_t *result,
+					       void *arg);
+static struct command_result *scan_tx_rpc_err(struct command *cmd,
+					      const char *method,
+					      const char *buf,
+					      const jsmntok_t *result,
+					      void *arg);
+
+/* Send a getblockhash request for ctx->scan_height; callback walks the
+ * block, decrements scan_remaining, or stops on match. */
+static void request_blockhash_for_scan(struct command *cmd,
+				       struct spending_tx_scan_ctx *ctx)
+{
+	struct out_req *req = jsonrpc_request_start(cmd, "getblockhash",
+		scan_tx_blockhash_cb, scan_tx_rpc_err, ctx);
+	json_add_u32(req->js, "height", ctx->scan_height);
+	send_outreq(req);
+}
+
+/* Classify a factory based on the spending TX we just identified.
+ * Must be called only after fi->spending_txid has been populated. */
+static void ss_classify_spending_tx(factory_instance_t *fi)
+{
+	/* Self-match: our kickoff TX is always lib_factory->nodes[0] —
+	 * the tree node that spends the factory root outpoint directly.
+	 * If the lib_factory handle isn't loaded, we can't match; leave
+	 * as CLOSED_BY_UNKNOWN and let operator decide. */
+	factory_t *f = (factory_t *)fi->lib_factory;
+	if (f && f->n_nodes > 0) {
+		if (memcmp(fi->spending_txid, f->nodes[0].txid, 32) == 0) {
+			fi->closed_by = CLOSED_BY_SELF;
+			/* Upgrade from the Phase 1 default. ACTIVE → CLOSED_EXTERNALLY
+			 * was the safe label; now we know it was our own kickoff
+			 * (implies the close was initiated outside the DYING
+			 * flow — worth an UNUSUAL log but not fatal). */
+			fi->lifecycle = FACTORY_LIFECYCLE_CLOSED_UNILATERAL;
+			char txid_hex[65];
+			for (int j = 0; j < 32; j++)
+				sprintf(txid_hex + j*2, "%02x",
+					fi->spending_txid[31-j]);
+			txid_hex[64] = '\0';
+			plugin_log(plugin_handle, LOG_UNUSUAL,
+				   "Spend classifier: factory root spent by our "
+				   "own kickoff %s — upgrading to "
+				   "CLOSED_UNILATERAL (self). Lifecycle was "
+				   "ACTIVE at heartbeat, which implies a close "
+				   "path outside the normal DYING flow. Review "
+				   "force-close logic.",
+				   txid_hex);
+			return;
+		}
+	}
+
+	/* No self-match. Phase 2b will further distinguish counterparty
+	 * normal-exit from breach; for Phase 2a we just record
+	 * CLOSED_BY_COUNTERPARTY and let lifecycle stay CLOSED_EXTERNALLY
+	 * until the refined classifier lands. */
+	fi->closed_by = CLOSED_BY_COUNTERPARTY;
+	char txid_hex[65];
+	for (int j = 0; j < 32; j++)
+		sprintf(txid_hex + j*2, "%02x", fi->spending_txid[31-j]);
+	txid_hex[64] = '\0';
+	plugin_log(plugin_handle, LOG_INFORM,
+		   "Spend classifier: factory root spent by external TX %s "
+		   "(not our kickoff). Phase 2a leaves lifecycle at "
+		   "CLOSED_EXTERNALLY; Phase 2b will refine into "
+		   "counterparty-normal vs breach.",
+		   txid_hex);
+}
+
+/* Got the blockhash for ctx->scan_height; fetch the block with tx detail. */
+static struct command_result *scan_tx_blockhash_cb(struct command *cmd,
+						    const char *method,
+						    const char *buf,
+						    const jsmntok_t *result,
+						    void *arg)
+{
+	struct spending_tx_scan_ctx *ctx = (struct spending_tx_scan_ctx *)arg;
+
+	/* getblockhash returns the hash as a bare string result. */
+	const char *hash_str = NULL;
+	if (result && result->type == JSMN_STRING) {
+		hash_str = buf + result->start;
+	}
+	if (!hash_str)
+		return notification_handled(cmd);
+
+	int hash_len = result->end - result->start;
+	char *hash_copy = tal_arr(cmd, char, hash_len + 1);
+	memcpy(hash_copy, hash_str, hash_len);
+	hash_copy[hash_len] = '\0';
+
+	struct out_req *req = jsonrpc_request_start(cmd, "getblock",
+		scan_tx_block_cb, scan_tx_rpc_err, ctx);
+	json_add_string(req->js, "blockhash", hash_copy);
+	json_add_u32(req->js, "verbosity", 2);
+	send_outreq(req);
+	return notification_handled(cmd);
+}
+
+/* Walk the block's transactions looking for one that spends our funding
+ * outpoint. If found, record the spending txid and classify. Else step
+ * back one block and continue, bounded by ctx->scan_remaining. */
+static struct command_result *scan_tx_block_cb(struct command *cmd,
+					       const char *method,
+					       const char *buf,
+					       const jsmntok_t *result,
+					       void *arg)
+{
+	struct spending_tx_scan_ctx *ctx = (struct spending_tx_scan_ctx *)arg;
+	factory_instance_t *fi = ctx->fi;
+
+	/* Build the display-order hex of our funding_txid once for matching. */
+	char want_txid_hex[65];
+	for (int j = 0; j < 32; j++)
+		sprintf(want_txid_hex + j*2, "%02x", fi->funding_txid[31-j]);
+	want_txid_hex[64] = '\0';
+
+	const jsmntok_t *tx_array = json_get_member(buf, result, "tx");
+	if (!tx_array || tx_array->type != JSMN_ARRAY) {
+		/* Can't parse; step back. */
+		goto next_block;
+	}
+
+	const jsmntok_t *tx_tok;
+	size_t ti;
+	json_for_each_arr(ti, tx_tok, tx_array) {
+		const jsmntok_t *vin_array = json_get_member(buf, tx_tok, "vin");
+		if (!vin_array || vin_array->type != JSMN_ARRAY) continue;
+
+		const jsmntok_t *vin_tok;
+		size_t vi;
+		json_for_each_arr(vi, vin_tok, vin_array) {
+			const jsmntok_t *txid_tok = json_get_member(buf, vin_tok, "txid");
+			const jsmntok_t *vout_tok = json_get_member(buf, vin_tok, "vout");
+			if (!txid_tok || !vout_tok) continue;
+
+			/* Match vout */
+			u32 v;
+			if (!json_to_u32(buf, vout_tok, &v)) continue;
+			if (v != fi->funding_outnum) continue;
+
+			/* Match txid (string compare). */
+			int txid_len = txid_tok->end - txid_tok->start;
+			if (txid_len != 64) continue;
+			if (memcmp(buf + txid_tok->start, want_txid_hex, 64) != 0)
+				continue;
+
+			/* Matched! Extract this TX's txid. */
+			const jsmntok_t *spending_txid_tok =
+				json_get_member(buf, tx_tok, "txid");
+			if (!spending_txid_tok
+			    || spending_txid_tok->end - spending_txid_tok->start != 64)
+				continue;
+
+			/* Convert display hex → internal little-endian bytes. */
+			for (int j = 0; j < 32; j++) {
+				unsigned int b;
+				const char *h = buf + spending_txid_tok->start + j*2;
+				if (sscanf(h, "%02x", &b) != 1) goto next_block;
+				fi->spending_txid[31 - j] = (uint8_t)b;
+			}
+
+			plugin_log(plugin_handle, LOG_INFORM,
+				   "Scan: found spending TX for factory root at "
+				   "block %u — classifying.",
+				   ctx->scan_height);
+			ss_classify_spending_tx(fi);
+			ss_save_factory(cmd, fi);
+			return notification_handled(cmd);
+		}
+	}
+
+next_block:
+	if (ctx->scan_height == 0 || ctx->scan_remaining == 0) {
+		plugin_log(plugin_handle, LOG_UNUSUAL,
+			   "Scan: spending TX for factory root not found within "
+			   "window (scanned down through block %u). Leaving "
+			   "lifecycle at CLOSED_EXTERNALLY with "
+			   "closed_by=UNKNOWN. Operator can widen the window "
+			   "via factory-scan-external-close.",
+			   ctx->scan_height);
+		return notification_handled(cmd);
+	}
+	ctx->scan_height--;
+	ctx->scan_remaining--;
+	request_blockhash_for_scan(cmd, ctx);
+	return notification_handled(cmd);
+}
+
+/* Error path: transient bitcoind/RPC failures abort the scan but don't
+ * poison the factory. Operator can retry. */
+static struct command_result *scan_tx_rpc_err(struct command *cmd,
+					      const char *method,
+					      const char *buf,
+					      const jsmntok_t *result,
+					      void *arg)
+{
+	(void)method; (void)buf; (void)result; (void)arg;
+	plugin_log(plugin_handle, LOG_UNUSUAL,
+		   "Scan: RPC error during spending-TX scan; aborting. Retry "
+		   "via factory-scan-external-close.");
+	return notification_handled(cmd);
+}
+
+/* Entry point for Phase 2a spending-TX scan. Safe to call multiple times;
+ * subsequent runs overwrite the previous classification output. */
+static void ss_launch_spending_tx_scan(struct command *cmd,
+				       factory_instance_t *fi,
+				       uint32_t window)
+{
+	/* Needs real funding info and a cached blockheight to walk from. */
+	bool has_funding = false;
+	for (int b = 0; b < 32; b++)
+		if (fi->funding_txid[b] != 0) { has_funding = true; break; }
+	if (!has_funding) return;
+	if (ss_state.current_blockheight == 0) return;
+
+	struct spending_tx_scan_ctx *ctx = tal(cmd, struct spending_tx_scan_ctx);
+	ctx->fi = fi;
+	/* Start from the block the heartbeat first noticed the spend
+	 * (preferred — narrower window) or the current height if Phase 1
+	 * didn't record one (e.g., operator-triggered scan on an old
+	 * factory). */
+	ctx->scan_height = fi->first_noticed_block
+		? fi->first_noticed_block
+		: ss_state.current_blockheight;
+	ctx->scan_remaining = window;
+	request_blockhash_for_scan(cmd, ctx);
+}
+
 /* Breach scan: callback after checkutxo returns for a factory's
  * root funding UTXO. If the UTXO is spent, attempt penalty TXs. */
 struct breach_scan_ctx {
@@ -6394,6 +6680,8 @@ static struct command_result *breach_utxo_checked(struct command *cmd,
 			fi->lifecycle = FACTORY_LIFECYCLE_CLOSED_EXTERNALLY;
 			fi->closed_externally_at_block =
 				ss_state.current_blockheight;
+			fi->first_noticed_block =
+				ss_state.current_blockheight;
 			char iid_hex[65];
 			for (int j = 0; j < 32; j++)
 				sprintf(iid_hex + j*2, "%02x",
@@ -6403,12 +6691,20 @@ static struct command_result *breach_utxo_checked(struct command *cmd,
 				   "FACTORY CLOSED EXTERNALLY: instance_id=%s "
 				   "funding root spent at block %u (was in "
 				   "lifecycle %d) without plugin-initiated "
-				   "close. Marked closed_externally. Run "
-				   "factory-confirm-closed %s to reap after "
-				   "verifying funds are safe.",
+				   "close. Marked closed_externally. Phase 2a "
+				   "scan will attempt to identify the spending "
+				   "TX. Run factory-confirm-closed %s to reap "
+				   "after verifying funds are safe.",
 				   iid_hex, ss_state.current_blockheight,
 				   (int)prior, iid_hex);
 			ss_save_factory(cmd, fi);
+
+			/* Phase 2a: launch spending-TX scan. Default window is
+			 * 144 blocks (~1 day) which covers the common case where
+			 * the heartbeat fires on the same or next block the
+			 * spend actually confirmed. Operator can widen via
+			 * factory-scan-external-close if needed. */
+			ss_launch_spending_tx_scan(cmd, fi, 144);
 		}
 
 		/* Previously this loop called factory_build_burn_tx with
@@ -7784,6 +8080,51 @@ static struct command_result *json_factory_confirm_closed(struct command *cmd,
 	return command_finished(cmd, js);
 }
 
+/* Phase 2a: operator-triggered spending-TX scan with a widenable window.
+ * Useful when Phase 1's automatic scan missed (e.g., plugin was offline
+ * for weeks, then started; the spend predates the 144-block default
+ * window). Safe to call repeatedly; each run overwrites the previous
+ * classification. */
+static struct command_result *json_factory_scan_external_close(struct command *cmd,
+							        const char *buf,
+							        const jsmntok_t *params)
+{
+	const char *id_hex;
+	u32 *blocks;
+
+	if (!param(cmd, buf, params,
+		   p_req("instance_id", param_string, &id_hex),
+		   p_opt_def("blocks", param_u32, &blocks, 1000),
+		   NULL))
+		return command_param_failed();
+
+	if (strlen(id_hex) != 64)
+		return command_fail(cmd, LIGHTNINGD,
+				    "Bad instance_id length (need 64 hex chars)");
+
+	uint8_t instance_id[32];
+	for (int j = 0; j < 32; j++) {
+		unsigned int b;
+		if (sscanf(id_hex + j*2, "%02x", &b) != 1)
+			return command_fail(cmd, LIGHTNINGD,
+					    "Bad instance_id hex at byte %d", j);
+		instance_id[j] = (uint8_t)b;
+	}
+
+	factory_instance_t *fi = ss_factory_find(&ss_state, instance_id);
+	if (!fi)
+		return command_fail(cmd, LIGHTNINGD, "Factory %s not found",
+				    id_hex);
+
+	ss_launch_spending_tx_scan(cmd, fi, *blocks);
+
+	struct json_stream *js = jsonrpc_stream_success(cmd);
+	json_add_string(js, "instance_id", id_hex);
+	json_add_u32(js, "scan_window_blocks", *blocks);
+	json_add_string(js, "status", "scan_launched");
+	return command_finished(cmd, js);
+}
+
 static const struct plugin_command commands[] = {
 	{
 		"factory-create",
@@ -7840,6 +8181,10 @@ static const struct plugin_command commands[] = {
 	{
 		"factory-confirm-closed",
 		json_factory_confirm_closed,
+	},
+	{
+		"factory-scan-external-close",
+		json_factory_scan_external_close,
 	},
 };
 
