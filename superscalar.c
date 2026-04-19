@@ -6214,6 +6214,11 @@ static struct command_result *breach_utxo_checked(struct command *cmd,
 						   const char *buf,
 						   const jsmntok_t *result,
 						   void *arg);
+static struct command_result *breach_scan_rpc_err(struct command *cmd,
+						  const char *method,
+						  const char *buf,
+						  const jsmntok_t *result,
+						  void *arg);
 
 /* Launch a single-shot checkutxo scan on a factory's funding UTXO.
  * Returns without sending if the factory has no real funding txid
@@ -6250,15 +6255,56 @@ static void ss_launch_breach_scan(struct command *cmd,
 		sprintf(ftxid_hex + j*2, "%02x", fi->funding_txid[31-j]);
 	ftxid_hex[64] = '\0';
 
-	struct breach_scan_ctx *bctx = tal(cmd, struct breach_scan_ctx);
+	/* Phase 3a: spawn an aux_command so the checkutxo reply callback
+	 * survives the parent's lifetime. The original `cmd` here is
+	 * usually a notification-handler cmd (block_added) which the
+	 * libplugin framework cleans up as soon as notification_handled()
+	 * runs — well before our async checkutxo reply arrives. The reply
+	 * then orphans ("JSON reply with unknown id" in logs) and
+	 * breach_utxo_checked never fires, so the lifecycle transition
+	 * to CLOSED_EXTERNALLY never happens. aux_command() creates a
+	 * sibling cmd that lives until we explicitly free it via
+	 * aux_command_done() in the callback. This is the canonical
+	 * libplugin pattern for "I want my reply to survive my parent."
+	 *
+	 * tal-allocate the breach_scan_ctx on the aux cmd so it gets
+	 * freed with the aux cmd. */
+	struct command *acmd = aux_command(cmd);
+	struct breach_scan_ctx *bctx = tal(acmd, struct breach_scan_ctx);
 	bctx->fi = fi;
 	bctx->factory_idx = factory_idx;
 
-	struct out_req *req = jsonrpc_request_start(cmd,
-		"checkutxo", breach_utxo_checked, rpc_err, bctx);
+	struct out_req *req = jsonrpc_request_start(acmd,
+		"checkutxo", breach_utxo_checked, breach_scan_rpc_err, bctx);
 	json_add_string(req->js, "txid", ftxid_hex);
 	json_add_u32(req->js, "vout", fi->funding_outnum);
 	send_outreq(req);
+}
+
+/* Phase 3a: aux-cmd-aware error handler for the breach scan path. The
+ * generic rpc_err() returns command_still_pending which is fine for the
+ * notification-cmd lifetime model but leaks the aux cmd we created in
+ * ss_launch_breach_scan. Use aux_command_done so the framework reclaims
+ * the cmd + bctx (tal-allocated on it) cleanly. */
+static struct command_result *breach_scan_rpc_err(struct command *cmd,
+						  const char *method,
+						  const char *buf,
+						  const jsmntok_t *result,
+						  void *arg)
+{
+	(void)arg;
+	const jsmntok_t *msg_tok = json_get_member(buf, result, "message");
+	if (msg_tok) {
+		const char *errmsg = json_strdup(cmd, buf, msg_tok);
+		plugin_log(plugin_handle, LOG_UNUSUAL,
+			   "Breach scan RPC %s failed: %s — aux cmd freed",
+			   method, errmsg ? errmsg : "(null)");
+	} else {
+		plugin_log(plugin_handle, LOG_UNUSUAL,
+			   "Breach scan RPC %s failed (no message) — aux cmd freed",
+			   method);
+	}
+	return aux_command_done(cmd);
 }
 
 /* One-shot breach scan across every loaded factory. Called from init
@@ -6270,8 +6316,15 @@ static void ss_catchup_breach_scan(struct command *cmd)
 	for (size_t i = 0; i < ss_state.n_factories; i++) {
 		factory_instance_t *fi = ss_state.factories[i];
 		if (!fi) continue;
-		if (fi->lifecycle != FACTORY_LIFECYCLE_ACTIVE &&
-		    fi->lifecycle != FACTORY_LIFECYCLE_DYING)
+		/* Phase 3a: skip terminal-closed factories only. Pre-3a the
+		 * gate was ACTIVE || DYING, but the 9 signet zombies that
+		 * motivated this work were all in INIT (their ceremonies
+		 * never completed before the recovery tool swept their
+		 * roots). INIT factories with real funding need observation
+		 * too — the inner gate in breach_utxo_checked still filters
+		 * specific lifecycles for state transitions. */
+		if (fi->lifecycle == FACTORY_LIFECYCLE_EXPIRED
+		    || fi->lifecycle == FACTORY_LIFECYCLE_CLOSED_EXTERNALLY)
 			continue;
 		ss_launch_breach_scan(cmd, fi, i);
 		scanned++;
@@ -6295,7 +6348,7 @@ static struct command_result *breach_utxo_checked(struct command *cmd,
 
 	const jsmntok_t *exists_tok = json_get_member(buf, result, "exists");
 	if (!exists_tok)
-		return notification_handled(cmd);
+		return aux_command_done(cmd);
 
 	bool exists;
 	json_to_bool(buf, exists_tok, &exists);
@@ -6327,7 +6380,17 @@ static struct command_result *breach_utxo_checked(struct command *cmd,
 		 * ready to sweep its L-stock. The two concerns (lifecycle
 		 * flag vs burn-tx assembly) are complementary, not mutually
 		 * exclusive. */
-		if (fi->lifecycle == FACTORY_LIFECYCLE_ACTIVE) {
+		/* Phase 3a: transition any non-DYING, non-already-closed
+		 * factory to CLOSED_EXTERNALLY when a spend is observed.
+		 * DYING means we initiated the close; the spend is expected
+		 * (don't relabel). ACTIVE is the normal case. INIT covers
+		 * the "ceremony-not-complete-but-funded" zombies (the 9
+		 * signet recovery factories). */
+		bool should_mark =
+			fi->lifecycle == FACTORY_LIFECYCLE_ACTIVE
+			|| fi->lifecycle == FACTORY_LIFECYCLE_INIT;
+		if (should_mark) {
+			factory_lifecycle_t prior = fi->lifecycle;
 			fi->lifecycle = FACTORY_LIFECYCLE_CLOSED_EXTERNALLY;
 			fi->closed_externally_at_block =
 				ss_state.current_blockheight;
@@ -6338,12 +6401,13 @@ static struct command_result *breach_utxo_checked(struct command *cmd,
 			iid_hex[64] = '\0';
 			plugin_log(plugin_handle, LOG_BROKEN,
 				   "FACTORY CLOSED EXTERNALLY: instance_id=%s "
-				   "funding root spent at block %u without "
-				   "plugin-initiated close. Marked "
-				   "closed_externally. Run factory-confirm-closed "
-				   "%s to reap after verifying funds are safe.",
+				   "funding root spent at block %u (was in "
+				   "lifecycle %d) without plugin-initiated "
+				   "close. Marked closed_externally. Run "
+				   "factory-confirm-closed %s to reap after "
+				   "verifying funds are safe.",
 				   iid_hex, ss_state.current_blockheight,
-				   iid_hex);
+				   (int)prior, iid_hex);
 			ss_save_factory(cmd, fi);
 		}
 
@@ -6361,7 +6425,7 @@ static struct command_result *breach_utxo_checked(struct command *cmd,
 				   "burn TXs. Check startup log for reload "
 				   "failures.",
 				   bctx->factory_idx);
-			return notification_handled(cmd);
+			return aux_command_done(cmd);
 		}
 
 		plugin_log(plugin_handle, LOG_UNUSUAL,
@@ -6488,7 +6552,7 @@ static struct command_result *breach_utxo_checked(struct command *cmd,
 		}
 	}
 
-	return notification_handled(cmd);
+	return aux_command_done(cmd);
 }
 
 /* Handle block_added notification — check for breach (old state on-chain).
@@ -6511,8 +6575,12 @@ static struct command_result *handle_block_added(struct command *cmd,
 	/* Check factory lifecycle warnings */
 	for (size_t i = 0; i < ss_state.n_factories; i++) {
 		factory_instance_t *fi = ss_state.factories[i];
-		if (fi->lifecycle != FACTORY_LIFECYCLE_ACTIVE &&
-		    fi->lifecycle != FACTORY_LIFECYCLE_DYING)
+		/* Phase 3a: skip terminal-closed only. See matching comment
+		 * in ss_catchup_breach_scan — INIT factories with real
+		 * funding need observation. The interior expiry/cascade
+		 * blocks below already filter their own state requirements. */
+		if (fi->lifecycle == FACTORY_LIFECYCLE_EXPIRED
+		    || fi->lifecycle == FACTORY_LIFECYCLE_CLOSED_EXTERNALLY)
 			continue;
 
 		if (ss_factory_should_close(fi, ss_state.current_blockheight)) {
