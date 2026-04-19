@@ -9010,7 +9010,117 @@ static struct command_result *json_factory_scan_external_close(struct command *c
 	return command_finished(cmd, js);
 }
 
+/* dev-factory-set-signal — test-only hook for injecting a Phase 3b
+ * signal bit into a factory and running the classifier. Mirrors CLN's
+ * dev-* convention (see dev-forget-channel, dev-memleak). Used by the
+ * E2E test suite to exercise every branch of ss_apply_signals without
+ * needing a full on-chain ceremony + spend. Safe in production builds
+ * (plugin RPCs are always registered), but operators have no reason to
+ * call it — misusing it corrupts the factory lifecycle record.
+ *
+ * Params: instance_id (hex), signal (string name), match_epoch (u32 opt).
+ * Signal names map 1:1 to SIGNAL_* bits:
+ *   "utxo_spent", "broadcast_missing", "broadcast_known",
+ *   "dist_txid_matched", "kickoff_txid_matched",
+ *   "witness_current_match", "witness_past_match", "state_tx_match".
+ *
+ * match_epoch is required for state_tx_match / witness_past_match; it
+ * populates fi->state_tx_match_epoch / fi->breach_epoch respectively so
+ * the classifier sees consistent inputs.
+ */
+static struct command_result *json_dev_factory_set_signal(struct command *cmd,
+							  const char *buf,
+							  const jsmntok_t *params)
+{
+	const char *id_hex;
+	const char *signal_name;
+	u32 *match_epoch;
+
+	if (!param(cmd, buf, params,
+		   p_req("instance_id", param_string, &id_hex),
+		   p_req("signal", param_string, &signal_name),
+		   p_opt("match_epoch", param_u32, &match_epoch),
+		   NULL))
+		return command_param_failed();
+
+	if (strlen(id_hex) != 64)
+		return command_fail(cmd, LIGHTNINGD,
+				    "Bad instance_id length");
+
+	uint8_t instance_id[32];
+	for (int j = 0; j < 32; j++) {
+		unsigned int b;
+		if (sscanf(id_hex + j*2, "%02x", &b) != 1)
+			return command_fail(cmd, LIGHTNINGD,
+					    "Bad instance_id hex");
+		instance_id[j] = (uint8_t)b;
+	}
+
+	factory_instance_t *fi = ss_factory_find(&ss_state, instance_id);
+	if (!fi)
+		return command_fail(cmd, LIGHTNINGD, "Factory not found");
+
+	uint8_t bit = 0;
+	if (!strcmp(signal_name, "utxo_spent"))
+		bit = SIGNAL_UTXO_SPENT;
+	else if (!strcmp(signal_name, "broadcast_missing"))
+		bit = SIGNAL_BROADCAST_MISSING;
+	else if (!strcmp(signal_name, "broadcast_known"))
+		bit = SIGNAL_BROADCAST_KNOWN;
+	else if (!strcmp(signal_name, "dist_txid_matched"))
+		bit = SIGNAL_DIST_TXID_MATCHED;
+	else if (!strcmp(signal_name, "kickoff_txid_matched"))
+		bit = SIGNAL_KICKOFF_TXID_MATCHED;
+	else if (!strcmp(signal_name, "witness_current_match"))
+		bit = SIGNAL_WITNESS_CURRENT_MATCH;
+	else if (!strcmp(signal_name, "witness_past_match"))
+		bit = SIGNAL_WITNESS_PAST_MATCH;
+	else if (!strcmp(signal_name, "state_tx_match"))
+		bit = SIGNAL_STATE_TX_MATCH;
+	else
+		return command_fail(cmd, LIGHTNINGD,
+				    "Unknown signal '%s'", signal_name);
+
+	fi->signals_observed |= bit;
+
+	/* Consumer signals need companion state populated. Caller supplies
+	 * match_epoch; we route it to the right field so ss_apply_signals
+	 * can read a consistent picture. */
+	if (match_epoch) {
+		if (bit == SIGNAL_STATE_TX_MATCH)
+			fi->state_tx_match_epoch = *match_epoch;
+		else if (bit == SIGNAL_WITNESS_PAST_MATCH)
+			fi->breach_epoch = *match_epoch;
+	}
+
+	ss_apply_signals(cmd, fi);
+
+	struct json_stream *js = jsonrpc_stream_success(cmd);
+	json_add_string(js, "instance_id", id_hex);
+	json_add_string(js, "signal_set", signal_name);
+	json_add_u32(js, "signals_observed", (u32)fi->signals_observed);
+	json_add_string(js, "lifecycle",
+		fi->lifecycle == FACTORY_LIFECYCLE_INIT ? "init" :
+		fi->lifecycle == FACTORY_LIFECYCLE_ACTIVE ? "active" :
+		fi->lifecycle == FACTORY_LIFECYCLE_DYING ? "dying" :
+		fi->lifecycle == FACTORY_LIFECYCLE_EXPIRED ? "expired" :
+		fi->lifecycle == FACTORY_LIFECYCLE_CLOSED_EXTERNALLY
+			? "closed_externally" :
+		fi->lifecycle == FACTORY_LIFECYCLE_CLOSED_COOPERATIVE
+			? "closed_cooperative" :
+		fi->lifecycle == FACTORY_LIFECYCLE_CLOSED_UNILATERAL
+			? "closed_unilateral" :
+		fi->lifecycle == FACTORY_LIFECYCLE_CLOSED_BREACHED
+			? "closed_breached" :
+		"unknown");
+	return command_finished(cmd, js);
+}
+
 static const struct plugin_command commands[] = {
+	{
+		"dev-factory-set-signal",
+		json_dev_factory_set_signal,
+	},
 	{
 		"factory-create",
 		json_factory_create,
