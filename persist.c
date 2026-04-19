@@ -208,11 +208,14 @@ size_t ss_persist_serialize_meta(const factory_instance_t *fi, uint8_t **out)
 
 	/* v9: Phase 3b. Per-epoch state-root TXIDs (paired with kickoff
 	 * sig array above), signals_observed bitmask, state_tx_match_epoch.
-	 * The TXID array length equals n_history_kickoff_sigs. */
+	 * The TXID array length equals n_history_kickoff_sigs.
+	 *
+	 * v10 widens signals_observed from u8 to u16 (bit 8 added for
+	 * SIGNAL_PENALTY_CONFIRMED). Big-endian. */
 	for (size_t i = 0; i < fi->n_history_kickoff_sigs; i++)
 		buf_append(&buf, &len, &cap,
 			   fi->history_state_root_txids[i], 32);
-	buf_u8(&buf, &len, &cap, fi->signals_observed);
+	buf_u16(&buf, &len, &cap, fi->signals_observed);
 	buf_u32(&buf, &len, &cap, fi->state_tx_match_epoch);
 
 	/* v10: Phase 3c pending penalties. One u8 count, then for each entry
@@ -222,7 +225,7 @@ size_t ss_persist_serialize_meta(const factory_instance_t *fi, uint8_t **out)
 	 * breach_data via factory_build_burn_tx). */
 	buf_u8(&buf, &len, &cap, (uint8_t)fi->n_pending_penalties);
 	for (size_t i = 0; i < fi->n_pending_penalties; i++) {
-		pending_penalty_t *pp = &fi->pending_penalties[i];
+		const pending_penalty_t *pp = &fi->pending_penalties[i];
 		buf_u32(&buf, &len, &cap, pp->epoch);
 		/* leaf_index stored as unsigned; negative sentinel as UINT32_MAX */
 		buf_u32(&buf, &len, &cap,
@@ -460,10 +463,19 @@ bool ss_persist_deserialize_meta(factory_instance_t *fi,
 					fi->history_state_root_txids[i], 32))
 				return false;
 		}
-		uint8_t sig_bits;
-		if (!read_u8(&p, &rem, &sig_bits))
-			return false;
-		fi->signals_observed = sig_bits;
+		/* v9: u8 signals. v10+: u16 signals (widened for
+		 * SIGNAL_PENALTY_CONFIRMED at bit 8). */
+		if (version == 9) {
+			uint8_t sig_bits;
+			if (!read_u8(&p, &rem, &sig_bits))
+				return false;
+			fi->signals_observed = sig_bits;
+		} else {
+			uint16_t sig_bits;
+			if (!read_u16(&p, &rem, &sig_bits))
+				return false;
+			fi->signals_observed = sig_bits;
+		}
 		if (!read_u32(&p, &rem, &fi->state_tx_match_epoch))
 			return false;
 	}

@@ -343,8 +343,10 @@ typedef struct factory_instance {
 	/* Phase 3b: signal observation bitmask. Tracks which evidence
 	 * sources contributed to the current lifecycle decision. Used by
 	 * ss_apply_signals() to make idempotent classification decisions
-	 * and by factory-list to surface the evidence trail. */
-	uint8_t signals_observed;
+	 * and by factory-list to surface the evidence trail.
+	 *
+	 * Widened from u8 to u16 in Phase 3c — bit 8 is SIGNAL_PENALTY_CONFIRMED. */
+	uint16_t signals_observed;
 
 	/* Phase 3b: matched epoch from downstream state-TX scan.
 	 * UINT32_MAX when no match. Independent of breach_epoch (which

@@ -7211,7 +7211,7 @@ static void ss_catchup_breach_scan(struct command *cmd)
  * Called whenever a new signal is set on fi->signals_observed. Persists. */
 static void ss_apply_signals(struct command *cmd, factory_instance_t *fi)
 {
-	uint8_t s = fi->signals_observed;
+	uint16_t s = fi->signals_observed;
 
 	/* Skip if already in a more-specific terminal state — we don't
 	 * downgrade. CLOSED_EXTERNALLY is the weakest closed-* label;
@@ -7336,7 +7336,7 @@ broadcast_reply_classified(struct command *cmd,
 	/* Parse known error patterns. errmsg looks like:
 	 *   "error code: -25\nerror message:\nbad-txns-inputs-missingorspent"
 	 */
-	uint8_t signal_to_set = 0;
+	uint16_t signal_to_set = 0;
 	const char *what = "unknown";
 	if (errmsg) {
 		if (strstr(errmsg, "missingorspent")) {
@@ -9375,7 +9375,7 @@ static struct command_result *json_dev_factory_set_signal(struct command *cmd,
 	if (!fi)
 		return command_fail(cmd, LIGHTNINGD, "Factory not found");
 
-	uint8_t bit = 0;
+	uint16_t bit = 0;
 	if (!strcmp(signal_name, "utxo_spent"))
 		bit = SIGNAL_UTXO_SPENT;
 	else if (!strcmp(signal_name, "broadcast_missing"))
