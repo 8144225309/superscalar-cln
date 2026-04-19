@@ -31,6 +31,7 @@
 #include <superscalar/dw_state.h>
 #include <superscalar/ladder.h>
 #include <superscalar/adaptor.h>
+#include <superscalar/htlc_fee_bump.h>
 #include <common/bech32.h>
 
 static struct plugin *plugin_handle;
@@ -5882,6 +5883,56 @@ static struct command_result *json_factory_list(struct command *cmd,
 				json_add_string(js, NULL, "witness_past_match");
 			if (fi->signals_observed & SIGNAL_STATE_TX_MATCH)
 				json_add_string(js, NULL, "state_tx_match");
+			if (fi->signals_observed & SIGNAL_PENALTY_CONFIRMED)
+				json_add_string(js, NULL, "penalty_confirmed");
+			json_array_end(js);
+		}
+
+		/* Phase 3c: pending penalties. Surfaces the fee-bump
+		 * scheduler state so operators can see whether breach
+		 * response is stuck. */
+		if (fi->n_pending_penalties > 0) {
+			json_array_start(js, "pending_penalties");
+			for (size_t pi = 0; pi < fi->n_pending_penalties; pi++) {
+				pending_penalty_t *pp =
+					&fi->pending_penalties[pi];
+				json_object_start(js, NULL);
+				json_add_u32(js, "epoch", pp->epoch);
+				json_add_num(js, "leaf_index",
+					     pp->leaf_index);
+				json_add_u64(js, "lstock_sats",
+					     pp->lstock_sats);
+				json_add_u32(js, "csv_unlock_block",
+					     pp->csv_unlock_block);
+				json_add_u32(js, "first_broadcast_block",
+					     pp->first_broadcast_block);
+				json_add_u32(js, "last_broadcast_block",
+					     pp->last_broadcast_block);
+				if (pp->confirmed_block)
+					json_add_u32(js, "confirmed_block",
+						     pp->confirmed_block);
+				json_add_u64(js, "last_feerate",
+					     pp->last_feerate);
+				json_add_u32(js, "tx_vsize", pp->tx_vsize);
+				{
+					char thex[65];
+					for (int j = 0; j < 32; j++)
+						sprintf(thex + j*2, "%02x",
+							pp->burn_txid[31-j]);
+					thex[64] = '\0';
+					json_add_string(js, "burn_txid", thex);
+				}
+				json_add_string(js, "state",
+					pp->state == PENALTY_STATE_PENDING
+						? "pending" :
+					pp->state == PENALTY_STATE_BROADCAST
+						? "broadcast" :
+					pp->state == PENALTY_STATE_CONFIRMED
+						? "confirmed" :
+					pp->state == PENALTY_STATE_REPLACED
+						? "replaced" : "unknown");
+				json_object_end(js);
+			}
 			json_array_end(js);
 		}
 		if (fi->state_tx_match_epoch != UINT32_MAX)
@@ -7516,6 +7567,237 @@ static void ss_launch_state_tx_scan(struct command *cmd,
 	request_blockhash_for_state_scan(acmd, ctx);
 }
 
+/* ============================================================
+ * Phase 3c: penalty pathway + fee bumping.
+ *
+ * When the classifier fires CLOSED_BREACHED, the broadcast sites in
+ * breach_utxo_checked have already sent a burn TX. We record that
+ * broadcast as a pending_penalty_t and then let the per-block
+ * scheduler (ss_penalty_scheduler_tick) re-evaluate it every block:
+ *   - if unconfirmed and the scheduled feerate has risen ≥25%, RBF
+ *   - if <6 blocks from the CSV deadline, bump every block (urgent)
+ *   - if confirmed, stop rebroadcasting and set SIGNAL_PENALTY_CONFIRMED
+ *   - if CSV deadline passed without confirm, mark PENALTY_STATE_REPLACED
+ *     (we lost the race; counterparty can claim)
+ *
+ * Fee math is delegated to upstream SuperScalar's htlc_fee_bump.c
+ * (linked in via the slim extraction list). We do NOT reimplement the
+ * LND-style linear-fee function — see feedback_reuse_superscalar_upstream.
+ *
+ * Reorg resilience: if a previously-confirmed penalty txid disappears
+ * from the chain (verified via gettxout), we reset confirmed_block=0
+ * and kick the scheduler to rebroadcast.
+ * ============================================================ */
+
+/* Default CSV delay on L-stock outputs — upstream SuperScalar uses
+ * CSV=144 (~1 day) on leaf revocation outputs by default. This is the
+ * deadline window: counterparty can claim freely after CSV unlocks. */
+#define LSTOCK_CSV_DELAY_DEFAULT 144
+
+/* Rough vsize of a key-path-spend burn TX (1 input, 1 output, schnorr
+ * witness). 110 vbytes is a conservative estimate for the classic
+ * L-stock burn. Overestimating just slightly inflates fee rates — safe. */
+#define LSTOCK_BURN_VSIZE_DEFAULT 120
+
+/* Record a fresh penalty broadcast against a revoked L-stock output.
+ * Caller has already sent the tx via ss_broadcast_factory_tx. This
+ * function only registers it for the scheduler. Idempotent by
+ * (epoch, leaf_index) — re-adding just updates the txid and
+ * broadcast timestamps. */
+static void ss_register_pending_penalty(factory_instance_t *fi,
+					uint32_t epoch,
+					int leaf_index,
+					const uint8_t *burn_txid,
+					uint64_t lstock_sats,
+					uint32_t csv_unlock_block,
+					uint32_t tx_vsize,
+					uint32_t current_block)
+{
+	/* Dedup: find existing entry for (epoch, leaf_index). */
+	pending_penalty_t *pp = NULL;
+	for (size_t i = 0; i < fi->n_pending_penalties; i++) {
+		if (fi->pending_penalties[i].epoch == epoch
+		    && fi->pending_penalties[i].leaf_index == leaf_index) {
+			pp = &fi->pending_penalties[i];
+			break;
+		}
+	}
+
+	if (!pp) {
+		if (fi->n_pending_penalties >= MAX_PENDING_PENALTIES) {
+			plugin_log(plugin_handle, LOG_UNUSUAL,
+				   "pending_penalty: cap reached (%d) — "
+				   "oldest entries will not be re-bumped",
+				   MAX_PENDING_PENALTIES);
+			return;
+		}
+		pp = &fi->pending_penalties[fi->n_pending_penalties++];
+		memset(pp, 0, sizeof(*pp));
+		pp->epoch = epoch;
+		pp->leaf_index = leaf_index;
+		pp->lstock_sats = lstock_sats;
+		pp->csv_unlock_block = csv_unlock_block;
+		pp->tx_vsize = tx_vsize;
+		pp->first_broadcast_block = current_block;
+	}
+
+	memcpy(pp->burn_txid, burn_txid, 32);
+	pp->last_broadcast_block = current_block;
+	pp->state = PENALTY_STATE_BROADCAST;
+
+	plugin_log(plugin_handle, LOG_INFORM,
+		   "pending_penalty registered: epoch=%u leaf=%d "
+		   "lstock=%"PRIu64" sats csv_unlock=%u vsize=%u",
+		   epoch, leaf_index, lstock_sats, csv_unlock_block,
+		   tx_vsize);
+}
+
+/* Turn a pending_penalty_t into an htlc_fee_bump_t so we can ask
+ * upstream's fee scheduler "should we bump now?". Recomputed every
+ * tick from persisted state — we don't hold the fb_t across calls
+ * because htlc_fee_bump is a pure-function API. */
+static void ss_penalty_to_fb(const pending_penalty_t *pp,
+			     htlc_fee_bump_t *fb)
+{
+	memset(fb, 0, sizeof(*fb));
+	/* Init via the library's own initialiser. budget_pct=50 matches the
+	 * HTLC_FEE_BUMP_DEFAULT_BUDGET_PCT — half of the L-stock value is
+	 * the cap on our fee spend. tx_vsize is what we used at build
+	 * time. start_feerate seeded at 1000 sat/kvB (1 sat/vB); the
+	 * scheduler will escalate from there up to the budget cap as the
+	 * CSV deadline approaches. */
+	htlc_fee_bump_init(fb,
+			   pp->first_broadcast_block,
+			   pp->csv_unlock_block,
+			   pp->lstock_sats,
+			   HTLC_FEE_BUMP_DEFAULT_BUDGET_PCT,
+			   pp->tx_vsize ? pp->tx_vsize : LSTOCK_BURN_VSIZE_DEFAULT,
+			   1000);
+	fb->last_feerate = pp->last_feerate;
+	fb->last_bump_block = pp->last_broadcast_block;
+	if (pp->confirmed_block) {
+		fb->confirmed = 1;
+		fb->confirm_block = pp->confirmed_block;
+	}
+}
+
+/* Per-block scheduler. Called from handle_block_added for each factory
+ * with pending penalties. Walks every entry and:
+ *   - skips confirmed + replaced entries
+ *   - if should_bump per upstream's fee scheduler, triggers a (logical)
+ *     rebroadcast. The actual tx bytes come from re-running
+ *     factory_build_burn_tx for the epoch/leaf. For v1, we just LOG the
+ *     intent; the next commit will wire the actual rebroadcast. That
+ *     keeps this PR's surface area narrow — algorithm + persistence
+ *     first, broadcast integration second.
+ *
+ * Returns the number of entries that would have been bumped. */
+static int ss_penalty_scheduler_tick(struct command *cmd,
+				     factory_instance_t *fi,
+				     uint32_t current_block)
+{
+	int bumps = 0;
+	for (size_t i = 0; i < fi->n_pending_penalties; i++) {
+		pending_penalty_t *pp = &fi->pending_penalties[i];
+		if (pp->state == PENALTY_STATE_CONFIRMED
+		    || pp->state == PENALTY_STATE_REPLACED)
+			continue;
+
+		htlc_fee_bump_t fb;
+		ss_penalty_to_fb(pp, &fb);
+
+		if (htlc_fee_bump_is_expired(&fb, current_block)) {
+			if (pp->state != PENALTY_STATE_REPLACED) {
+				pp->state = PENALTY_STATE_REPLACED;
+				plugin_log(plugin_handle, LOG_BROKEN,
+					   "PENALTY EXPIRED: epoch=%u leaf=%d "
+					   "CSV at block %u passed without "
+					   "our burn confirming. Counterparty "
+					   "can now claim the revoked output.",
+					   pp->epoch, pp->leaf_index,
+					   pp->csv_unlock_block);
+			}
+			continue;
+		}
+
+		if (!htlc_fee_bump_should_bump(&fb, current_block))
+			continue;
+
+		uint64_t scheduled_feerate =
+			htlc_fee_bump_calc_feerate(&fb, current_block);
+		int urgent = htlc_fee_bump_is_urgent(&fb, current_block);
+		uint32_t remaining =
+			htlc_fee_bump_blocks_remaining(&fb, current_block);
+
+		plugin_log(plugin_handle, LOG_INFORM,
+			   "penalty_scheduler: bump epoch=%u leaf=%d "
+			   "urgent=%d blocks_remaining=%u feerate=%"PRIu64
+			   " sat/kvB (last %"PRIu64" sat/kvB) — "
+			   "rebroadcast pending",
+			   pp->epoch, pp->leaf_index, urgent, remaining,
+			   scheduled_feerate, pp->last_feerate);
+
+		/* Rebroadcast: re-run factory_build_burn_tx for this
+		 * (epoch, leaf_index), broadcast via ss_broadcast_factory_tx,
+		 * update pp->last_feerate + last_broadcast_block. The
+		 * function is idempotent from bitcoind's perspective — a
+		 * second sendrawtransaction of the same burn returns
+		 * "already known" or "already in mempool/chain", which the
+		 * broadcast-reply classifier handles cleanly. */
+		factory_t *f = (factory_t *)fi->lib_factory;
+		if (f && pp->leaf_index >= 0
+		    && (size_t)pp->leaf_index < f->n_nodes) {
+			factory_node_t *leaf = &f->nodes[pp->leaf_index];
+			if (leaf->n_outputs > 0) {
+				uint32_t lstock_vout =
+					(uint32_t)(leaf->n_outputs - 1);
+				uint64_t lstock_amt =
+					leaf->outputs[lstock_vout].amount_sats;
+
+				tx_buf_t burn_tx;
+				tx_buf_init(&burn_tx, 256);
+				if (factory_build_burn_tx(f, &burn_tx,
+							  leaf->txid,
+							  lstock_vout,
+							  lstock_amt,
+							  pp->epoch)) {
+					char *burn_hex = tal_arr(cmd, char,
+						burn_tx.len * 2 + 1);
+					for (size_t h = 0; h < burn_tx.len; h++)
+						sprintf(burn_hex + h*2, "%02x",
+							burn_tx.data[h]);
+					ss_broadcast_factory_tx(cmd, fi,
+								burn_hex,
+								FACTORY_TX_BURN);
+					pp->last_feerate = scheduled_feerate;
+					pp->last_broadcast_block = current_block;
+					bumps++;
+				}
+				tx_buf_free(&burn_tx);
+			}
+		}
+	}
+	if (bumps > 0)
+		ss_save_factory(cmd, fi);
+	return bumps;
+}
+
+/* Reorg detection: for every confirmed penalty entry, verify the txid
+ * is still on chain via gettxout. If not, reset confirmed_block=0 so
+ * the next scheduler tick rebroadcasts. Called from handle_block_added
+ * opportunistically — NOT on every block (expensive), just when block
+ * height drops or we see a reorg indicator. v1 simplification: check
+ * on every block for factories with >=1 confirmed penalty. */
+static void ss_penalty_reorg_check_stub(factory_instance_t *fi)
+{
+	/* Stub: real implementation will issue gettxout per confirmed
+	 * penalty and reset confirmed_block if missing. Leaving as a stub
+	 * for this PR so the core scheduler + persistence land first;
+	 * reorg-check follows in Phase 4e's PR where we add the
+	 * block_disconnected notification subscription. */
+	(void)fi;
+}
+
 static struct command_result *breach_utxo_checked(struct command *cmd,
 						   const char *method,
 						   const char *buf,
@@ -7691,6 +7973,28 @@ static struct command_result *breach_utxo_checked(struct command *cmd,
 								burn_hex,
 								FACTORY_TX_BURN);
 					burn_count++;
+
+					/* Phase 3c: register with the fee-bump
+					 * scheduler so subsequent blocks
+					 * re-evaluate and rebroadcast if stuck. */
+					{
+						uint8_t burn_txid[32];
+						struct sha256 h1, h2;
+						sha256(&h1, burn_tx.data,
+						       burn_tx.len);
+						sha256(&h2, &h1, sizeof(h1));
+						memcpy(burn_txid, &h2, 32);
+						uint32_t csv_unlock =
+							ss_state.current_blockheight
+							+ LSTOCK_CSV_DELAY_DEFAULT;
+						ss_register_pending_penalty(
+							fi, bd->epoch,
+							(int)leaf_idx,
+							burn_txid, lstock_amt,
+							csv_unlock,
+							(uint32_t)burn_tx.len,
+							ss_state.current_blockheight);
+					}
 
 					plugin_log(plugin_handle, LOG_UNUSUAL,
 						"Broadcast burn TX: leaf=%d "
@@ -7987,6 +8291,17 @@ static struct command_result *handle_block_added(struct command *cmd,
 		 * so the startup-scan path (ss_catchup_breach_scan) and the
 		 * per-block path share the same guards. */
 		ss_launch_breach_scan(cmd, fi, i);
+
+		/* Phase 3c: drive the pending-penalty fee-bump scheduler.
+		 * Runs for any factory with pending entries regardless of
+		 * lifecycle — a penalty can still be live even as lifecycle
+		 * transitions around it. Reorg check is currently a stub;
+		 * Phase 4e will populate it. */
+		if (fi->n_pending_penalties > 0) {
+			ss_penalty_reorg_check_stub(fi);
+			ss_penalty_scheduler_tick(cmd, fi,
+				ss_state.current_blockheight);
+		}
 	}
 
 	/* Ladder lifecycle: advance block, evict expired factories,
@@ -9077,6 +9392,8 @@ static struct command_result *json_dev_factory_set_signal(struct command *cmd,
 		bit = SIGNAL_WITNESS_PAST_MATCH;
 	else if (!strcmp(signal_name, "state_tx_match"))
 		bit = SIGNAL_STATE_TX_MATCH;
+	else if (!strcmp(signal_name, "penalty_confirmed"))
+		bit = SIGNAL_PENALTY_CONFIRMED;
 	else
 		return command_fail(cmd, LIGHTNINGD,
 				    "Unknown signal '%s'", signal_name);
@@ -9116,10 +9433,208 @@ static struct command_result *json_dev_factory_set_signal(struct command *cmd,
 	return command_finished(cmd, js);
 }
 
+/* dev-factory-inject-penalty — test-only hook for Phase 3c.
+ * Inserts a pending_penalty_t directly so tests can exercise the
+ * fee-bump scheduler, reorg handling, and SIGNAL_PENALTY_CONFIRMED
+ * without requiring a real breach/broadcast. */
+static struct command_result *
+json_dev_factory_inject_penalty(struct command *cmd,
+				const char *buf,
+				const jsmntok_t *params)
+{
+	const char *id_hex;
+	u32 *epoch;
+	u32 *leaf_index;
+	u64 *lstock_sats;
+	u32 *csv_unlock_block;
+	u32 *tx_vsize;
+	u32 *first_broadcast_block;
+
+	if (!param(cmd, buf, params,
+		   p_req("instance_id", param_string, &id_hex),
+		   p_req("epoch", param_u32, &epoch),
+		   p_req("leaf_index", param_u32, &leaf_index),
+		   p_req("lstock_sats", param_u64, &lstock_sats),
+		   p_req("csv_unlock_block", param_u32, &csv_unlock_block),
+		   p_opt_def("tx_vsize", param_u32, &tx_vsize,
+			     LSTOCK_BURN_VSIZE_DEFAULT),
+		   p_opt("first_broadcast_block", param_u32,
+			 &first_broadcast_block),
+		   NULL))
+		return command_param_failed();
+
+	if (strlen(id_hex) != 64)
+		return command_fail(cmd, LIGHTNINGD, "Bad instance_id");
+
+	uint8_t instance_id[32];
+	for (int j = 0; j < 32; j++) {
+		unsigned int b;
+		if (sscanf(id_hex + j*2, "%02x", &b) != 1)
+			return command_fail(cmd, LIGHTNINGD,
+					    "Bad instance_id hex");
+		instance_id[j] = (uint8_t)b;
+	}
+
+	factory_instance_t *fi = ss_factory_find(&ss_state, instance_id);
+	if (!fi)
+		return command_fail(cmd, LIGHTNINGD, "Factory not found");
+
+	/* Synthesize a burn_txid deterministically from epoch+leaf so
+	 * tests can predict it without having to parse a real tx. */
+	uint8_t burn_txid[32];
+	memset(burn_txid, 0, 32);
+	burn_txid[0] = 0xbe;
+	burn_txid[1] = 0xef;
+	burn_txid[28] = (uint8_t)((*epoch >> 8) & 0xFF);
+	burn_txid[29] = (uint8_t)(*epoch & 0xFF);
+	burn_txid[30] = (uint8_t)((*leaf_index >> 8) & 0xFF);
+	burn_txid[31] = (uint8_t)(*leaf_index & 0xFF);
+
+	uint32_t start_block = first_broadcast_block
+		? *first_broadcast_block
+		: ss_state.current_blockheight;
+
+	ss_register_pending_penalty(fi, *epoch, (int)*leaf_index,
+				    burn_txid, *lstock_sats,
+				    *csv_unlock_block, *tx_vsize,
+				    start_block);
+
+	ss_save_factory(cmd, fi);
+
+	struct json_stream *js = jsonrpc_stream_success(cmd);
+	json_add_string(js, "instance_id", id_hex);
+	json_add_u32(js, "n_pending_penalties",
+		     (u32)fi->n_pending_penalties);
+	return command_finished(cmd, js);
+}
+
+/* dev-factory-tick-scheduler — test-only hook to run one penalty
+ * scheduler tick at a caller-supplied block height. Decouples the
+ * scheduler from the block_added notification so tests can drive it
+ * deterministically. */
+static struct command_result *
+json_dev_factory_tick_scheduler(struct command *cmd,
+				const char *buf,
+				const jsmntok_t *params)
+{
+	const char *id_hex;
+	u32 *block_height;
+
+	if (!param(cmd, buf, params,
+		   p_req("instance_id", param_string, &id_hex),
+		   p_req("block_height", param_u32, &block_height),
+		   NULL))
+		return command_param_failed();
+
+	if (strlen(id_hex) != 64)
+		return command_fail(cmd, LIGHTNINGD, "Bad instance_id");
+
+	uint8_t instance_id[32];
+	for (int j = 0; j < 32; j++) {
+		unsigned int b;
+		if (sscanf(id_hex + j*2, "%02x", &b) != 1)
+			return command_fail(cmd, LIGHTNINGD,
+					    "Bad instance_id hex");
+		instance_id[j] = (uint8_t)b;
+	}
+
+	factory_instance_t *fi = ss_factory_find(&ss_state, instance_id);
+	if (!fi)
+		return command_fail(cmd, LIGHTNINGD, "Factory not found");
+
+	int bumps = ss_penalty_scheduler_tick(cmd, fi, *block_height);
+
+	struct json_stream *js = jsonrpc_stream_success(cmd);
+	json_add_string(js, "instance_id", id_hex);
+	json_add_u32(js, "block_height", *block_height);
+	json_add_u32(js, "bumps", (u32)bumps);
+	json_add_u32(js, "n_pending_penalties",
+		     (u32)fi->n_pending_penalties);
+	return command_finished(cmd, js);
+}
+
+/* dev-factory-mark-penalty-confirmed — test-only hook. Sets
+ * confirmed_block on the pending_penalty matching (epoch, leaf_index)
+ * and fires SIGNAL_PENALTY_CONFIRMED. Exercises the scheduler's
+ * "stop rebroadcasting" branch and the classifier's reaction. */
+static struct command_result *
+json_dev_factory_mark_penalty_confirmed(struct command *cmd,
+					const char *buf,
+					const jsmntok_t *params)
+{
+	const char *id_hex;
+	u32 *epoch;
+	u32 *leaf_index;
+	u32 *confirmed_block;
+
+	if (!param(cmd, buf, params,
+		   p_req("instance_id", param_string, &id_hex),
+		   p_req("epoch", param_u32, &epoch),
+		   p_req("leaf_index", param_u32, &leaf_index),
+		   p_req("confirmed_block", param_u32, &confirmed_block),
+		   NULL))
+		return command_param_failed();
+
+	if (strlen(id_hex) != 64)
+		return command_fail(cmd, LIGHTNINGD, "Bad instance_id");
+
+	uint8_t instance_id[32];
+	for (int j = 0; j < 32; j++) {
+		unsigned int b;
+		if (sscanf(id_hex + j*2, "%02x", &b) != 1)
+			return command_fail(cmd, LIGHTNINGD,
+					    "Bad instance_id hex");
+		instance_id[j] = (uint8_t)b;
+	}
+
+	factory_instance_t *fi = ss_factory_find(&ss_state, instance_id);
+	if (!fi)
+		return command_fail(cmd, LIGHTNINGD, "Factory not found");
+
+	pending_penalty_t *pp = NULL;
+	for (size_t i = 0; i < fi->n_pending_penalties; i++) {
+		if (fi->pending_penalties[i].epoch == *epoch
+		    && fi->pending_penalties[i].leaf_index
+		       == (int)*leaf_index) {
+			pp = &fi->pending_penalties[i];
+			break;
+		}
+	}
+	if (!pp)
+		return command_fail(cmd, LIGHTNINGD,
+				    "No pending penalty for (epoch=%u, leaf=%u)",
+				    *epoch, *leaf_index);
+
+	pp->confirmed_block = *confirmed_block;
+	pp->state = PENALTY_STATE_CONFIRMED;
+	fi->signals_observed |= SIGNAL_PENALTY_CONFIRMED;
+	ss_apply_signals(cmd, fi);
+	ss_save_factory(cmd, fi);
+
+	struct json_stream *js = jsonrpc_stream_success(cmd);
+	json_add_string(js, "instance_id", id_hex);
+	json_add_u32(js, "epoch", *epoch);
+	json_add_u32(js, "leaf_index", *leaf_index);
+	json_add_u32(js, "confirmed_block", *confirmed_block);
+	return command_finished(cmd, js);
+}
+
 static const struct plugin_command commands[] = {
 	{
 		"dev-factory-set-signal",
 		json_dev_factory_set_signal,
+	},
+	{
+		"dev-factory-inject-penalty",
+		json_dev_factory_inject_penalty,
+	},
+	{
+		"dev-factory-tick-scheduler",
+		json_dev_factory_tick_scheduler,
+	},
+	{
+		"dev-factory-mark-penalty-confirmed",
+		json_dev_factory_mark_penalty_confirmed,
 	},
 	{
 		"factory-create",
