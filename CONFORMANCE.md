@@ -113,6 +113,10 @@ Factory lifecycle is observed against on-chain truth so records can't drift into
 | UTXO heartbeat on `block_added` + startup catch-up | ✓ Phase 1 |
 | `CLOSED_EXTERNALLY` lifecycle state on unexpected root spend | ✓ Phase 1 |
 | `factory-confirm-closed` RPC for explicit operator reap | ✓ Phase 1 |
-| Spending-TX classification (breach vs coop vs external) | — Phase 2 |
+| Bounded block scan to identify the spending TX | ✓ Phase 2a |
+| Self-close detection (our kickoff → `CLOSED_UNILATERAL`) | ✓ Phase 2a |
+| `factory-scan-external-close` RPC (operator re-scan with wider window) | ✓ Phase 2a |
+| Counterparty-normal vs breach distinction (per-epoch tree reconstruction) | — Phase 2b |
+| Cooperative close detection (spending TX matches `dist_signed_tx`) | — Phase 2b |
 | Automated breach penalty construction + fee bumping | — Phase 3 |
 | Multi-party ceremony tests at N > 2 | — Phase 4 |
