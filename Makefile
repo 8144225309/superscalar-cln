@@ -17,11 +17,14 @@ build:
 # system `/usr/local/bin/lightningd` (may be a stale or upstream build)
 # and tests hang at `plugins_init`. These vars make the target self-contained.
 CLN_DIR ?= /root/lightning
-SS_PLUGIN_PATH ?= /root/cln-blip56/plugins/superscalar
+# Use SUPERSCALAR_PLUGIN directly as the var name so callers can set it via
+# the standard env name rather than a make-only alias. The default tracks
+# the VPS layout; CI overrides it via the workflow env block.
+SUPERSCALAR_PLUGIN ?= /root/cln-blip56/plugins/superscalar
 test: test-build
 	@PATH=$(CLN_DIR)/lightningd:$(CLN_DIR)/cli:$$PATH \
 	 LIGHTNINGD=$(CLN_DIR)/lightningd/lightningd \
-	 SUPERSCALAR_PLUGIN=$(SS_PLUGIN_PATH) \
+	 SUPERSCALAR_PLUGIN=$(SUPERSCALAR_PLUGIN) \
 	 pytest tests/
 
 # Ensure the plugin binary is present and up-to-date.
