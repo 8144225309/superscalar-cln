@@ -88,17 +88,37 @@ def test_stale_entries_are_skipped_by_scheduler(ss_node_factory):
     assert fs["pending_penalties"][0]["state"] == "stale"
 
 
-def test_source_check_no_lib_factory_skips_gracefully(ss_node_factory):
-    """Stalled-ceremony factory has no lib_factory. source_check must
-    return probes_issued=0 without crashing — same gate pattern as
-    Phase 4a deep-unwind scan."""
+def test_source_check_dispatches_probe_and_flips_stale(ss_node_factory):
+    """factory-create builds a lib_factory skeleton immediately so the
+    source-check IS dispatched even on a stalled-ceremony factory. The
+    synthetic leaf txid never existed on chain, so the async checkutxo
+    reply has exists=false → entry flips to STALE.
+
+    Same async pattern as Phase 4e reorg check: probe + asynchronous
+    state transition driven by the reply callback."""
     lsp = ss_node_factory.get_node()
     iid = _create_factory(lsp)
     _inject_penalty(lsp, iid)
 
     r = lsp.rpc.call("factory-source-check", {"instance_id": iid})
-    assert r["probes_issued"] == 0
-    assert r["n_pending_penalties"] == 1
+    assert r["probes_issued"] >= 1, (
+        f"expected at least one probe dispatched (lib_factory has a "
+        f"tree skeleton), got {r['probes_issued']}"
+    )
+
+    # Wait for the async reply callback to flip state.
+    deadline = time.time() + 10.0
+    final = None
+    while time.time() < deadline:
+        fs = _factory(lsp, iid)
+        final = fs["pending_penalties"][0]["state"]
+        if final == "stale":
+            return
+        time.sleep(0.25)
+    raise AssertionError(
+        f"expected source-check to flip state to 'stale' "
+        f"(synthetic source txid → exists=false), got {final!r}"
+    )
 
 
 def test_dev_trigger_alias_works(ss_node_factory):
