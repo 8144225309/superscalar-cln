@@ -62,6 +62,11 @@ static void ss_broadcast_factory_tx(struct command *cmd,
 				    const char *tx_hex,
 				    int kind);
 
+/* Forward decls: Phase 4d sweep-state name helpers used by
+ * factory-list before their definitions lower in the file. */
+static const char *sweep_state_name(uint8_t s);
+static const char *sweep_type_name(uint8_t t);
+
 
 /* bLIP-56 factory message type */
 /* ODD type = CLN allows it through connectd without any fork changes.
@@ -5888,6 +5893,47 @@ static struct command_result *json_factory_list(struct command *cmd,
 			json_array_end(js);
 		}
 
+		/* Phase 4d: pending sweeps surfaced for operator visibility
+		 * into the CSV claim pipeline. */
+		if (fi->n_pending_sweeps > 0) {
+			json_array_start(js, "pending_sweeps");
+			for (size_t si = 0; si < fi->n_pending_sweeps; si++) {
+				pending_sweep_t *ps =
+					&fi->pending_sweeps[si];
+				json_object_start(js, NULL);
+				json_add_string(js, "type",
+					sweep_type_name(ps->type));
+				json_add_string(js, "state",
+					sweep_state_name(ps->state));
+				{
+					char thex[65];
+					for (int j = 0; j < 32; j++)
+						sprintf(thex + j*2, "%02x",
+							ps->source_txid[31-j]);
+					thex[64] = '\0';
+					json_add_string(js, "source_txid",
+							thex);
+				}
+				json_add_u32(js, "source_vout",
+					     ps->source_vout);
+				json_add_u64(js, "amount_sats",
+					     ps->amount_sats);
+				json_add_u32(js, "csv_delay", ps->csv_delay);
+				if (ps->confirmed_block)
+					json_add_u32(js, "confirmed_block",
+						     ps->confirmed_block);
+				if (ps->broadcast_block)
+					json_add_u32(js, "broadcast_block",
+						     ps->broadcast_block);
+				if (ps->sweep_confirmed_block)
+					json_add_u32(js,
+						"sweep_confirmed_block",
+						ps->sweep_confirmed_block);
+				json_object_end(js);
+			}
+			json_array_end(js);
+		}
+
 		/* Phase 3c: pending penalties. Surfaces the fee-bump
 		 * scheduler state so operators can see whether breach
 		 * response is stuck. */
@@ -7933,6 +7979,160 @@ static void ss_penalty_reorg_check_stub(factory_instance_t *fi)
 	(void)fi;
 }
 
+/* ============================================================
+ * Phase 4d: CSV claim scheduler.
+ *
+ * Algorithm ported from upstream sweeper.c:sweeper_check (see
+ * feedback_reuse_superscalar_upstream). Walks the pending_sweeps
+ * array every block and advances entries through the state machine:
+ *
+ *   PENDING   — source TX not yet confirmed; check confs, record
+ *               confirmed_block when >=1
+ *   READY     — source confirmed AND CSV window expired; log that
+ *               the entry is ready for sweep TX construction
+ *   BROADCAST — (Phase 4d2) a sweep TX has been sent; check its
+ *               confirmations
+ *   CONFIRMED — sweep tx has >=3 confs; entry is done
+ *
+ * Phase 4d v1 landed the scaffolding: it logs PENDING→READY
+ * transitions. Actual sweep-TX construction + broadcast is deferred
+ * to 4d2 when we identify concrete leaf-output sweep cases.
+ * ============================================================ */
+
+/* Minimum confirmations before we consider a sweep done. Matches
+ * upstream sweeper.c's 3-conf threshold. */
+#define SWEEP_CONFIRM_THRESHOLD 3
+
+/* Register a new pending sweep. Dedup by (source_txid, source_vout).
+ * Called from the post-close paths (Phase 4d2 entry points) when we
+ * identify an output that will mature after a CSV window. */
+static void ss_register_pending_sweep(factory_instance_t *fi,
+				      uint8_t type,
+				      const uint8_t *source_txid,
+				      uint32_t source_vout,
+				      uint64_t amount_sats,
+				      uint32_t csv_delay)
+{
+	/* Dedup. */
+	for (size_t i = 0; i < fi->n_pending_sweeps; i++) {
+		pending_sweep_t *existing = &fi->pending_sweeps[i];
+		if (memcmp(existing->source_txid, source_txid, 32) == 0
+		    && existing->source_vout == source_vout) {
+			/* Already tracking; refresh the amount/csv in case
+			 * caller learned new info. */
+			existing->amount_sats = amount_sats;
+			existing->csv_delay = csv_delay;
+			return;
+		}
+	}
+
+	if (fi->n_pending_sweeps >= MAX_PENDING_SWEEPS) {
+		plugin_log(plugin_handle, LOG_UNUSUAL,
+			   "pending_sweep: cap reached (%d) — sweep not tracked",
+			   MAX_PENDING_SWEEPS);
+		return;
+	}
+
+	pending_sweep_t *ps = &fi->pending_sweeps[fi->n_pending_sweeps++];
+	memset(ps, 0, sizeof(*ps));
+	ps->type = type;
+	ps->state = SWEEP_STATE_PENDING;
+	memcpy(ps->source_txid, source_txid, 32);
+	ps->source_vout = source_vout;
+	ps->amount_sats = amount_sats;
+	ps->csv_delay = csv_delay;
+
+	plugin_log(plugin_handle, LOG_INFORM,
+		   "pending_sweep registered: type=%u vout=%u amount=%"PRIu64
+		   " csv_delay=%u", type, source_vout, amount_sats, csv_delay);
+}
+
+static const char *sweep_state_name(uint8_t s)
+{
+	switch (s) {
+	case SWEEP_STATE_PENDING:   return "pending";
+	case SWEEP_STATE_READY:     return "ready";
+	case SWEEP_STATE_BROADCAST: return "broadcast";
+	case SWEEP_STATE_CONFIRMED: return "confirmed";
+	case SWEEP_STATE_FAILED:    return "failed";
+	default:                    return "unknown";
+	}
+}
+
+static const char *sweep_type_name(uint8_t t)
+{
+	switch (t) {
+	case SWEEP_TYPE_FACTORY_LSTOCK:  return "factory_lstock";
+	case SWEEP_TYPE_FACTORY_LEAF:    return "factory_leaf";
+	case SWEEP_TYPE_FACTORY_TIMEOUT: return "factory_timeout";
+	default:                         return "unknown";
+	}
+}
+
+/* Per-block sweep scheduler tick. Pure state-machine advancement for
+ * v1 — transitions that require actual block confirmations (PENDING →
+ * READY when source confirms, BROADCAST → CONFIRMED when sweep has
+ * threshold confs) are driven by caller-supplied current_block +
+ * future dev/operator RPCs that inject confirmations. Real chain
+ * integration (getrawtransaction, checkutxo) for these transitions
+ * lives in Phase 4d2.
+ *
+ * Returns the number of state transitions observed. */
+static int ss_sweep_scheduler_tick(struct command *cmd,
+				   factory_instance_t *fi,
+				   uint32_t current_block)
+{
+	int transitions = 0;
+	bool dirty = false;
+
+	for (size_t i = 0; i < fi->n_pending_sweeps; i++) {
+		pending_sweep_t *ps = &fi->pending_sweeps[i];
+
+		/* PENDING → READY when source has confirmed_block set AND
+		 * CSV window has elapsed. confirmed_block gets populated by
+		 * Phase 4d2 chain-observation hooks or the dev RPC. */
+		if (ps->state == SWEEP_STATE_PENDING
+		    && ps->confirmed_block > 0) {
+			uint32_t mature_at = ps->confirmed_block + ps->csv_delay;
+			if (current_block >= mature_at) {
+				ps->state = SWEEP_STATE_READY;
+				plugin_log(plugin_handle, LOG_INFORM,
+					   "sweep: entry %zu type=%s vout=%u "
+					   "amount=%"PRIu64" csv=%u now READY "
+					   "(confirmed_at=%u, current=%u). "
+					   "Phase 4d2 will broadcast.",
+					   i, sweep_type_name(ps->type),
+					   ps->source_vout, ps->amount_sats,
+					   ps->csv_delay,
+					   ps->confirmed_block, current_block);
+				transitions++;
+				dirty = true;
+			}
+		}
+
+		/* BROADCAST → CONFIRMED when sweep_confirmed_block has been
+		 * stamped by the confirm-observation hook (4d2 or the dev
+		 * RPC). Upstream requires >=3 confs; we honor that. */
+		if (ps->state == SWEEP_STATE_BROADCAST
+		    && ps->sweep_confirmed_block > 0
+		    && current_block >= ps->sweep_confirmed_block
+		    + SWEEP_CONFIRM_THRESHOLD - 1) {
+			ps->state = SWEEP_STATE_CONFIRMED;
+			plugin_log(plugin_handle, LOG_INFORM,
+				   "sweep: entry %zu type=%s CONFIRMED "
+				   "(sweep confirmed_at=%u, current=%u)",
+				   i, sweep_type_name(ps->type),
+				   ps->sweep_confirmed_block, current_block);
+			transitions++;
+			dirty = true;
+		}
+	}
+
+	if (dirty)
+		ss_save_factory(cmd, fi);
+	return transitions;
+}
+
 static struct command_result *breach_utxo_checked(struct command *cmd,
 						   const char *method,
 						   const char *buf,
@@ -8472,6 +8672,13 @@ static struct command_result *handle_block_added(struct command *cmd,
 		if (fi->n_pending_penalties > 0) {
 			ss_penalty_reorg_check_stub(fi);
 			ss_penalty_scheduler_tick(cmd, fi,
+				ss_state.current_blockheight);
+		}
+
+		/* Phase 4d: sweep scheduler tick. Cheap; only walks in-memory
+		 * array. */
+		if (fi->n_pending_sweeps > 0) {
+			ss_sweep_scheduler_tick(cmd, fi,
 				ss_state.current_blockheight);
 		}
 	}
@@ -9860,6 +10067,243 @@ json_dev_factory_trigger_deep_unwind_scan(struct command *cmd,
 	return command_finished(cmd, js);
 }
 
+/* dev-factory-inject-sweep — test-only hook for Phase 4d. Registers
+ * a pending_sweep_t for the scheduler to walk. */
+static struct command_result *
+json_dev_factory_inject_sweep(struct command *cmd,
+			      const char *buf,
+			      const jsmntok_t *params)
+{
+	const char *id_hex;
+	const char *type_str;
+	u32 *source_vout;
+	u64 *amount_sats;
+	u32 *csv_delay;
+	u32 *confirmed_block;
+
+	if (!param(cmd, buf, params,
+		   p_req("instance_id", param_string, &id_hex),
+		   p_req("type", param_string, &type_str),
+		   p_req("source_vout", param_u32, &source_vout),
+		   p_req("amount_sats", param_u64, &amount_sats),
+		   p_req("csv_delay", param_u32, &csv_delay),
+		   p_opt("confirmed_block", param_u32, &confirmed_block),
+		   NULL))
+		return command_param_failed();
+
+	if (strlen(id_hex) != 64)
+		return command_fail(cmd, LIGHTNINGD, "Bad instance_id");
+
+	uint8_t instance_id[32];
+	for (int j = 0; j < 32; j++) {
+		unsigned int b;
+		if (sscanf(id_hex + j*2, "%02x", &b) != 1)
+			return command_fail(cmd, LIGHTNINGD,
+					    "Bad instance_id hex");
+		instance_id[j] = (uint8_t)b;
+	}
+
+	factory_instance_t *fi = ss_factory_find(&ss_state, instance_id);
+	if (!fi)
+		return command_fail(cmd, LIGHTNINGD, "Factory not found");
+
+	uint8_t type = SWEEP_TYPE_FACTORY_LEAF;
+	if (!strcmp(type_str, "factory_lstock"))
+		type = SWEEP_TYPE_FACTORY_LSTOCK;
+	else if (!strcmp(type_str, "factory_leaf"))
+		type = SWEEP_TYPE_FACTORY_LEAF;
+	else if (!strcmp(type_str, "factory_timeout"))
+		type = SWEEP_TYPE_FACTORY_TIMEOUT;
+	else
+		return command_fail(cmd, LIGHTNINGD,
+				    "Unknown sweep type '%s'", type_str);
+
+	uint8_t fake_txid[32];
+	memset(fake_txid, 0, 32);
+	fake_txid[0] = 0x5e; fake_txid[1] = 0xed;
+	fake_txid[30] = (uint8_t)((*source_vout >> 8) & 0xFF);
+	fake_txid[31] = (uint8_t)(*source_vout & 0xFF);
+
+	ss_register_pending_sweep(fi, type, fake_txid, *source_vout,
+				  *amount_sats, *csv_delay);
+
+	/* Optionally stamp confirmed_block so tests can skip the "waiting
+	 * for source confirm" state. */
+	if (confirmed_block && fi->n_pending_sweeps > 0) {
+		pending_sweep_t *ps =
+			&fi->pending_sweeps[fi->n_pending_sweeps - 1];
+		ps->confirmed_block = *confirmed_block;
+	}
+
+	ss_save_factory(cmd, fi);
+
+	struct json_stream *js = jsonrpc_stream_success(cmd);
+	json_add_string(js, "instance_id", id_hex);
+	json_add_u32(js, "n_pending_sweeps", (u32)fi->n_pending_sweeps);
+	return command_finished(cmd, js);
+}
+
+/* dev-factory-tick-sweep-scheduler — test-only hook to run one sweep
+ * scheduler pass at a caller-supplied block height. */
+static struct command_result *
+json_dev_factory_tick_sweep_scheduler(struct command *cmd,
+				      const char *buf,
+				      const jsmntok_t *params)
+{
+	const char *id_hex;
+	u32 *block_height;
+
+	if (!param(cmd, buf, params,
+		   p_req("instance_id", param_string, &id_hex),
+		   p_req("block_height", param_u32, &block_height),
+		   NULL))
+		return command_param_failed();
+
+	if (strlen(id_hex) != 64)
+		return command_fail(cmd, LIGHTNINGD, "Bad instance_id");
+
+	uint8_t instance_id[32];
+	for (int j = 0; j < 32; j++) {
+		unsigned int b;
+		if (sscanf(id_hex + j*2, "%02x", &b) != 1)
+			return command_fail(cmd, LIGHTNINGD,
+					    "Bad instance_id hex");
+		instance_id[j] = (uint8_t)b;
+	}
+
+	factory_instance_t *fi = ss_factory_find(&ss_state, instance_id);
+	if (!fi)
+		return command_fail(cmd, LIGHTNINGD, "Factory not found");
+
+	int transitions = ss_sweep_scheduler_tick(cmd, fi, *block_height);
+
+	struct json_stream *js = jsonrpc_stream_success(cmd);
+	json_add_string(js, "instance_id", id_hex);
+	json_add_u32(js, "block_height", *block_height);
+	json_add_u32(js, "transitions", (u32)transitions);
+	json_add_u32(js, "n_pending_sweeps", (u32)fi->n_pending_sweeps);
+	return command_finished(cmd, js);
+}
+
+/* dev-factory-mark-sweep-broadcast — test-only. Simulates the 4d2
+ * integration point that will actually broadcast a sweep TX. Moves the
+ * first READY entry to BROADCAST with a synthetic sweep_txid and the
+ * caller-supplied block. Real 4d2 code will compute these from the
+ * broadcast reply. */
+static struct command_result *
+json_dev_factory_mark_sweep_broadcast(struct command *cmd,
+				      const char *buf,
+				      const jsmntok_t *params)
+{
+	const char *id_hex;
+	u32 *source_vout;
+	u32 *broadcast_block;
+
+	if (!param(cmd, buf, params,
+		   p_req("instance_id", param_string, &id_hex),
+		   p_req("source_vout", param_u32, &source_vout),
+		   p_req("broadcast_block", param_u32, &broadcast_block),
+		   NULL))
+		return command_param_failed();
+
+	if (strlen(id_hex) != 64)
+		return command_fail(cmd, LIGHTNINGD, "Bad instance_id");
+
+	uint8_t instance_id[32];
+	for (int j = 0; j < 32; j++) {
+		unsigned int b;
+		if (sscanf(id_hex + j*2, "%02x", &b) != 1)
+			return command_fail(cmd, LIGHTNINGD,
+					    "Bad instance_id hex");
+		instance_id[j] = (uint8_t)b;
+	}
+
+	factory_instance_t *fi = ss_factory_find(&ss_state, instance_id);
+	if (!fi)
+		return command_fail(cmd, LIGHTNINGD, "Factory not found");
+
+	pending_sweep_t *ps = NULL;
+	for (size_t i = 0; i < fi->n_pending_sweeps; i++) {
+		if (fi->pending_sweeps[i].source_vout == *source_vout
+		    && fi->pending_sweeps[i].state == SWEEP_STATE_READY) {
+			ps = &fi->pending_sweeps[i];
+			break;
+		}
+	}
+	if (!ps)
+		return command_fail(cmd, LIGHTNINGD,
+				    "No READY sweep for source_vout=%u",
+				    *source_vout);
+
+	ps->state = SWEEP_STATE_BROADCAST;
+	ps->broadcast_block = *broadcast_block;
+	ps->sweep_txid[0] = 0x5b; /* synthetic marker */
+	ps->sweep_txid[1] = 0xcd;
+	ss_save_factory(cmd, fi);
+
+	struct json_stream *js = jsonrpc_stream_success(cmd);
+	json_add_string(js, "instance_id", id_hex);
+	json_add_string(js, "state", "broadcast");
+	return command_finished(cmd, js);
+}
+
+/* dev-factory-mark-sweep-confirmed — test-only. Stamps
+ * sweep_confirmed_block so the scheduler's BROADCAST→CONFIRMED
+ * transition can fire. */
+static struct command_result *
+json_dev_factory_mark_sweep_confirmed(struct command *cmd,
+				      const char *buf,
+				      const jsmntok_t *params)
+{
+	const char *id_hex;
+	u32 *source_vout;
+	u32 *sweep_confirmed_block;
+
+	if (!param(cmd, buf, params,
+		   p_req("instance_id", param_string, &id_hex),
+		   p_req("source_vout", param_u32, &source_vout),
+		   p_req("sweep_confirmed_block", param_u32,
+			 &sweep_confirmed_block),
+		   NULL))
+		return command_param_failed();
+
+	if (strlen(id_hex) != 64)
+		return command_fail(cmd, LIGHTNINGD, "Bad instance_id");
+
+	uint8_t instance_id[32];
+	for (int j = 0; j < 32; j++) {
+		unsigned int b;
+		if (sscanf(id_hex + j*2, "%02x", &b) != 1)
+			return command_fail(cmd, LIGHTNINGD,
+					    "Bad instance_id hex");
+		instance_id[j] = (uint8_t)b;
+	}
+
+	factory_instance_t *fi = ss_factory_find(&ss_state, instance_id);
+	if (!fi)
+		return command_fail(cmd, LIGHTNINGD, "Factory not found");
+
+	pending_sweep_t *ps = NULL;
+	for (size_t i = 0; i < fi->n_pending_sweeps; i++) {
+		if (fi->pending_sweeps[i].source_vout == *source_vout) {
+			ps = &fi->pending_sweeps[i];
+			break;
+		}
+	}
+	if (!ps)
+		return command_fail(cmd, LIGHTNINGD,
+				    "No sweep for source_vout=%u",
+				    *source_vout);
+
+	ps->sweep_confirmed_block = *sweep_confirmed_block;
+	ss_save_factory(cmd, fi);
+
+	struct json_stream *js = jsonrpc_stream_success(cmd);
+	json_add_string(js, "instance_id", id_hex);
+	json_add_u32(js, "sweep_confirmed_block", *sweep_confirmed_block);
+	return command_finished(cmd, js);
+}
+
 /* factory-reorg-check — operator-facing RPC to re-validate confirmed
  * penalty TXs against current chain state. Use after observing a
  * reorg (e.g., from bitcoind logs) to reset any penalty whose TX got
@@ -9945,6 +10389,22 @@ static const struct plugin_command commands[] = {
 	{
 		"factory-reorg-check",
 		json_factory_reorg_check,
+	},
+	{
+		"dev-factory-inject-sweep",
+		json_dev_factory_inject_sweep,
+	},
+	{
+		"dev-factory-tick-sweep-scheduler",
+		json_dev_factory_tick_sweep_scheduler,
+	},
+	{
+		"dev-factory-mark-sweep-broadcast",
+		json_dev_factory_mark_sweep_broadcast,
+	},
+	{
+		"dev-factory-mark-sweep-confirmed",
+		json_dev_factory_mark_sweep_confirmed,
 	},
 	{
 		"factory-create",

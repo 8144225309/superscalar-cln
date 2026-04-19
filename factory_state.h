@@ -129,6 +129,64 @@ typedef struct {
 	uint8_t  cpfp_attempted;  /* 1 if we've tried an anchor child */
 } pending_penalty_t;
 
+/* Phase 4d: CSV claim scheduler.
+ *
+ * Algorithm ported from upstream sweeper.c (see
+ * feedback_reuse_superscalar_upstream). A pending sweep tracks a source
+ * output (on-chain TX we want to claim) that becomes spendable after a
+ * CSV delay from the source's confirmation. The scheduler walks this
+ * array every block and flips entries through:
+ *
+ *   PENDING   — source TX not yet confirmed
+ *   READY     — source confirmed + CSV expired, sweep TX buildable
+ *   BROADCAST — we sent a sweep; waiting for confirmations
+ *   CONFIRMED — sweep has ≥3 confs, entry is done (ready to drop)
+ *   FAILED    — broadcast errored; retry next cycle
+ *
+ * Mirrors upstream's sweep_type_t but narrows to the cases that
+ * actually apply inside a CLN plugin (the LN-channel cases belong to
+ * CLN proper, not us):
+ *
+ *   SWEEP_FACTORY_LSTOCK  — burn-TX-confirmed L-stock output we've
+ *                           claimed (needed if burn doesn't pay direct)
+ *   SWEEP_FACTORY_LEAF    — our own P2TR share on a confirmed leaf
+ *   SWEEP_FACTORY_TIMEOUT — post-timeout-spend output we need to
+ *                           forward to our wallet
+ *
+ * Phase 4d v1 lands the state machine + persistence + dev RPCs for
+ * testing. The actual sweep-TX construction is factory-leaf-type
+ * specific and is deferred to Phase 4d2. The scheduler drives state
+ * transitions based on the signals we have today. */
+#define MAX_PENDING_SWEEPS 16
+
+typedef enum {
+	SWEEP_STATE_PENDING   = 0,
+	SWEEP_STATE_READY     = 1,
+	SWEEP_STATE_BROADCAST = 2,
+	SWEEP_STATE_CONFIRMED = 3,
+	SWEEP_STATE_FAILED    = 4,
+} sweep_state_t;
+
+typedef enum {
+	SWEEP_TYPE_FACTORY_LSTOCK  = 0,
+	SWEEP_TYPE_FACTORY_LEAF    = 1,
+	SWEEP_TYPE_FACTORY_TIMEOUT = 2,
+} sweep_type_t;
+
+typedef struct {
+	uint8_t  type;             /* sweep_type_t */
+	uint8_t  state;            /* sweep_state_t */
+	uint8_t  source_txid[32];  /* output we're sweeping (internal BE) */
+	uint32_t source_vout;
+	uint64_t amount_sats;
+	uint32_t csv_delay;        /* blocks from source confirm to maturity */
+	uint32_t confirmed_block;  /* source confirmed at this height (0=unconf) */
+	uint8_t  sweep_txid[32];   /* our broadcast sweep (zero = not broadcast) */
+	uint32_t broadcast_block;  /* block we broadcast sweep (0 = none) */
+	uint32_t sweep_confirmed_block; /* sweep's own confirm (0 = unconfirmed) */
+	uint8_t  reserved[4];      /* pad — keeps on-disk size stable */
+} pending_sweep_t;
+
 /* Per-epoch breach data */
 typedef struct {
 	uint32_t epoch;
@@ -219,6 +277,14 @@ typedef struct factory_instance {
 	 * running each entry through htlc_fee_bump_should_bump. */
 	pending_penalty_t pending_penalties[MAX_PENDING_PENALTIES];
 	size_t n_pending_penalties;
+
+	/* Phase 4d: pending sweep records. Populated when we identify an
+	 * output that needs CSV-delayed claim (our share of a leaf,
+	 * residuals after a timeout-spend, etc.). Per-block scheduler
+	 * ticks state transitions; actual TX construction + broadcast
+	 * lives in the sweep-type-specific handler (Phase 4d2). */
+	pending_sweep_t pending_sweeps[MAX_PENDING_SWEEPS];
+	size_t n_pending_sweeps;
 
 	/* Rotation */
 	bool rotation_in_progress;
