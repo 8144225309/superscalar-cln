@@ -214,6 +214,51 @@ typedef struct factory_instance {
 	 * persistence; don't renumber the constants without a version bump. */
 	uint8_t closed_by;
 
+	/* Phase 2b: cooperative-close identification.
+	 *
+	 * When dist_signed_tx is set (distribution TX is MuSig2-signed and
+	 * ready to broadcast), we precompute its segwit txid (BIP-141
+	 * non-witness serialization, double-SHA256) and cache here. The
+	 * classifier matches spending_txid against this value to recognize
+	 * "factory was cooperatively closed" — could be either party that
+	 * actually broadcast; same signed bytes, same txid either way.
+	 * All-zero means no dist TX is signed yet. */
+	uint8_t dist_signed_txid[32];
+
+	/* Phase 2b: breach-epoch identification.
+	 *
+	 * When the classifier matches the spending TX's witness signature
+	 * to a past epoch's kickoff signature, this records which epoch
+	 * the counterparty published. Only meaningful when
+	 * lifecycle == FACTORY_LIFECYCLE_CLOSED_BREACHED. UINT32_MAX sentinel
+	 * when no breach has been classified. Phase 3 reads this to pick
+	 * the right revocation secret when building the penalty TX. */
+	uint32_t breach_epoch;
+
+	/* Phase 2b: per-epoch kickoff witness signature cache.
+	 *
+	 * The kickoff TXID is stable across epochs (DW timelock race requires
+	 * it — see the comment in json_factory_rotate) but the WITNESS
+	 * (Schnorr signature) differs per epoch because MuSig2 signs the
+	 * input with a per-epoch-aggregated key state. So matching a
+	 * published kickoff against stored per-epoch witnesses tells us
+	 * which epoch the counterparty broadcast.
+	 *
+	 * history_kickoff_sigs[i] holds the 64-byte Schnorr sig captured at
+	 * the moment we rotated past epoch (history_kickoff_epochs[i]). Both
+	 * LSP and client capture independently; signatures are identical
+	 * because MuSig2 aggregation is deterministic. Capped at the max
+	 * rotation count (16 per current default); grows monotonically.
+	 *
+	 * Factories that existed before Phase 2b shipped start with
+	 * n_history_kickoff_sigs = 0 and can't be classified via sig match
+	 * for any past epoch; the classifier falls back to
+	 * closed_by=COUNTERPARTY without an epoch label. */
+	#define MAX_HISTORY_SIGS 64
+	uint8_t history_kickoff_sigs[MAX_HISTORY_SIGS][64];
+	uint32_t history_kickoff_epochs[MAX_HISTORY_SIGS];
+	size_t n_history_kickoff_sigs;
+
 	/* Cached tree node count (persisted so factory-list works after restart
 	 * even when lib_factory hasn't been rebuilt yet). */
 	uint32_t n_tree_nodes;

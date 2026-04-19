@@ -116,7 +116,8 @@ Factory lifecycle is observed against on-chain truth so records can't drift into
 | Bounded block scan to identify the spending TX | ✓ Phase 2a |
 | Self-close detection (our kickoff → `CLOSED_UNILATERAL`) | ✓ Phase 2a |
 | `factory-scan-external-close` RPC (operator re-scan with wider window) | ✓ Phase 2a |
-| Counterparty-normal vs breach distinction (per-epoch tree reconstruction) | — Phase 2b |
-| Cooperative close detection (spending TX matches `dist_signed_tx`) | — Phase 2b |
+| Counterparty-normal vs breach distinction (witness-sig match against cached per-epoch sigs) | ✓ Phase 2b |
+| Cooperative close detection (precomputed `dist_signed_txid` match) | ✓ Phase 2b |
+| Per-epoch kickoff signature snapshot at rotation | ✓ Phase 2b |
 | Automated breach penalty construction + fee bumping | — Phase 3 |
 | Multi-party ceremony tests at N > 2 | — Phase 4 |

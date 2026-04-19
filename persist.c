@@ -81,8 +81,10 @@ size_t ss_persist_serialize_meta(const factory_instance_t *fi, uint8_t **out)
 	 *   v5 adds per-client REVOKE-ACK tracking
 	 *   v6 adds closed_externally_at_block (watcher Phase 1)
 	 *   v7 adds spending_txid + first_noticed_block + closed_by
-	 *      (watcher Phase 2a) */
-	buf_u8(&buf, &len, &cap, 7);
+	 *      (watcher Phase 2a)
+	 *   v8 adds dist_signed_txid + breach_epoch + per-epoch kickoff
+	 *      signature cache (watcher Phase 2b) */
+	buf_u8(&buf, &len, &cap, 8);
 
 	/* Identity */
 	buf_append(&buf, &len, &cap, fi->instance_id, 32);
@@ -186,6 +188,20 @@ size_t ss_persist_serialize_meta(const factory_instance_t *fi, uint8_t **out)
 	buf_u32(&buf, &len, &cap, fi->first_noticed_block);
 	buf_u8(&buf, &len, &cap, fi->closed_by);
 
+	/* v8: Phase 2b classification enrichments. dist_signed_txid is all-
+	 * zero when no coop dist TX is signed yet. breach_epoch is
+	 * UINT32_MAX sentinel when no breach has been classified. The
+	 * history_kickoff_sigs array is (epoch, sig64) tuples captured at
+	 * each rotation — used by the classifier to match a published
+	 * kickoff's witness sig to the epoch that produced it. */
+	buf_append(&buf, &len, &cap, fi->dist_signed_txid, 32);
+	buf_u32(&buf, &len, &cap, fi->breach_epoch);
+	buf_u32(&buf, &len, &cap, (uint32_t)fi->n_history_kickoff_sigs);
+	for (size_t i = 0; i < fi->n_history_kickoff_sigs; i++) {
+		buf_u32(&buf, &len, &cap, fi->history_kickoff_epochs[i]);
+		buf_append(&buf, &len, &cap, fi->history_kickoff_sigs[i], 64);
+	}
+
 	*out = buf;
 	return len;
 }
@@ -199,7 +215,7 @@ bool ss_persist_deserialize_meta(factory_instance_t *fi,
 	uint8_t version, tmp8;
 	uint16_t tmp16;
 
-	if (!read_u8(&p, &rem, &version) || version < 1 || version > 7)
+	if (!read_u8(&p, &rem, &version) || version < 1 || version > 8)
 		return false;
 
 	if (!read_bytes(&p, &rem, fi->instance_id, 32)) return false;
@@ -346,6 +362,37 @@ bool ss_persist_deserialize_meta(factory_instance_t *fi,
 		if (!read_u8(&p, &rem, &cb))
 			return false;
 		fi->closed_by = cb;
+	}
+
+	/* v8: Phase 2b classification enrichments. Pre-v8 blobs default to
+	 * all-zero dist_signed_txid, UINT32_MAX breach_epoch, and an empty
+	 * kickoff-sig cache. Factories without cached sigs can still match
+	 * coop close via a later dist_signed_txid compute, but breach-vs-
+	 * normal-exit for rotations that happened before the upgrade is
+	 * structurally unreachable — those signatures weren't captured at
+	 * rotation time. */
+	memset(fi->dist_signed_txid, 0, 32);
+	fi->breach_epoch = UINT32_MAX;
+	fi->n_history_kickoff_sigs = 0;
+	if (version >= 8) {
+		if (!read_bytes(&p, &rem, fi->dist_signed_txid, 32))
+			return false;
+		if (!read_u32(&p, &rem, &fi->breach_epoch))
+			return false;
+		uint32_t n_sigs;
+		if (!read_u32(&p, &rem, &n_sigs))
+			return false;
+		if (n_sigs > MAX_HISTORY_SIGS)
+			return false;
+		for (uint32_t i = 0; i < n_sigs; i++) {
+			if (!read_u32(&p, &rem,
+				      &fi->history_kickoff_epochs[i]))
+				return false;
+			if (!read_bytes(&p, &rem,
+					fi->history_kickoff_sigs[i], 64))
+				return false;
+		}
+		fi->n_history_kickoff_sigs = n_sigs;
 	}
 
 	return true;

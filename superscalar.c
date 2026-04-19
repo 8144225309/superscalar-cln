@@ -100,6 +100,293 @@ static const uint8_t SUPERSCALAR_PROTOCOL_ID[32] = {
 	0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
 };
 
+/* --------------------------------------------------------------------- *
+ * BIP-141 parser helpers (Phase 2b)
+ *
+ * Used for two purposes:
+ *   (a) Compute segwit txid (double-SHA256 of non-witness serialization)
+ *       of a signed TX we hold in memory — needed to precompute
+ *       dist_signed_txid at coop-signing time.
+ *   (b) Extract the first witness-stack item of the first input, which
+ *       for a key-path P2TR spend is the 64-byte Schnorr signature —
+ *       used to snapshot kickoff witnesses at rotation time, and to
+ *       match a spending TX's witness against stored per-epoch sigs
+ *       during classification.
+ *
+ * BIP-141 serialization (segwit):
+ *   version (4 LE)
+ *   [marker 0x00][flag 0x01]            if witness present
+ *   input_count (varint)
+ *   inputs[] = prevout (32+4) + scriptSig (varint+bytes) + sequence (4)
+ *   output_count (varint)
+ *   outputs[] = value (8 LE) + scriptPubKey (varint+bytes)
+ *   [witness[] = for each input: stack_count (varint) + stack items
+ *     (each varint+bytes)]                 if witness present
+ *   nLockTime (4 LE)
+ *
+ * Non-witness (txid) serialization omits the marker/flag/witness.
+ * --------------------------------------------------------------------- */
+
+/* Read a BIP-141 varint from p[0..rem]. On success advances p, decrements
+ * rem, sets *out. Returns true on success, false on overrun. */
+static bool ss_read_varint(const uint8_t **p, size_t *rem, uint64_t *out)
+{
+	if (*rem < 1) return false;
+	uint8_t first = **p; (*p)++; (*rem)--;
+	if (first < 0xfd) { *out = first; return true; }
+	if (first == 0xfd) {
+		if (*rem < 2) return false;
+		*out = (uint64_t)(*p)[0] | ((uint64_t)(*p)[1] << 8);
+		*p += 2; *rem -= 2;
+		return true;
+	}
+	if (first == 0xfe) {
+		if (*rem < 4) return false;
+		*out = (uint64_t)(*p)[0] | ((uint64_t)(*p)[1] << 8)
+		     | ((uint64_t)(*p)[2] << 16) | ((uint64_t)(*p)[3] << 24);
+		*p += 4; *rem -= 4;
+		return true;
+	}
+	/* 0xff: 8-byte little-endian */
+	if (*rem < 8) return false;
+	*out = 0;
+	for (int i = 0; i < 8; i++) *out |= (uint64_t)(*p)[i] << (i*8);
+	*p += 8; *rem -= 8;
+	return true;
+}
+
+/* Write a BIP-141 varint; returns number of bytes written (1, 3, 5, or 9). */
+static size_t ss_write_varint(uint8_t *out, uint64_t v)
+{
+	if (v < 0xfd) { out[0] = (uint8_t)v; return 1; }
+	if (v <= 0xffff) {
+		out[0] = 0xfd; out[1] = v & 0xff; out[2] = (v >> 8) & 0xff;
+		return 3;
+	}
+	if (v <= 0xffffffffULL) {
+		out[0] = 0xfe;
+		for (int i = 0; i < 4; i++) out[1+i] = (v >> (i*8)) & 0xff;
+		return 5;
+	}
+	out[0] = 0xff;
+	for (int i = 0; i < 8; i++) out[1+i] = (v >> (i*8)) & 0xff;
+	return 9;
+}
+
+/* Parse a segwit TX, output both the segwit txid (double-SHA256 of the
+ * non-witness serialization, internal little-endian byte order) AND the
+ * first witness-stack item of the first input.
+ *
+ * out_txid[32]: required, always populated on success.
+ * out_witness_sig: optional (NULL to skip); must be at least 64 bytes if
+ *                  provided. Populated only when has_witness && stack item
+ *                  is exactly 64 bytes (BIP-340 Schnorr sig). For
+ *                  non-witness TXs or non-64-byte stack items, zeroed.
+ * out_has_witness: optional; set true if the TX had a witness marker.
+ *
+ * Returns true on success, false on malformed input.
+ */
+static bool ss_parse_tx(const uint8_t *tx, size_t tx_len,
+			uint8_t out_txid[32],
+			uint8_t *out_witness_sig /* 64 bytes, NULLable */,
+			bool *out_has_witness /* NULLable */)
+{
+	if (tx_len < 10) return false;
+	const uint8_t *p = tx;
+	size_t rem = tx_len;
+
+	/* Build non-witness serialization into scratch buffer. Max ~= tx_len. */
+	uint8_t *nw = malloc(tx_len);
+	if (!nw) return false;
+	size_t nw_len = 0;
+
+	/* version */
+	memcpy(nw + nw_len, p, 4); nw_len += 4; p += 4; rem -= 4;
+
+	/* Detect witness marker/flag. */
+	bool has_witness = false;
+	if (rem >= 2 && p[0] == 0x00 && p[1] == 0x01) {
+		has_witness = true;
+		p += 2; rem -= 2;
+	}
+
+	/* input_count */
+	uint64_t n_in;
+	if (!ss_read_varint(&p, &rem, &n_in)) { free(nw); return false; }
+	if (n_in > 1000) { free(nw); return false; }
+	size_t n_in_w = ss_write_varint(nw + nw_len, n_in);
+	nw_len += n_in_w;
+
+	/* Track per-input scriptSig region for witness stack ordering later. */
+	for (uint64_t i = 0; i < n_in; i++) {
+		if (rem < 36) { free(nw); return false; }
+		memcpy(nw + nw_len, p, 36); nw_len += 36; p += 36; rem -= 36;
+
+		uint64_t script_len;
+		const uint8_t *script_len_start = p;
+		if (!ss_read_varint(&p, &rem, &script_len)) { free(nw); return false; }
+		size_t vi_len = (size_t)(p - script_len_start);
+		memcpy(nw + nw_len, script_len_start, vi_len);
+		nw_len += vi_len;
+
+		if (rem < script_len) { free(nw); return false; }
+		memcpy(nw + nw_len, p, script_len); nw_len += script_len;
+		p += script_len; rem -= script_len;
+
+		if (rem < 4) { free(nw); return false; }
+		memcpy(nw + nw_len, p, 4); nw_len += 4;
+		p += 4; rem -= 4;
+	}
+
+	/* output_count */
+	uint64_t n_out;
+	const uint8_t *no_start = p;
+	if (!ss_read_varint(&p, &rem, &n_out)) { free(nw); return false; }
+	if (n_out > 1000) { free(nw); return false; }
+	size_t no_vi_len = (size_t)(p - no_start);
+	memcpy(nw + nw_len, no_start, no_vi_len); nw_len += no_vi_len;
+
+	for (uint64_t i = 0; i < n_out; i++) {
+		if (rem < 8) { free(nw); return false; }
+		memcpy(nw + nw_len, p, 8); nw_len += 8; p += 8; rem -= 8;
+
+		uint64_t spk_len;
+		const uint8_t *spk_len_start = p;
+		if (!ss_read_varint(&p, &rem, &spk_len)) { free(nw); return false; }
+		size_t vi_len = (size_t)(p - spk_len_start);
+		memcpy(nw + nw_len, spk_len_start, vi_len);
+		nw_len += vi_len;
+
+		if (rem < spk_len) { free(nw); return false; }
+		memcpy(nw + nw_len, p, spk_len); nw_len += spk_len;
+		p += spk_len; rem -= spk_len;
+	}
+
+	/* witness section, if present. Extract first stack item of first
+	 * input, if requested and its length is 64 bytes. */
+	bool got_witness_sig = false;
+	if (has_witness) {
+		/* For each input, parse its witness stack. We only keep the
+		 * first item of the first input — rest is skipped. */
+		for (uint64_t i = 0; i < n_in; i++) {
+			uint64_t stack_count;
+			if (!ss_read_varint(&p, &rem, &stack_count)) { free(nw); return false; }
+			for (uint64_t j = 0; j < stack_count; j++) {
+				uint64_t item_len;
+				if (!ss_read_varint(&p, &rem, &item_len)) { free(nw); return false; }
+				if (rem < item_len) { free(nw); return false; }
+				if (i == 0 && j == 0 && item_len == 64
+				    && out_witness_sig) {
+					memcpy(out_witness_sig, p, 64);
+					got_witness_sig = true;
+				}
+				p += item_len; rem -= item_len;
+			}
+		}
+	}
+
+	/* nLockTime */
+	if (rem < 4) { free(nw); return false; }
+	memcpy(nw + nw_len, p, 4); nw_len += 4;
+	p += 4; rem -= 4;
+
+	/* Compute double-SHA256 over the non-witness serialization. */
+	struct sha256 h1, h2;
+	sha256(&h1, nw, nw_len);
+	sha256(&h2, &h1, sizeof(h1));
+	memcpy(out_txid, &h2, 32);
+	free(nw);
+
+	if (out_has_witness) *out_has_witness = has_witness;
+	if (out_witness_sig && !got_witness_sig) memset(out_witness_sig, 0, 64);
+	return true;
+}
+
+/* Phase 2b helpers.
+ *
+ * ss_compute_dist_signed_txid: populate fi->dist_signed_txid from the
+ * currently-set fi->dist_signed_tx bytes. Called once when the coop dist
+ * TX is signed/loaded. Idempotent; re-computing on an unchanged TX
+ * yields the same txid.
+ */
+static void ss_compute_dist_signed_txid(factory_instance_t *fi)
+{
+	if (!fi->dist_signed_tx || fi->dist_signed_tx_len == 0) {
+		memset(fi->dist_signed_txid, 0, 32);
+		return;
+	}
+	if (!ss_parse_tx(fi->dist_signed_tx, fi->dist_signed_tx_len,
+			 fi->dist_signed_txid, NULL, NULL)) {
+		plugin_log(plugin_handle, LOG_UNUSUAL,
+			   "Failed to compute dist_signed_txid from %zu-byte "
+			   "dist TX — classifier won't detect coop close for "
+			   "this factory.",
+			   fi->dist_signed_tx_len);
+		memset(fi->dist_signed_txid, 0, 32);
+	}
+}
+
+/* Snapshot the current epoch's kickoff witness sig before rotating. Call
+ * right before any line that advances fi->epoch past its current value.
+ *
+ * The snapshot reads nodes[0].signed_tx from lib_factory, parses out the
+ * first input's first witness stack item, and appends (epoch, sig) to
+ * fi->history_kickoff_sigs. Duplicates are skipped (if same epoch was
+ * already captured).
+ *
+ * On serialization failure (TX not signed yet, malformed bytes) we skip
+ * capture and log — the classifier handles missing-epoch-sig gracefully
+ * (falls back to CLOSED_BY_COUNTERPARTY without breach label). */
+static void ss_snapshot_current_epoch_kickoff_sig(factory_instance_t *fi)
+{
+	factory_t *f = (factory_t *)fi->lib_factory;
+	if (!f || f->n_nodes == 0) return;
+	tx_buf_t *stx = &f->nodes[0].signed_tx;
+	if (!stx->data || stx->len == 0) return;
+
+	/* Dedup: don't double-capture same epoch. */
+	for (size_t i = 0; i < fi->n_history_kickoff_sigs; i++)
+		if (fi->history_kickoff_epochs[i] == fi->epoch) return;
+
+	if (fi->n_history_kickoff_sigs >= MAX_HISTORY_SIGS) {
+		plugin_log(plugin_handle, LOG_UNUSUAL,
+			   "Kickoff-sig history full (%zu slots); skipping "
+			   "capture for epoch %u. Factory has rotated more "
+			   "than MAX_HISTORY_SIGS times, which is above the "
+			   "max_epochs configured for the default factory "
+			   "shape — increase MAX_HISTORY_SIGS if you hit this.",
+			   fi->n_history_kickoff_sigs, fi->epoch);
+		return;
+	}
+
+	uint8_t txid_unused[32];
+	uint8_t sig[64];
+	bool has_witness = false;
+	if (!ss_parse_tx(stx->data, stx->len, txid_unused, sig, &has_witness)) {
+		plugin_log(plugin_handle, LOG_UNUSUAL,
+			   "Failed to parse kickoff TX at epoch %u for sig "
+			   "snapshot; breach classification for this epoch "
+			   "will be unavailable.",
+			   fi->epoch);
+		return;
+	}
+	if (!has_witness) return;
+
+	/* Check sig isn't all-zero (extraction fell through to "not 64 bytes"). */
+	bool any = false;
+	for (int i = 0; i < 64; i++) if (sig[i]) { any = true; break; }
+	if (!any) return;
+
+	size_t slot = fi->n_history_kickoff_sigs;
+	fi->history_kickoff_epochs[slot] = fi->epoch;
+	memcpy(fi->history_kickoff_sigs[slot], sig, 64);
+	fi->n_history_kickoff_sigs++;
+
+	plugin_log(plugin_handle, LOG_DBG,
+		   "Captured kickoff witness sig for epoch %u (history slot %zu)",
+		   fi->epoch, slot);
+}
+
 /* Derive a deterministic seckey from instance_id + participant index.
  * When HSM-derived master key is available, uses HMAC-SHA256 for
  * proper key derivation. Falls back to demo XOR otherwise.
@@ -1271,12 +1558,17 @@ static void ss_load_factories(struct command *cmd)
 							tal_bytelen(dtx_data);
 						if (dtx_len > 0 &&
 						    ss_persist_deserialize_dist_tx(
-							fi, dtx_data, dtx_len))
+							fi, dtx_data, dtx_len)) {
 							plugin_log(plugin_handle,
 								LOG_INFORM,
 								"Loaded dist TX "
 								"(%zu bytes)",
 								fi->dist_signed_tx_len);
+							/* Phase 2b: precompute
+							 * txid on load so the
+							 * classifier can match. */
+							ss_compute_dist_signed_txid(fi);
+						}
 					}
 				}
 
@@ -3477,6 +3769,11 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 						       f->dist_unsigned_tx.len);
 						fi->dist_signed_tx_len =
 							f->dist_unsigned_tx.len;
+						/* Phase 2b: precompute the
+						 * coop-close txid so the
+						 * classifier can match a
+						 * published dist TX later. */
+						ss_compute_dist_signed_txid(fi);
 					}
 				}
 			}
@@ -3553,6 +3850,11 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 
 			factory_t *factory = (factory_t *)fi->lib_factory;
 			secp256k1_context *ctx = global_secp_ctx;
+
+			/* Phase 2b: snapshot current epoch's kickoff witness
+			 * sig BEFORE advancing. Used later to classify a
+			 * spending TX as breach vs normal-exit. */
+			ss_snapshot_current_epoch_kickoff_sig(fi);
 
 			/* Advance our DW counter to match */
 			dw_counter_advance(&factory->counter);
@@ -5505,6 +5807,28 @@ static struct command_result *json_factory_list(struct command *cmd,
 			fi->closed_by == CLOSED_BY_SELF ? "self" :
 			fi->closed_by == CLOSED_BY_COUNTERPARTY ? "counterparty" :
 			"unknown");
+
+		/* Phase 2b classification details. */
+		{
+			bool any_dist = false;
+			for (int b = 0; b < 32; b++)
+				if (fi->dist_signed_txid[b]) {
+					any_dist = true; break;
+				}
+			if (any_dist) {
+				char dhex[65];
+				for (int j = 0; j < 32; j++)
+					sprintf(dhex + j*2, "%02x",
+						fi->dist_signed_txid[31-j]);
+				dhex[64] = '\0';
+				json_add_string(js, "dist_signed_txid", dhex);
+			}
+		}
+		if (fi->breach_epoch != UINT32_MAX)
+			json_add_u32(js, "breach_epoch", fi->breach_epoch);
+		if (fi->n_history_kickoff_sigs > 0)
+			json_add_u32(js, "kickoff_sig_history_epochs_cached",
+				     (u32)fi->n_history_kickoff_sigs);
 		json_add_string(js, "ceremony",
 			fi->ceremony == CEREMONY_IDLE ? "idle" :
 			fi->ceremony == CEREMONY_PROPOSED ? "proposed" :
@@ -5816,6 +6140,11 @@ static struct command_result *json_factory_rotate(struct command *cmd,
 			   "schedule factory-migrate soon",
 			   id_hex, fi->epoch, fi->max_epochs);
 	}
+
+	/* Phase 2b: snapshot current epoch's kickoff witness sig BEFORE
+	 * advancing the counter. Used later to classify a spending TX
+	 * as breach vs normal-exit. */
+	ss_snapshot_current_epoch_kickoff_sig(fi);
 
 	/* Advance the DW counter */
 	if (!dw_counter_advance(&factory->counter)) {
@@ -6277,53 +6606,149 @@ static void request_blockhash_for_scan(struct command *cmd,
 }
 
 /* Classify a factory based on the spending TX we just identified.
- * Must be called only after fi->spending_txid has been populated. */
-static void ss_classify_spending_tx(factory_instance_t *fi)
+ *
+ * Phase 2b rewrite. Order of tests:
+ *   1. spending_txid == dist_signed_txid → CLOSED_COOPERATIVE
+ *   2. spending_txid == kickoff txid (stable across epochs) → factory-exit
+ *      was initiated by counterparty (lifecycle was ACTIVE when Phase 1
+ *      fired, so it wasn't us). Use witness_sig to resolve the epoch:
+ *        - matches current lib_factory kickoff sig → CLOSED_UNILATERAL
+ *        - matches a past epoch's stored sig → CLOSED_BREACHED
+ *          (breach_epoch populated for Phase 3's penalty pathway)
+ *        - no match (or no witness_sig available) → CLOSED_UNILATERAL
+ *          with breach_epoch = UINT32_MAX; best-effort, Phase 3 may
+ *          refine via state-TX observation
+ *   3. else → CLOSED_EXTERNALLY (genuine external)
+ *
+ * Must be called after fi->spending_txid is populated. witness_sig may
+ * be NULL (or all-zero) if not extractable from the spending TX —
+ * classifier degrades gracefully to txid-only matching.
+ */
+static void ss_classify_spending_tx(factory_instance_t *fi,
+				    const uint8_t *witness_sig /* 64 bytes or NULL */)
 {
-	/* Self-match: our kickoff TX is always lib_factory->nodes[0] —
-	 * the tree node that spends the factory root outpoint directly.
-	 * If the lib_factory handle isn't loaded, we can't match; leave
-	 * as CLOSED_BY_UNKNOWN and let operator decide. */
-	factory_t *f = (factory_t *)fi->lib_factory;
-	if (f && f->n_nodes > 0) {
-		if (memcmp(fi->spending_txid, f->nodes[0].txid, 32) == 0) {
-			fi->closed_by = CLOSED_BY_SELF;
-			/* Upgrade from the Phase 1 default. ACTIVE → CLOSED_EXTERNALLY
-			 * was the safe label; now we know it was our own kickoff
-			 * (implies the close was initiated outside the DYING
-			 * flow — worth an UNUSUAL log but not fatal). */
-			fi->lifecycle = FACTORY_LIFECYCLE_CLOSED_UNILATERAL;
-			char txid_hex[65];
-			for (int j = 0; j < 32; j++)
-				sprintf(txid_hex + j*2, "%02x",
-					fi->spending_txid[31-j]);
-			txid_hex[64] = '\0';
-			plugin_log(plugin_handle, LOG_UNUSUAL,
-				   "Spend classifier: factory root spent by our "
-				   "own kickoff %s — upgrading to "
-				   "CLOSED_UNILATERAL (self). Lifecycle was "
-				   "ACTIVE at heartbeat, which implies a close "
-				   "path outside the normal DYING flow. Review "
-				   "force-close logic.",
-				   txid_hex);
-			return;
-		}
-	}
-
-	/* No self-match. Phase 2b will further distinguish counterparty
-	 * normal-exit from breach; for Phase 2a we just record
-	 * CLOSED_BY_COUNTERPARTY and let lifecycle stay CLOSED_EXTERNALLY
-	 * until the refined classifier lands. */
-	fi->closed_by = CLOSED_BY_COUNTERPARTY;
 	char txid_hex[65];
 	for (int j = 0; j < 32; j++)
 		sprintf(txid_hex + j*2, "%02x", fi->spending_txid[31-j]);
 	txid_hex[64] = '\0';
+
+	/* Test 1: cooperative close match. */
+	bool any_dist = false;
+	for (int b = 0; b < 32; b++)
+		if (fi->dist_signed_txid[b]) { any_dist = true; break; }
+	if (any_dist && memcmp(fi->spending_txid,
+			       fi->dist_signed_txid, 32) == 0) {
+		fi->closed_by = CLOSED_BY_UNKNOWN; /* coop — either side could have broadcast */
+		fi->lifecycle = FACTORY_LIFECYCLE_CLOSED_COOPERATIVE;
+		plugin_log(plugin_handle, LOG_INFORM,
+			   "Classifier: factory root spent by cooperative "
+			   "distribution TX %s → CLOSED_COOPERATIVE.",
+			   txid_hex);
+		return;
+	}
+
+	/* Test 2: kickoff-txid match (stable across epochs). */
+	factory_t *f = (factory_t *)fi->lib_factory;
+	bool kickoff_match = false;
+	if (f && f->n_nodes > 0 &&
+	    memcmp(fi->spending_txid, f->nodes[0].txid, 32) == 0)
+		kickoff_match = true;
+
+	if (kickoff_match) {
+		fi->closed_by = CLOSED_BY_COUNTERPARTY; /* we didn't initiate — lifecycle was ACTIVE */
+
+		/* Test 2a: witness available → try to identify the epoch. */
+		bool have_sig = false;
+		if (witness_sig) {
+			for (int b = 0; b < 64; b++)
+				if (witness_sig[b]) { have_sig = true; break; }
+		}
+
+		if (have_sig) {
+			/* Compare to current-epoch live sig. */
+			uint8_t cur_sig[64]; bool cur_ok = false;
+			if (f && f->nodes[0].signed_tx.data
+			    && f->nodes[0].signed_tx.len > 0) {
+				uint8_t tmp_txid[32];
+				bool hw = false;
+				if (ss_parse_tx(f->nodes[0].signed_tx.data,
+						f->nodes[0].signed_tx.len,
+						tmp_txid, cur_sig, &hw)
+				    && hw) {
+					bool any = false;
+					for (int b = 0; b < 64; b++)
+						if (cur_sig[b]) { any = true; break; }
+					cur_ok = any;
+				}
+			}
+			if (cur_ok && memcmp(witness_sig, cur_sig, 64) == 0) {
+				fi->lifecycle = FACTORY_LIFECYCLE_CLOSED_UNILATERAL;
+				fi->breach_epoch = UINT32_MAX;
+				plugin_log(plugin_handle, LOG_INFORM,
+					   "Classifier: factory root spent by "
+					   "kickoff at CURRENT epoch %u → "
+					   "CLOSED_UNILATERAL (counterparty "
+					   "normal exit).",
+					   fi->epoch);
+				return;
+			}
+
+			/* Compare to stored past-epoch sigs — any match is
+			 * a breach at that epoch. */
+			for (size_t i = 0; i < fi->n_history_kickoff_sigs; i++) {
+				if (memcmp(witness_sig,
+					   fi->history_kickoff_sigs[i], 64) == 0) {
+					fi->lifecycle = FACTORY_LIFECYCLE_CLOSED_BREACHED;
+					fi->breach_epoch =
+						fi->history_kickoff_epochs[i];
+					plugin_log(plugin_handle, LOG_BROKEN,
+						   "BREACH CLASSIFIED: factory "
+						   "root spent by kickoff from "
+						   "REVOKED epoch %u (current %u). "
+						   "CLOSED_BREACHED. Phase 3 will "
+						   "broadcast penalty TXs when "
+						   "the leaf state TXs confirm.",
+						   fi->breach_epoch, fi->epoch);
+					return;
+				}
+			}
+
+			/* Witness extraction succeeded but matches no known
+			 * epoch. Possibilities: factory was rotated before
+			 * Phase 2b shipped (no history cached); ambiguous
+			 * pre-fix state. Label as UNILATERAL but flag
+			 * breach_epoch as unknown. */
+			fi->lifecycle = FACTORY_LIFECYCLE_CLOSED_UNILATERAL;
+			fi->breach_epoch = UINT32_MAX;
+			plugin_log(plugin_handle, LOG_UNUSUAL,
+				   "Classifier: kickoff published, witness sig "
+				   "doesn't match current or any cached past "
+				   "epoch. Factory likely rotated before Phase 2b "
+				   "shipped. Labeling CLOSED_UNILATERAL without "
+				   "epoch; Phase 3 may refine via state-TX "
+				   "observation.");
+			return;
+		}
+
+		/* No witness available (couldn't extract). */
+		fi->lifecycle = FACTORY_LIFECYCLE_CLOSED_UNILATERAL;
+		fi->breach_epoch = UINT32_MAX;
+		plugin_log(plugin_handle, LOG_UNUSUAL,
+			   "Classifier: kickoff published but witness sig "
+			   "unavailable — can't distinguish current epoch "
+			   "from breach. Labeling CLOSED_UNILATERAL without "
+			   "epoch. Re-run factory-scan-external-close or "
+			   "wait for Phase 3 state-TX observation.");
+		return;
+	}
+
+	/* Test 3: no match to any of our artifacts. Leave lifecycle at
+	 * Phase 1's CLOSED_EXTERNALLY; note closed_by as counterparty
+	 * since Phase 1 only fired because lifecycle was ACTIVE. */
+	fi->closed_by = CLOSED_BY_COUNTERPARTY;
 	plugin_log(plugin_handle, LOG_INFORM,
-		   "Spend classifier: factory root spent by external TX %s "
-		   "(not our kickoff). Phase 2a leaves lifecycle at "
-		   "CLOSED_EXTERNALLY; Phase 2b will refine into "
-		   "counterparty-normal vs breach.",
+		   "Classifier: factory root spent by TX %s matching neither "
+		   "coop dist TX nor our kickoff. CLOSED_EXTERNALLY stands.",
 		   txid_hex);
 }
 
@@ -6420,11 +6845,44 @@ static struct command_result *scan_tx_block_cb(struct command *cmd,
 				fi->spending_txid[31 - j] = (uint8_t)b;
 			}
 
+			/* Phase 2b: extract the first witness stack item of
+			 * the matched input. For key-path P2TR spend of the
+			 * factory root, this is the 64-byte Schnorr sig —
+			 * used by the classifier to identify the epoch. */
+			uint8_t witness_sig[64];
+			memset(witness_sig, 0, 64);
+			bool have_witness_sig = false;
+			const jsmntok_t *witness_arr =
+				json_get_member(buf, vin_tok, "txinwitness");
+			if (witness_arr && witness_arr->type == JSMN_ARRAY
+			    && witness_arr->size > 0) {
+				const jsmntok_t *first_item =
+					witness_arr + 1; /* first array element */
+				int item_hex_len =
+					first_item->end - first_item->start;
+				if (item_hex_len == 128 /* 64 bytes hex */) {
+					bool ok = true;
+					for (int k = 0; k < 64; k++) {
+						unsigned int b;
+						if (sscanf(buf
+							   + first_item->start
+							   + k*2,
+							   "%02x", &b) != 1) {
+							ok = false; break;
+						}
+						witness_sig[k] = (uint8_t)b;
+					}
+					if (ok) have_witness_sig = true;
+				}
+			}
+
 			plugin_log(plugin_handle, LOG_INFORM,
 				   "Scan: found spending TX for factory root at "
-				   "block %u — classifying.",
-				   ctx->scan_height);
-			ss_classify_spending_tx(fi);
+				   "block %u — classifying (witness %s).",
+				   ctx->scan_height,
+				   have_witness_sig ? "present" : "absent");
+			ss_classify_spending_tx(fi,
+				have_witness_sig ? witness_sig : NULL);
 			ss_save_factory(cmd, fi);
 			return notification_handled(cmd);
 		}

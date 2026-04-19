@@ -102,7 +102,10 @@ Key fields:
 - `closed_externally_at_block` — present only when `lifecycle == "closed_externally"`; the block height at which the root-spend was observed.
 - `spending_txid` — Phase 2a: hex txid of the TX that spent the factory root, once the scan identifies it.
 - `first_noticed_block` — Phase 2a: block height when the UTXO-heartbeat first saw the spend (scan starts here and walks backwards).
-- `closed_by` — Phase 2a classification result: `self`, `counterparty`, or `unknown`. `self` means our own kickoff drove the close. `counterparty` means the scan found a spending TX that wasn't ours (Phase 2b will refine into counterparty-normal-exit vs. breach). `unknown` means either the scan hasn't run yet or it failed to find the spending TX within its window.
+- `closed_by` — classification result: `counterparty` (the kickoff or dist TX was published by our peer), `unknown` (scan didn't run or found no matching TX), or (rare, bug-path) `self`. Phase 1 only fires when lifecycle was `ACTIVE`, so the normal label is `counterparty`.
+- `dist_signed_txid` — Phase 2b: precomputed segwit txid of our distribution TX (the cooperative close). When a spending TX matches this, lifecycle is set to `closed_cooperative`.
+- `breach_epoch` — Phase 2b: populated only when `lifecycle == "closed_breached"` — identifies which revoked epoch's kickoff was published. Phase 3 uses this to select the correct revocation secret for the penalty pathway.
+- `kickoff_sig_history_epochs_cached` — Phase 2b diagnostic: how many past epochs' kickoff witness sigs have been captured. Grows on each rotation. Factories pre-dating the Phase 2b upgrade start at 0 and can only classify current-epoch / cooperative-close publishing, not breach.
 
 ## Architecture
 
