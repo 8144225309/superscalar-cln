@@ -7786,19 +7786,150 @@ static int ss_penalty_scheduler_tick(struct command *cmd,
 	return bumps;
 }
 
-/* Reorg detection: for every confirmed penalty entry, verify the txid
- * is still on chain via gettxout. If not, reset confirmed_block=0 so
- * the next scheduler tick rebroadcasts. Called from handle_block_added
- * opportunistically — NOT on every block (expensive), just when block
- * height drops or we see a reorg indicator. v1 simplification: check
- * on every block for factories with >=1 confirmed penalty. */
+/* ============================================================
+ * Phase 4e: reorg re-evaluation.
+ *
+ * Algorithm ported from upstream watchtower.c:watchtower_on_reorg
+ * (see feedback_reuse_superscalar_upstream). Upstream takes a new_tip
+ * and old_tip, walks every entry with penalty_broadcast==1 + a stored
+ * penalty_txid, and resets that pair if the TX is neither confirmed
+ * nor in mempool. Stored txids that reorg out get re-queued.
+ *
+ * Our adaptation: iterate pending_penalty_t entries in CONFIRMED state,
+ * issue getrawtransaction(verbose=true) per entry. If the reply errors
+ * (TX unknown to bitcoind) OR reports confirmations==0 (evicted to
+ * mempool only), reset confirmed_block and flip state back to
+ * PENALTY_STATE_BROADCAST so the scheduler re-bumps on the next tick.
+ *
+ * Auto-detection of reorgs is deferred (Phase 4e2) — CLN doesn't emit
+ * a block_disconnected notification by default and the minimum-viable
+ * path is operator- or dev-triggered invocation. Phase 4e lands the
+ * algorithm; wiring the trigger source is follow-up.
+ * ============================================================ */
+
+struct reorg_check_ctx {
+	factory_instance_t *fi;
+	size_t penalty_idx;
+};
+
+static struct command_result *
+reorg_check_gettx_reply(struct command *cmd,
+			const char *method UNUSED,
+			const char *buf,
+			const jsmntok_t *result,
+			void *arg)
+{
+	struct reorg_check_ctx *ctx = (struct reorg_check_ctx *)arg;
+	factory_instance_t *fi = ctx->fi;
+	if (ctx->penalty_idx >= fi->n_pending_penalties)
+		return aux_command_done(cmd);
+	pending_penalty_t *pp = &fi->pending_penalties[ctx->penalty_idx];
+
+	bool tx_gone = false;
+	const char *why = "unknown";
+
+	/* The error path has result == NULL (jsonrpc error dispatched
+	 * straight to the error cb). Here we share the same callback for
+	 * both success and error, so either NULL result or an explicit
+	 * "code"/"message" member signals bitcoind didn't find the tx. */
+	if (!result) {
+		tx_gone = true;
+		why = "rpc_error";
+	} else {
+		const jsmntok_t *err_tok =
+			json_get_member(buf, result, "code");
+		if (err_tok) {
+			tx_gone = true;
+			why = "tx_unknown";
+		} else {
+			/* Verbose getrawtransaction returns a "confirmations"
+			 * field (present and >=1 = in chain). Missing or 0 =
+			 * mempool-only (reorg-evicted). */
+			const jsmntok_t *confs_tok =
+				json_get_member(buf, result, "confirmations");
+			if (!confs_tok) {
+				tx_gone = true;
+				why = "no_confirmations_field";
+			} else {
+				u32 n_confs;
+				if (!json_to_u32(buf, confs_tok, &n_confs)) {
+					tx_gone = true;
+					why = "confirmations_parse_fail";
+				} else if (n_confs == 0) {
+					tx_gone = true;
+					why = "mempool_only";
+				}
+			}
+		}
+	}
+
+	if (tx_gone && pp->state == PENALTY_STATE_CONFIRMED) {
+		plugin_log(plugin_handle, LOG_UNUSUAL,
+			   "REORG RE-EVAL: penalty epoch=%u leaf=%d no longer "
+			   "confirmed on chain (%s) — resetting state to "
+			   "BROADCAST. Scheduler will re-bump next tick.",
+			   pp->epoch, pp->leaf_index, why);
+		pp->confirmed_block = 0;
+		pp->state = PENALTY_STATE_BROADCAST;
+		ss_save_factory(cmd, fi);
+	}
+	return aux_command_done(cmd);
+}
+
+/* For each CONFIRMED pending penalty, fire off a getrawtransaction
+ * probe via aux_command (reply may outlive parent). Callbacks flip
+ * state back to BROADCAST if the TX is no longer on chain. */
+static int ss_penalty_reorg_check(struct command *cmd,
+				  factory_instance_t *fi)
+{
+	int probes = 0;
+	for (size_t i = 0; i < fi->n_pending_penalties; i++) {
+		pending_penalty_t *pp = &fi->pending_penalties[i];
+		if (pp->state != PENALTY_STATE_CONFIRMED)
+			continue;
+
+		struct command *acmd = aux_command(cmd);
+		struct reorg_check_ctx *rctx =
+			tal(acmd, struct reorg_check_ctx);
+		rctx->fi = fi;
+		rctx->penalty_idx = i;
+
+		char txid_hex[65];
+		for (int j = 0; j < 32; j++)
+			sprintf(txid_hex + j*2, "%02x",
+				pp->burn_txid[31-j]);
+		txid_hex[64] = '\0';
+
+		struct out_req *req = jsonrpc_request_start(acmd,
+			"getrawtransaction",
+			reorg_check_gettx_reply,
+			reorg_check_gettx_reply,
+			rctx);
+		json_add_string(req->js, "txid", txid_hex);
+		json_add_bool(req->js, "verbose", true);
+		send_outreq(req);
+		probes++;
+	}
+	return probes;
+}
+
+/* Legacy stub name kept for the existing block_added call site. Wires
+ * through to the real impl. The block_added path is conservative about
+ * calling this — we don't want to eagerly mark every confirmed penalty
+ * stale in environments where bitcoind rejects getrawtransaction for
+ * non-chain TXs (test fixtures with synthetic burn_txid). Callers must
+ * ensure they're running against a real chain or are OK with the check
+ * flipping penalties back to BROADCAST. */
 static void ss_penalty_reorg_check_stub(factory_instance_t *fi)
 {
-	/* Stub: real implementation will issue gettxout per confirmed
-	 * penalty and reset confirmed_block if missing. Leaving as a stub
-	 * for this PR so the core scheduler + persistence land first;
-	 * reorg-check follows in Phase 4e's PR where we add the
-	 * block_disconnected notification subscription. */
+	/* Synchronous no-op wrapper retained to preserve the existing
+	 * block_added call site's signature. The real async check lives
+	 * in ss_penalty_reorg_check (takes a command*); production
+	 * trigger is via the factory-reorg-check / dev-factory-trigger-
+	 * reorg-check RPCs. Auto-wiring to block_added is deferred until
+	 * we either (a) get a block_disconnected notification subscription
+	 * working or (b) track (height, blockhash) per penalty so we can
+	 * detect the reorg without eagerly probing. */
 	(void)fi;
 }
 
@@ -9729,6 +9860,63 @@ json_dev_factory_trigger_deep_unwind_scan(struct command *cmd,
 	return command_finished(cmd, js);
 }
 
+/* factory-reorg-check — operator-facing RPC to re-validate confirmed
+ * penalty TXs against current chain state. Use after observing a
+ * reorg (e.g., from bitcoind logs) to reset any penalty whose TX got
+ * evicted. Returns number of probes issued; results materialize
+ * asynchronously in the log (LOG_UNUSUAL "REORG RE-EVAL:" lines) and
+ * in factory-list.pending_penalties[].state flipping back to
+ * "broadcast". */
+static struct command_result *
+json_factory_reorg_check(struct command *cmd,
+			 const char *buf,
+			 const jsmntok_t *params)
+{
+	const char *id_hex;
+
+	if (!param(cmd, buf, params,
+		   p_req("instance_id", param_string, &id_hex),
+		   NULL))
+		return command_param_failed();
+
+	if (strlen(id_hex) != 64)
+		return command_fail(cmd, LIGHTNINGD, "Bad instance_id");
+
+	uint8_t instance_id[32];
+	for (int j = 0; j < 32; j++) {
+		unsigned int b;
+		if (sscanf(id_hex + j*2, "%02x", &b) != 1)
+			return command_fail(cmd, LIGHTNINGD,
+					    "Bad instance_id hex");
+		instance_id[j] = (uint8_t)b;
+	}
+
+	factory_instance_t *fi = ss_factory_find(&ss_state, instance_id);
+	if (!fi)
+		return command_fail(cmd, LIGHTNINGD, "Factory not found");
+
+	int probes = ss_penalty_reorg_check(cmd, fi);
+
+	struct json_stream *js = jsonrpc_stream_success(cmd);
+	json_add_string(js, "instance_id", id_hex);
+	json_add_u32(js, "probes_issued", (u32)probes);
+	json_add_u32(js, "n_pending_penalties",
+		     (u32)fi->n_pending_penalties);
+	return command_finished(cmd, js);
+}
+
+/* dev-factory-trigger-reorg-check — alias of factory-reorg-check
+ * named with dev-* to signal "test / development use." Identical
+ * implementation; kept distinct so tests can find it under a stable
+ * dev-* prefix alongside the other Phase 4e/5a injection hooks. */
+static struct command_result *
+json_dev_factory_trigger_reorg_check(struct command *cmd,
+				     const char *buf,
+				     const jsmntok_t *params)
+{
+	return json_factory_reorg_check(cmd, buf, params);
+}
+
 static const struct plugin_command commands[] = {
 	{
 		"dev-factory-set-signal",
@@ -9749,6 +9937,14 @@ static const struct plugin_command commands[] = {
 	{
 		"dev-factory-trigger-deep-unwind-scan",
 		json_dev_factory_trigger_deep_unwind_scan,
+	},
+	{
+		"dev-factory-trigger-reorg-check",
+		json_dev_factory_trigger_reorg_check,
+	},
+	{
+		"factory-reorg-check",
+		json_factory_reorg_check,
 	},
 	{
 		"factory-create",
