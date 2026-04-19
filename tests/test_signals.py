@@ -117,25 +117,27 @@ def test_state_tx_match_current_epoch_is_unilateral(ss_node_factory):
     assert r["lifecycle"] == "closed_unilateral"
 
 
-def test_state_tx_match_past_epoch_is_breached(ss_node_factory):
-    """Phase 3b: downstream scan found a state TX matching a PAST
-    epoch's cached state-root TXID. Counterparty published revoked
-    state — breach. classifier should populate breach_epoch."""
+def test_state_tx_match_non_current_epoch_is_breached(ss_node_factory):
+    """Phase 3b: downstream scan found a state TX whose epoch does NOT
+    match the factory's current epoch. Classifier treats any epoch
+    mismatch (not strictly 'past') as breach — the factory has already
+    rotated past whatever state this TX belongs to, so publishing it
+    is a revoked-state attack. breach_epoch gets populated with the
+    mismatched epoch for the downstream penalty path.
+
+    We can't advance fi->epoch without a full ceremony + rotation, but
+    the classifier only cares about !=, so injecting match_epoch=5 on
+    a factory stuck at epoch=0 exercises the same code path."""
     lsp = ss_node_factory.get_node()
     iid = _create_factory(lsp)
 
-    # Force factory to look like it's past epoch 0 by injecting a past-
-    # epoch state-tx-match. The classifier compares fi->epoch (still 0)
-    # against state_tx_match_epoch. To make "past" valid we'd need to
-    # have advanced the epoch — which we can't without ceremony. So we
-    # assert on the WITNESS_PAST_MATCH signal instead, which is the
-    # other breach path and doesn't need epoch > 0.
-    # This test documents the shape; real coverage is in the
-    # witness_past_match test below.
-    pytest.skip(
-        "requires fi->epoch > 0 which needs a completed ceremony + "
-        "rotation; Phase 5b"
-    )
+    r = _inject(lsp, iid, "state_tx_match", match_epoch=5)
+    assert r["lifecycle"] == "closed_breached"
+
+    fs = _factory_state(lsp, iid)
+    assert fs["breach_epoch"] == 5
+    assert "state_tx_match" in fs["signals"]
+    assert fs["state_tx_match_epoch"] == 5
 
 
 def test_witness_past_match_is_breached(ss_node_factory):
