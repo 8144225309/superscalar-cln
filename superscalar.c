@@ -6316,8 +6316,15 @@ static void ss_catchup_breach_scan(struct command *cmd)
 	for (size_t i = 0; i < ss_state.n_factories; i++) {
 		factory_instance_t *fi = ss_state.factories[i];
 		if (!fi) continue;
-		if (fi->lifecycle != FACTORY_LIFECYCLE_ACTIVE &&
-		    fi->lifecycle != FACTORY_LIFECYCLE_DYING)
+		/* Phase 3a: skip terminal-closed factories only. Pre-3a the
+		 * gate was ACTIVE || DYING, but the 9 signet zombies that
+		 * motivated this work were all in INIT (their ceremonies
+		 * never completed before the recovery tool swept their
+		 * roots). INIT factories with real funding need observation
+		 * too — the inner gate in breach_utxo_checked still filters
+		 * specific lifecycles for state transitions. */
+		if (fi->lifecycle == FACTORY_LIFECYCLE_EXPIRED
+		    || fi->lifecycle == FACTORY_LIFECYCLE_CLOSED_EXTERNALLY)
 			continue;
 		ss_launch_breach_scan(cmd, fi, i);
 		scanned++;
@@ -6373,7 +6380,17 @@ static struct command_result *breach_utxo_checked(struct command *cmd,
 		 * ready to sweep its L-stock. The two concerns (lifecycle
 		 * flag vs burn-tx assembly) are complementary, not mutually
 		 * exclusive. */
-		if (fi->lifecycle == FACTORY_LIFECYCLE_ACTIVE) {
+		/* Phase 3a: transition any non-DYING, non-already-closed
+		 * factory to CLOSED_EXTERNALLY when a spend is observed.
+		 * DYING means we initiated the close; the spend is expected
+		 * (don't relabel). ACTIVE is the normal case. INIT covers
+		 * the "ceremony-not-complete-but-funded" zombies (the 9
+		 * signet recovery factories). */
+		bool should_mark =
+			fi->lifecycle == FACTORY_LIFECYCLE_ACTIVE
+			|| fi->lifecycle == FACTORY_LIFECYCLE_INIT;
+		if (should_mark) {
+			factory_lifecycle_t prior = fi->lifecycle;
 			fi->lifecycle = FACTORY_LIFECYCLE_CLOSED_EXTERNALLY;
 			fi->closed_externally_at_block =
 				ss_state.current_blockheight;
@@ -6384,12 +6401,13 @@ static struct command_result *breach_utxo_checked(struct command *cmd,
 			iid_hex[64] = '\0';
 			plugin_log(plugin_handle, LOG_BROKEN,
 				   "FACTORY CLOSED EXTERNALLY: instance_id=%s "
-				   "funding root spent at block %u without "
-				   "plugin-initiated close. Marked "
-				   "closed_externally. Run factory-confirm-closed "
-				   "%s to reap after verifying funds are safe.",
+				   "funding root spent at block %u (was in "
+				   "lifecycle %d) without plugin-initiated "
+				   "close. Marked closed_externally. Run "
+				   "factory-confirm-closed %s to reap after "
+				   "verifying funds are safe.",
 				   iid_hex, ss_state.current_blockheight,
-				   iid_hex);
+				   (int)prior, iid_hex);
 			ss_save_factory(cmd, fi);
 		}
 
@@ -6557,8 +6575,12 @@ static struct command_result *handle_block_added(struct command *cmd,
 	/* Check factory lifecycle warnings */
 	for (size_t i = 0; i < ss_state.n_factories; i++) {
 		factory_instance_t *fi = ss_state.factories[i];
-		if (fi->lifecycle != FACTORY_LIFECYCLE_ACTIVE &&
-		    fi->lifecycle != FACTORY_LIFECYCLE_DYING)
+		/* Phase 3a: skip terminal-closed only. See matching comment
+		 * in ss_catchup_breach_scan — INIT factories with real
+		 * funding need observation. The interior expiry/cascade
+		 * blocks below already filter their own state requirements. */
+		if (fi->lifecycle == FACTORY_LIFECYCLE_EXPIRED
+		    || fi->lifecycle == FACTORY_LIFECYCLE_CLOSED_EXTERNALLY)
 			continue;
 
 		if (ss_factory_should_close(fi, ss_state.current_blockheight)) {
