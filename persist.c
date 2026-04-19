@@ -87,8 +87,10 @@ size_t ss_persist_serialize_meta(const factory_instance_t *fi, uint8_t **out)
 	 *   v9 adds per-epoch state-root TXID cache + signals_observed
 	 *      bitmask + state_tx_match_epoch (watcher Phase 3b)
 	 *  v10 adds pending_penalties array for fee-bump scheduler
-	 *      (watcher Phase 3c) */
-	buf_u8(&buf, &len, &cap, 10);
+	 *      (watcher Phase 3c)
+	 *  v11 adds pending_sweeps array for CSV claim scheduler
+	 *      (watcher Phase 4d) */
+	buf_u8(&buf, &len, &cap, 11);
 
 	/* Identity */
 	buf_append(&buf, &len, &cap, fi->instance_id, 32);
@@ -255,6 +257,30 @@ size_t ss_persist_serialize_meta(const factory_instance_t *fi, uint8_t **out)
 		buf_u32(&buf, &len, &cap, pp->tx_vsize);
 		buf_u8(&buf, &len, &cap, pp->state);
 		buf_u8(&buf, &len, &cap, pp->cpfp_attempted);
+	}
+
+	/* v11: Phase 4d pending sweeps. Same shape as pending_penalties —
+	 * u8 count, then per-entry fixed-size block. */
+	buf_u8(&buf, &len, &cap, (uint8_t)fi->n_pending_sweeps);
+	for (size_t i = 0; i < fi->n_pending_sweeps; i++) {
+		const pending_sweep_t *ps = &fi->pending_sweeps[i];
+		buf_u8(&buf, &len, &cap, ps->type);
+		buf_u8(&buf, &len, &cap, ps->state);
+		buf_append(&buf, &len, &cap, ps->source_txid, 32);
+		buf_u32(&buf, &len, &cap, ps->source_vout);
+		{
+			uint64_t a = ps->amount_sats;
+			uint8_t ab[8] = { (a>>56)&0xFF, (a>>48)&0xFF,
+					   (a>>40)&0xFF, (a>>32)&0xFF,
+					   (a>>24)&0xFF, (a>>16)&0xFF,
+					   (a>>8)&0xFF, a&0xFF };
+			buf_append(&buf, &len, &cap, ab, 8);
+		}
+		buf_u32(&buf, &len, &cap, ps->csv_delay);
+		buf_u32(&buf, &len, &cap, ps->confirmed_block);
+		buf_append(&buf, &len, &cap, ps->sweep_txid, 32);
+		buf_u32(&buf, &len, &cap, ps->broadcast_block);
+		buf_u32(&buf, &len, &cap, ps->sweep_confirmed_block);
 	}
 
 	*out = buf;
@@ -539,6 +565,52 @@ bool ss_persist_deserialize_meta(factory_instance_t *fi,
 				return false;
 		}
 		fi->n_pending_penalties = n_pen;
+	}
+
+	/* v11: Phase 4d pending sweeps. Additive — pre-v11 records default
+	 * to empty array. */
+	fi->n_pending_sweeps = 0;
+	memset(fi->pending_sweeps, 0, sizeof(fi->pending_sweeps));
+	if (version >= 11) {
+		uint8_t n_sw;
+		if (!read_u8(&p, &rem, &n_sw))
+			return false;
+		if (n_sw > MAX_PENDING_SWEEPS)
+			return false;
+		for (uint8_t i = 0; i < n_sw; i++) {
+			pending_sweep_t *ps = &fi->pending_sweeps[i];
+			if (!read_u8(&p, &rem, &ps->type)) return false;
+			if (!read_u8(&p, &rem, &ps->state)) return false;
+			if (!read_bytes(&p, &rem, ps->source_txid, 32))
+				return false;
+			if (!read_u32(&p, &rem, &ps->source_vout))
+				return false;
+			{
+				uint8_t ab[8];
+				if (!read_bytes(&p, &rem, ab, 8))
+					return false;
+				ps->amount_sats =
+					((uint64_t)ab[0] << 56) |
+					((uint64_t)ab[1] << 48) |
+					((uint64_t)ab[2] << 40) |
+					((uint64_t)ab[3] << 32) |
+					((uint64_t)ab[4] << 24) |
+					((uint64_t)ab[5] << 16) |
+					((uint64_t)ab[6] <<  8) |
+					 (uint64_t)ab[7];
+			}
+			if (!read_u32(&p, &rem, &ps->csv_delay))
+				return false;
+			if (!read_u32(&p, &rem, &ps->confirmed_block))
+				return false;
+			if (!read_bytes(&p, &rem, ps->sweep_txid, 32))
+				return false;
+			if (!read_u32(&p, &rem, &ps->broadcast_block))
+				return false;
+			if (!read_u32(&p, &rem, &ps->sweep_confirmed_block))
+				return false;
+		}
+		fi->n_pending_sweeps = n_sw;
 	}
 
 	return true;
