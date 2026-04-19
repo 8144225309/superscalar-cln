@@ -8296,6 +8296,34 @@ static struct command_result *handle_block_added(struct command *cmd,
 		 * per-block path share the same guards. */
 		ss_launch_breach_scan(cmd, fi, i);
 
+		/* Phase 4a: proactive deep-unwind detection. Philosophy
+		 * ported from upstream's factory_recovery_scan — scan every
+		 * block for on-chain state changes, don't wait for a
+		 * root-spend heartbeat to trigger. Closes the trustless gap
+		 * where counterparty confirms a state TX in a block our
+		 * plugin missed (brief offline, private-mempool attack, etc):
+		 * the heartbeat may never fire for the root, but scanning
+		 * the last few blocks for a TX spending kickoff's output
+		 * catches the state TX directly.
+		 *
+		 * Gate: only for factories with a loaded lib_factory + non-
+		 * zero kickoff txid (cache check). Window is narrow (2 blocks)
+		 * because this runs every block — 144-block catchup lives in
+		 * the startup path + in breach_utxo_checked.
+		 *
+		 * Cost: 2 RPCs per factory per block (getblockhash +
+		 * getblock). Cheap even with N=20 factories. */
+		{
+			factory_t *fct = (factory_t *)fi->lib_factory;
+			if (fct && fct->n_nodes > 0
+			    && !factory_is_closed(fi->lifecycle)) {
+				static const uint8_t zero32[32] = {0};
+				if (memcmp(fct->nodes[0].txid, zero32, 32) != 0)
+					ss_launch_state_tx_scan(cmd, fi,
+						fct->nodes[0].txid, 2);
+			}
+		}
+
 		/* Phase 3c: drive the pending-penalty fee-bump scheduler.
 		 * Runs for any factory with pending entries regardless of
 		 * lifecycle — a penalty can still be live even as lifecycle
@@ -9623,6 +9651,66 @@ json_dev_factory_mark_penalty_confirmed(struct command *cmd,
 	return command_finished(cmd, js);
 }
 
+/* dev-factory-trigger-deep-unwind-scan — test-only hook to exercise the
+ * Phase 4a proactive scan gating without waiting for a block_added
+ * notification. Returns without error even when the scan is skipped
+ * (no lib_factory, closed lifecycle, zero kickoff txid), so tests can
+ * assert the gating contract directly. */
+static struct command_result *
+json_dev_factory_trigger_deep_unwind_scan(struct command *cmd,
+					  const char *buf,
+					  const jsmntok_t *params)
+{
+	const char *id_hex;
+	u32 *window;
+
+	if (!param(cmd, buf, params,
+		   p_req("instance_id", param_string, &id_hex),
+		   p_opt_def("window", param_u32, &window, 2),
+		   NULL))
+		return command_param_failed();
+
+	if (strlen(id_hex) != 64)
+		return command_fail(cmd, LIGHTNINGD, "Bad instance_id");
+
+	uint8_t instance_id[32];
+	for (int j = 0; j < 32; j++) {
+		unsigned int b;
+		if (sscanf(id_hex + j*2, "%02x", &b) != 1)
+			return command_fail(cmd, LIGHTNINGD,
+					    "Bad instance_id hex");
+		instance_id[j] = (uint8_t)b;
+	}
+
+	factory_instance_t *fi = ss_factory_find(&ss_state, instance_id);
+	if (!fi)
+		return command_fail(cmd, LIGHTNINGD, "Factory not found");
+
+	const char *skip_reason = NULL;
+	factory_t *fct = (factory_t *)fi->lib_factory;
+	if (!fct || fct->n_nodes == 0)
+		skip_reason = "no_lib_factory";
+	else if (factory_is_closed(fi->lifecycle))
+		skip_reason = "lifecycle_closed";
+	else {
+		static const uint8_t zero32[32] = {0};
+		if (memcmp(fct->nodes[0].txid, zero32, 32) == 0)
+			skip_reason = "zero_kickoff_txid";
+	}
+
+	if (!skip_reason)
+		ss_launch_state_tx_scan(cmd, fi, fct->nodes[0].txid, *window);
+
+	struct json_stream *js = jsonrpc_stream_success(cmd);
+	json_add_string(js, "instance_id", id_hex);
+	json_add_u32(js, "window", *window);
+	if (skip_reason)
+		json_add_string(js, "skipped", skip_reason);
+	else
+		json_add_string(js, "status", "scan_launched");
+	return command_finished(cmd, js);
+}
+
 static const struct plugin_command commands[] = {
 	{
 		"dev-factory-set-signal",
@@ -9639,6 +9727,10 @@ static const struct plugin_command commands[] = {
 	{
 		"dev-factory-mark-penalty-confirmed",
 		json_dev_factory_mark_penalty_confirmed,
+	},
+	{
+		"dev-factory-trigger-deep-unwind-scan",
+		json_dev_factory_trigger_deep_unwind_scan,
 	},
 	{
 		"factory-create",
