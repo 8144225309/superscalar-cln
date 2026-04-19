@@ -76,8 +76,11 @@ size_t ss_persist_serialize_meta(const factory_instance_t *fi, uint8_t **out)
 	uint8_t *buf = NULL;
 	size_t len = 0, cap = 0;
 
-	/* Version byte (4 adds factory_pubkeys, allocations, departure) */
-	buf_u8(&buf, &len, &cap, 5);
+	/* Version byte:
+	 *   v4 adds factory_pubkeys, allocations, departure
+	 *   v5 adds per-client REVOKE-ACK tracking
+	 *   v6 adds closed_externally_at_block (watcher Phase 1) */
+	buf_u8(&buf, &len, &cap, 6);
 
 	/* Identity */
 	buf_append(&buf, &len, &cap, fi->instance_id, 32);
@@ -168,6 +171,11 @@ size_t ss_persist_serialize_meta(const factory_instance_t *fi, uint8_t **out)
 			fi->clients[i].last_acked_epoch);
 	}
 
+	/* v6: closed_externally_at_block. 0 for factories that never went
+	 * CLOSED_EXTERNALLY. Paired with the lifecycle byte above for
+	 * forensic/reap tooling. */
+	buf_u32(&buf, &len, &cap, fi->closed_externally_at_block);
+
 	*out = buf;
 	return len;
 }
@@ -181,7 +189,7 @@ bool ss_persist_deserialize_meta(factory_instance_t *fi,
 	uint8_t version, tmp8;
 	uint16_t tmp16;
 
-	if (!read_u8(&p, &rem, &version) || version < 1 || version > 5)
+	if (!read_u8(&p, &rem, &version) || version < 1 || version > 6)
 		return false;
 
 	if (!read_bytes(&p, &rem, fi->instance_id, 32)) return false;
@@ -301,6 +309,15 @@ bool ss_persist_deserialize_meta(factory_instance_t *fi,
 			fi->clients[i].pending_revoke_epoch = pe;
 			fi->clients[i].last_acked_epoch = la;
 		}
+	}
+
+	/* v6: closed_externally_at_block. Older blobs default to 0, which is
+	 * also the sentinel for "never externally closed" — so no special
+	 * handling is needed for pre-v6 records. */
+	fi->closed_externally_at_block = 0;
+	if (version >= 6) {
+		if (!read_u32(&p, &rem, &fi->closed_externally_at_block))
+			return false;
 	}
 
 	return true;

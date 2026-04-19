@@ -103,3 +103,16 @@ As of the last run: **4/4 smoke tests passing.** Includes two-node connect + pro
 - **Implementation:** ~90% of the bLIP-56 draft's wire-visible surface, with the one well-documented deviation on wire-type parity.
 - **Spec engagement:** pending. Plan: post implementation feedback on PR #56 citing bLIP-17 precedent, propose ODD ratification, offer this repo as reference implementation.
 - **Second implementation:** not yet. bLIP ratification typically requires two; LDK is the most plausible next target after CLN.
+
+## Trustless watcher (Phase 1 shipped)
+
+Factory lifecycle is observed against on-chain truth so records can't drift into zombies when a factory is closed outside the plugin. See [project_trustless_watcher_plan.md](#) (4-phase plan) for the full design.
+
+| Watcher capability | Status |
+|---|---|
+| UTXO heartbeat on `block_added` + startup catch-up | ✓ Phase 1 |
+| `CLOSED_EXTERNALLY` lifecycle state on unexpected root spend | ✓ Phase 1 |
+| `factory-confirm-closed` RPC for explicit operator reap | ✓ Phase 1 |
+| Spending-TX classification (breach vs coop vs external) | — Phase 2 |
+| Automated breach penalty construction + fee bumping | — Phase 3 |
+| Multi-party ceremony tests at N > 2 | — Phase 4 |

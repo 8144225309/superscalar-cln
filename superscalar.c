@@ -5470,7 +5470,19 @@ static struct command_result *json_factory_list(struct command *cmd,
 			fi->lifecycle == FACTORY_LIFECYCLE_INIT ? "init" :
 			fi->lifecycle == FACTORY_LIFECYCLE_ACTIVE ? "active" :
 			fi->lifecycle == FACTORY_LIFECYCLE_DYING ? "dying" :
-			"expired");
+			fi->lifecycle == FACTORY_LIFECYCLE_EXPIRED ? "expired" :
+			fi->lifecycle == FACTORY_LIFECYCLE_CLOSED_EXTERNALLY
+				? "closed_externally" :
+			fi->lifecycle == FACTORY_LIFECYCLE_CLOSED_COOPERATIVE
+				? "closed_cooperative" :
+			fi->lifecycle == FACTORY_LIFECYCLE_CLOSED_UNILATERAL
+				? "closed_unilateral" :
+			fi->lifecycle == FACTORY_LIFECYCLE_CLOSED_BREACHED
+				? "closed_breached" :
+			"unknown");
+		if (fi->closed_externally_at_block > 0)
+			json_add_u32(js, "closed_externally_at_block",
+				     fi->closed_externally_at_block);
 		json_add_string(js, "ceremony",
 			fi->ceremony == CEREMONY_IDLE ? "idle" :
 			fi->ceremony == CEREMONY_PROPOSED ? "proposed" :
@@ -6221,7 +6233,16 @@ static void ss_launch_breach_scan(struct command *cmd,
 			break;
 		}
 	}
-	if (!has_real_funding || fi->epoch == 0)
+	/* Pre-Phase-1 this returned early for fi->epoch == 0 because the
+	 * function existed solely to drive breach burn-tx construction,
+	 * which is a no-op before any rotation. The function now also
+	 * drives Phase-1 external-close detection (lifecycle transition
+	 * to CLOSED_EXTERNALLY), which applies to fresh factories too —
+	 * an LSP or client could have their factory root spent before the
+	 * first rotation. Keep only the has_real_funding gate. The breach
+	 * loop inside breach_utxo_checked already no-ops when there are no
+	 * revoked epochs. */
+	if (!has_real_funding)
 		return;
 
 	char ftxid_hex[65];
@@ -6281,20 +6302,52 @@ static struct command_result *breach_utxo_checked(struct command *cmd,
 
 	if (!exists) {
 		/* Funding UTXO has been spent. Could be:
-		 *   (a) our own force-close / intentional exit — expected
+		 *   (a) our own force-close / intentional exit — expected;
+		 *       lifecycle is already DYING in that case
 		 *   (b) a genuine breach (peer published an old kickoff
 		 *       from a prior epoch, before we could advance)
 		 *   (c) a cooperative close we didn't drive
+		 *   (d) a manual external sweep (recovery tool, HSM-lost
+		 *       recovery, operator intervention outside the plugin)
 		 *
-		 * We can't tell from checkutxo alone which it is — that's
-		 * left to the cascade logic elsewhere. What we CAN do here
-		 * is, for every old epoch where we hold the peer's
-		 * revocation secret, build L-stock burn TXs against that
-		 * epoch's leaf-state L-stock outputs so the moment those
-		 * state TXs confirm (if peer does publish them) our burn
-		 * TXs are ready in mempool to claim the L-stock.
+		 * Phase 1 distinguishes (a) from everything else via
+		 * lifecycle: if the factory is still ACTIVE when the spend
+		 * lands, we didn't initiate it — transition to
+		 * CLOSED_EXTERNALLY. Phase 2 will classify (b/c/d) by
+		 * inspecting the spending TX; for now CLOSED_EXTERNALLY is
+		 * the safe default label for "root spent, not by us." The
+		 * operator confirms via factory-confirm-closed before the
+		 * record is reaped, so a misclassification at this layer
+		 * costs a manual verification step, not funds.
 		 *
-		 * Previously this loop called factory_build_burn_tx with
+		 * Breach burn-TX construction below continues independently
+		 * — if we have revocation secrets for a past epoch, they
+		 * should still go to mempool so that when the counterparty
+		 * publishes a leaf-state TX from the revoked epoch we're
+		 * ready to sweep its L-stock. The two concerns (lifecycle
+		 * flag vs burn-tx assembly) are complementary, not mutually
+		 * exclusive. */
+		if (fi->lifecycle == FACTORY_LIFECYCLE_ACTIVE) {
+			fi->lifecycle = FACTORY_LIFECYCLE_CLOSED_EXTERNALLY;
+			fi->closed_externally_at_block =
+				ss_state.current_blockheight;
+			char iid_hex[65];
+			for (int j = 0; j < 32; j++)
+				sprintf(iid_hex + j*2, "%02x",
+					fi->instance_id[j]);
+			iid_hex[64] = '\0';
+			plugin_log(plugin_handle, LOG_BROKEN,
+				   "FACTORY CLOSED EXTERNALLY: instance_id=%s "
+				   "funding root spent at block %u without "
+				   "plugin-initiated close. Marked "
+				   "closed_externally. Run factory-confirm-closed "
+				   "%s to reap after verifying funds are safe.",
+				   iid_hex, ss_state.current_blockheight,
+				   iid_hex);
+			ss_save_factory(cmd, fi);
+		}
+
+		/* Previously this loop called factory_build_burn_tx with
 		 * (nodes[0].txid, 0) — the kickoff's output, which is NOT
 		 * an L-stock output. L-stock outputs live on LEAF STATE
 		 * nodes as the last output of each leaf. The burn TXs
@@ -7505,6 +7558,164 @@ static const struct plugin_hook hooks[] = {
 	{ "htlc_accepted", handle_htlc_accepted },
 };
 
+/* Phase 1 trustless-watcher: explicit operator reap of a factory the
+ * plugin has flagged as closed (externally or otherwise).
+ *
+ * Safety: by default the RPC only reaps factories whose lifecycle is a
+ * closed-* terminal state (set by the watcher). Pass force=true to reap
+ * a factory in any state — useful if the watcher hasn't classified yet
+ * but the operator knows the record is dead. In either case the in-
+ * memory record is removed first (so the plugin immediately stops
+ * advertising, scanning, etc.) and the datastore keys are deleted
+ * asynchronously. If any delete fails the factory stays out of memory
+ * but the orphaned key remains on disk until the operator intervenes —
+ * that is strictly safer than re-attaching the zombie.
+ *
+ * Does NOT force-close channels, does NOT broadcast breach TXs, does
+ * NOT touch the on-chain wallet. This is a pure bookkeeping RPC.
+ */
+static struct command_result *json_factory_confirm_closed(struct command *cmd,
+							   const char *buf,
+							   const jsmntok_t *params)
+{
+	const char *id_hex;
+	bool *force;
+
+	if (!param(cmd, buf, params,
+		   p_req("instance_id", param_string, &id_hex),
+		   p_opt_def("force", param_bool, &force, false),
+		   NULL))
+		return command_param_failed();
+
+	if (strlen(id_hex) != 64)
+		return command_fail(cmd, LIGHTNINGD,
+				    "Bad instance_id length (need 64 hex chars)");
+
+	uint8_t instance_id[32];
+	for (int j = 0; j < 32; j++) {
+		unsigned int b;
+		if (sscanf(id_hex + j*2, "%02x", &b) != 1)
+			return command_fail(cmd, LIGHTNINGD,
+					    "Bad instance_id hex at byte %d", j);
+		instance_id[j] = (uint8_t)b;
+	}
+
+	factory_instance_t *fi = ss_factory_find(&ss_state, instance_id);
+	if (!fi)
+		return command_fail(cmd, LIGHTNINGD,
+				    "Factory %s not found in memory. Already "
+				    "reaped, or never loaded.", id_hex);
+
+	if (!factory_is_closed(fi->lifecycle) && !*force)
+		return command_fail(cmd, LIGHTNINGD,
+				    "Factory %s is in lifecycle %d (not a "
+				    "closed-* terminal state). Pass "
+				    "force=true to reap regardless — but "
+				    "verify first that on-chain funds have "
+				    "been secured.",
+				    id_hex, fi->lifecycle);
+
+	/* Snapshot what we need before we remove fi from ss_state — the
+	 * async deldatastore callbacks shouldn't touch freed memory. */
+	size_t factory_slot = SIZE_MAX;
+	for (size_t i = 0; i < ss_state.n_factories; i++) {
+		if (ss_state.factories[i] == fi) {
+			factory_slot = i;
+			break;
+		}
+	}
+
+	/* Dispatch deldatastore for each known key under this factory.
+	 * Failures are logged but not reported to the caller — the
+	 * authoritative action here is the in-memory removal below, and
+	 * orphaned datastore entries degrade gracefully on next startup
+	 * (ss_load_factories just skips keys whose meta is missing). */
+	char iid_hex[65];
+	for (int j = 0; j < 32; j++)
+		sprintf(iid_hex + j*2, "%02x", fi->instance_id[j]);
+	iid_hex[64] = '\0';
+
+	static const char *fixed_subkeys[] = {
+		"meta", "channels", "signed_txs", "dist_tx", "breach-index"
+	};
+	for (size_t k = 0; k < sizeof(fixed_subkeys)/sizeof(fixed_subkeys[0]);
+	     k++) {
+		struct out_req *req = jsonrpc_request_start(cmd, "deldatastore",
+			rpc_done, rpc_done /* treat errors as informational */,
+			fi);
+		json_array_start(req->js, "key");
+		json_add_string(req->js, NULL, "superscalar");
+		json_add_string(req->js, NULL, "factories");
+		json_add_string(req->js, NULL, iid_hex);
+		json_add_string(req->js, NULL, fixed_subkeys[k]);
+		json_array_end(req->js);
+		send_outreq(req);
+	}
+	/* Per-epoch breach keys we know about. */
+	for (size_t bi = 0; bi < fi->n_breach_epochs; bi++) {
+		char epoch_str[16];
+		snprintf(epoch_str, sizeof(epoch_str), "%u",
+			 fi->breach_data[bi].epoch);
+		struct out_req *req = jsonrpc_request_start(cmd, "deldatastore",
+			rpc_done, rpc_done, fi);
+		json_array_start(req->js, "key");
+		json_add_string(req->js, NULL, "superscalar");
+		json_add_string(req->js, NULL, "factories");
+		json_add_string(req->js, NULL, iid_hex);
+		json_add_string(req->js, NULL, "breach");
+		json_add_string(req->js, NULL, epoch_str);
+		json_array_end(req->js);
+		send_outreq(req);
+	}
+
+	/* Capture lifecycle for the log message before we free fi. */
+	int prior_lifecycle = (int)fi->lifecycle;
+
+	/* Remove from in-memory state. Free the struct — any in-flight
+	 * hook callbacks holding fi without a freshness check are buggy
+	 * regardless, and would crash on the next state change anyway. */
+	if (factory_slot != SIZE_MAX) {
+		for (size_t i = factory_slot + 1; i < ss_state.n_factories; i++)
+			ss_state.factories[i - 1] = ss_state.factories[i];
+		ss_state.n_factories--;
+		ss_state.factories[ss_state.n_factories] = NULL;
+	}
+	if (fi->breach_data) free(fi->breach_data);
+	if (fi->dist_signed_tx) free(fi->dist_signed_tx);
+	free(fi);
+	fi = NULL; /* poison */
+
+	/* Refresh the factory-index key so the next startup load doesn't
+	 * try to reload the reaped factory. */
+	if (factory_slot != SIZE_MAX) {
+		size_t idx_len = 2 + ss_state.n_factories * 32;
+		uint8_t *idx_buf = calloc(1, idx_len);
+		if (idx_buf) {
+			idx_buf[0] = (ss_state.n_factories >> 8) & 0xFF;
+			idx_buf[1] = ss_state.n_factories & 0xFF;
+			for (size_t i = 0; i < ss_state.n_factories; i++)
+				memcpy(idx_buf + 2 + i * 32,
+				       ss_state.factories[i]->instance_id, 32);
+			jsonrpc_set_datastore_binary(cmd,
+				"superscalar/factory-index",
+				idx_buf, idx_len,
+				"create-or-replace", rpc_done, rpc_done,
+				NULL);
+			free(idx_buf);
+		}
+	}
+
+	plugin_log(plugin_handle, LOG_INFORM,
+		   "factory-confirm-closed: reaped factory %s "
+		   "(was in lifecycle %d; force=%d)",
+		   iid_hex, prior_lifecycle, *force ? 1 : 0);
+
+	struct json_stream *js = jsonrpc_stream_success(cmd);
+	json_add_string(js, "instance_id", id_hex);
+	json_add_bool(js, "reaped", true);
+	return command_finished(cmd, js);
+}
+
 static const struct plugin_command commands[] = {
 	{
 		"factory-create",
@@ -7557,6 +7768,10 @@ static const struct plugin_command commands[] = {
 	{
 		"factory-close-departed",
 		json_factory_close_departed,
+	},
+	{
+		"factory-confirm-closed",
+		json_factory_confirm_closed,
 	},
 };
 
