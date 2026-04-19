@@ -85,6 +85,49 @@ static inline bool factory_is_closed(factory_lifecycle_t l) {
 #define SIGNAL_WITNESS_CURRENT_MATCH (1u << 5) /* witness sig matched current epoch */
 #define SIGNAL_WITNESS_PAST_MATCH  (1u << 6) /* witness sig matched a past epoch */
 #define SIGNAL_STATE_TX_MATCH      (1u << 7) /* downstream state TX matched a cached state root */
+#define SIGNAL_PENALTY_CONFIRMED   (1u << 8) /* Phase 3c: our penalty TX confirmed on chain — breach neutralized */
+
+/* Phase 3c: penalty pipeline.
+ * A pending penalty is a burn TX we have broadcast (or are about to
+ * broadcast) against a counterparty's revoked L-stock output. The
+ * scheduler in handle_block_added re-runs each pending entry through
+ * htlc_fee_bump_should_bump every block and CPFP-bumps if stuck.
+ *
+ * Deadline: derived from the CSV delay on the L-stock output — we MUST
+ * confirm our burn before CSV unlocks (at which point the counterparty
+ * can claim freely). Upstream htlc_fee_bump_t carries deadline_block.
+ *
+ * Budget: fraction of the L-stock amount we are willing to spend on
+ * fees. Default 50% (HTLC_FEE_BUMP_DEFAULT_BUDGET_PCT from
+ * htlc_fee_bump.h). Counterparty's alternative is keeping 100% of the
+ * stolen amount, so we rationally outbid them up to (amount - dust).
+ *
+ * Persisted as TLV-style blocks in the factory meta under key
+ * "pending_penalties" so restarts don't lose the fee state. */
+#define MAX_PENDING_PENALTIES 16
+
+typedef enum {
+	PENALTY_STATE_PENDING   = 0, /* constructed, not yet broadcast */
+	PENALTY_STATE_BROADCAST = 1, /* in mempool, awaiting confirm */
+	PENALTY_STATE_CONFIRMED = 2, /* on chain with >=1 conf */
+	PENALTY_STATE_REPLACED  = 3, /* counterparty won the race (RBF or
+				      * CSV-expired claim) — we lost */
+} penalty_state_t;
+
+typedef struct {
+	uint32_t epoch;          /* revoked epoch this burns */
+	int32_t  leaf_index;     /* which leaf's L-stock we target */
+	uint8_t  burn_txid[32];  /* txid of our burn broadcast (internal BE) */
+	uint64_t lstock_sats;    /* value at stake — budget basis */
+	uint32_t csv_unlock_block; /* deadline: counterparty can claim after this */
+	uint32_t first_broadcast_block;
+	uint32_t last_broadcast_block;
+	uint32_t confirmed_block; /* 0 if unconfirmed */
+	uint64_t last_feerate;    /* sat/kvB, 0 until first broadcast */
+	uint32_t tx_vsize;        /* vbytes for fee math */
+	uint8_t  state;           /* penalty_state_t */
+	uint8_t  cpfp_attempted;  /* 1 if we've tried an anchor child */
+} pending_penalty_t;
 
 /* Per-epoch breach data */
 typedef struct {
@@ -168,6 +211,14 @@ typedef struct factory_instance {
 	/* Breach data (circular buffer of recent epochs) */
 	epoch_breach_data_t *breach_data;
 	size_t n_breach_epochs;
+
+	/* Phase 3c: pending penalty records. Populated when classifier
+	 * fires CLOSED_BREACHED (or when breach burn is built in
+	 * breach_utxo_checked) and retained until the penalty TX confirms
+	 * or becomes irrelevant. Per-block scheduler walks this array,
+	 * running each entry through htlc_fee_bump_should_bump. */
+	pending_penalty_t pending_penalties[MAX_PENDING_PENALTIES];
+	size_t n_pending_penalties;
 
 	/* Rotation */
 	bool rotation_in_progress;
@@ -292,8 +343,10 @@ typedef struct factory_instance {
 	/* Phase 3b: signal observation bitmask. Tracks which evidence
 	 * sources contributed to the current lifecycle decision. Used by
 	 * ss_apply_signals() to make idempotent classification decisions
-	 * and by factory-list to surface the evidence trail. */
-	uint8_t signals_observed;
+	 * and by factory-list to surface the evidence trail.
+	 *
+	 * Widened from u8 to u16 in Phase 3c — bit 8 is SIGNAL_PENALTY_CONFIRMED. */
+	uint16_t signals_observed;
 
 	/* Phase 3b: matched epoch from downstream state-TX scan.
 	 * UINT32_MAX when no match. Independent of breach_epoch (which

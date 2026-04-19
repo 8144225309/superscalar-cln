@@ -85,8 +85,10 @@ size_t ss_persist_serialize_meta(const factory_instance_t *fi, uint8_t **out)
 	 *   v8 adds dist_signed_txid + breach_epoch + per-epoch kickoff
 	 *      signature cache (watcher Phase 2b)
 	 *   v9 adds per-epoch state-root TXID cache + signals_observed
-	 *      bitmask + state_tx_match_epoch (watcher Phase 3b) */
-	buf_u8(&buf, &len, &cap, 9);
+	 *      bitmask + state_tx_match_epoch (watcher Phase 3b)
+	 *  v10 adds pending_penalties array for fee-bump scheduler
+	 *      (watcher Phase 3c) */
+	buf_u8(&buf, &len, &cap, 10);
 
 	/* Identity */
 	buf_append(&buf, &len, &cap, fi->instance_id, 32);
@@ -206,12 +208,54 @@ size_t ss_persist_serialize_meta(const factory_instance_t *fi, uint8_t **out)
 
 	/* v9: Phase 3b. Per-epoch state-root TXIDs (paired with kickoff
 	 * sig array above), signals_observed bitmask, state_tx_match_epoch.
-	 * The TXID array length equals n_history_kickoff_sigs. */
+	 * The TXID array length equals n_history_kickoff_sigs.
+	 *
+	 * v10 widens signals_observed from u8 to u16 (bit 8 added for
+	 * SIGNAL_PENALTY_CONFIRMED). Big-endian. */
 	for (size_t i = 0; i < fi->n_history_kickoff_sigs; i++)
 		buf_append(&buf, &len, &cap,
 			   fi->history_state_root_txids[i], 32);
-	buf_u8(&buf, &len, &cap, fi->signals_observed);
+	buf_u16(&buf, &len, &cap, fi->signals_observed);
 	buf_u32(&buf, &len, &cap, fi->state_tx_match_epoch);
+
+	/* v10: Phase 3c pending penalties. One u8 count, then for each entry
+	 * a packed fixed-size block. Fields chosen to survive process
+	 * restarts without needing to rebuild the burn TX — we persist the
+	 * txid we broadcast, not the full TX bytes (re-derivable from
+	 * breach_data via factory_build_burn_tx). */
+	buf_u8(&buf, &len, &cap, (uint8_t)fi->n_pending_penalties);
+	for (size_t i = 0; i < fi->n_pending_penalties; i++) {
+		const pending_penalty_t *pp = &fi->pending_penalties[i];
+		buf_u32(&buf, &len, &cap, pp->epoch);
+		/* leaf_index stored as unsigned; negative sentinel as UINT32_MAX */
+		buf_u32(&buf, &len, &cap,
+			pp->leaf_index < 0 ? UINT32_MAX
+					   : (uint32_t)pp->leaf_index);
+		buf_append(&buf, &len, &cap, pp->burn_txid, 32);
+		{
+			uint64_t a = pp->lstock_sats;
+			uint8_t ab[8] = { (a>>56)&0xFF, (a>>48)&0xFF,
+					   (a>>40)&0xFF, (a>>32)&0xFF,
+					   (a>>24)&0xFF, (a>>16)&0xFF,
+					   (a>>8)&0xFF, a&0xFF };
+			buf_append(&buf, &len, &cap, ab, 8);
+		}
+		buf_u32(&buf, &len, &cap, pp->csv_unlock_block);
+		buf_u32(&buf, &len, &cap, pp->first_broadcast_block);
+		buf_u32(&buf, &len, &cap, pp->last_broadcast_block);
+		buf_u32(&buf, &len, &cap, pp->confirmed_block);
+		{
+			uint64_t a = pp->last_feerate;
+			uint8_t ab[8] = { (a>>56)&0xFF, (a>>48)&0xFF,
+					   (a>>40)&0xFF, (a>>32)&0xFF,
+					   (a>>24)&0xFF, (a>>16)&0xFF,
+					   (a>>8)&0xFF, a&0xFF };
+			buf_append(&buf, &len, &cap, ab, 8);
+		}
+		buf_u32(&buf, &len, &cap, pp->tx_vsize);
+		buf_u8(&buf, &len, &cap, pp->state);
+		buf_u8(&buf, &len, &cap, pp->cpfp_attempted);
+	}
 
 	*out = buf;
 	return len;
@@ -419,12 +463,82 @@ bool ss_persist_deserialize_meta(factory_instance_t *fi,
 					fi->history_state_root_txids[i], 32))
 				return false;
 		}
-		uint8_t sig_bits;
-		if (!read_u8(&p, &rem, &sig_bits))
-			return false;
-		fi->signals_observed = sig_bits;
+		/* v9: u8 signals. v10+: u16 signals (widened for
+		 * SIGNAL_PENALTY_CONFIRMED at bit 8). */
+		if (version == 9) {
+			uint8_t sig_bits;
+			if (!read_u8(&p, &rem, &sig_bits))
+				return false;
+			fi->signals_observed = sig_bits;
+		} else {
+			uint16_t sig_bits;
+			if (!read_u16(&p, &rem, &sig_bits))
+				return false;
+			fi->signals_observed = sig_bits;
+		}
 		if (!read_u32(&p, &rem, &fi->state_tx_match_epoch))
 			return false;
+	}
+
+	/* v10: Phase 3c pending penalties. Pre-v10 blobs default to empty;
+	 * the scheduler will just no-op on empty arrays. */
+	fi->n_pending_penalties = 0;
+	memset(fi->pending_penalties, 0, sizeof(fi->pending_penalties));
+	if (version >= 10) {
+		uint8_t n_pen;
+		if (!read_u8(&p, &rem, &n_pen))
+			return false;
+		if (n_pen > MAX_PENDING_PENALTIES)
+			return false;
+		for (uint8_t i = 0; i < n_pen; i++) {
+			pending_penalty_t *pp = &fi->pending_penalties[i];
+			uint32_t leaf_u32;
+			if (!read_u32(&p, &rem, &pp->epoch)) return false;
+			if (!read_u32(&p, &rem, &leaf_u32)) return false;
+			pp->leaf_index = (leaf_u32 == UINT32_MAX)
+				? -1 : (int32_t)leaf_u32;
+			if (!read_bytes(&p, &rem, pp->burn_txid, 32))
+				return false;
+			{
+				uint8_t ab[8];
+				if (!read_bytes(&p, &rem, ab, 8)) return false;
+				pp->lstock_sats =
+					((uint64_t)ab[0] << 56) |
+					((uint64_t)ab[1] << 48) |
+					((uint64_t)ab[2] << 40) |
+					((uint64_t)ab[3] << 32) |
+					((uint64_t)ab[4] << 24) |
+					((uint64_t)ab[5] << 16) |
+					((uint64_t)ab[6] <<  8) |
+					 (uint64_t)ab[7];
+			}
+			if (!read_u32(&p, &rem, &pp->csv_unlock_block))
+				return false;
+			if (!read_u32(&p, &rem, &pp->first_broadcast_block))
+				return false;
+			if (!read_u32(&p, &rem, &pp->last_broadcast_block))
+				return false;
+			if (!read_u32(&p, &rem, &pp->confirmed_block))
+				return false;
+			{
+				uint8_t ab[8];
+				if (!read_bytes(&p, &rem, ab, 8)) return false;
+				pp->last_feerate =
+					((uint64_t)ab[0] << 56) |
+					((uint64_t)ab[1] << 48) |
+					((uint64_t)ab[2] << 40) |
+					((uint64_t)ab[3] << 32) |
+					((uint64_t)ab[4] << 24) |
+					((uint64_t)ab[5] << 16) |
+					((uint64_t)ab[6] <<  8) |
+					 (uint64_t)ab[7];
+			}
+			if (!read_u32(&p, &rem, &pp->tx_vsize)) return false;
+			if (!read_u8(&p, &rem, &pp->state)) return false;
+			if (!read_u8(&p, &rem, &pp->cpfp_attempted))
+				return false;
+		}
+		fi->n_pending_penalties = n_pen;
 	}
 
 	return true;

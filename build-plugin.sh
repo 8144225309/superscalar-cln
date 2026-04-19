@@ -32,15 +32,20 @@ cp "$PLUGIN_SRC/superscalar.c" "$PLUGIN_SRC/factory_state.h" \
    "$PLUGIN_SRC/nonce_exchange.h" "$PLUGIN_SRC/fee_stubs.c" \
    "$PLUGIN_SRC/ceremony.h" plugins/
 
-# --- Step 1: Build slim libsuperscalar (only the 9 files we need) ---
-# The full libsuperscalar.a has 106 .o files. 97 of them export symbols
+# --- Step 1: Build slim libsuperscalar (only the 10 files we need) ---
+# The full libsuperscalar.a has 106 .o files. 96 of them export symbols
 # that conflict with CLN (hex_decode, bolt11_decode, etc). We extract
-# only the 9 .o files our plugin actually calls.
+# only the .o files our plugin actually calls.
+#
+# Phase 3c reuse: htlc_fee_bump.c.o provides LND-compatible fee-bump
+# scheduling (linear interpolation, 25% RBF rule, urgency detection).
+# See feedback_reuse_superscalar_upstream — we DO NOT reimplement this.
 SLIM_DIR=$(mktemp -d)
 cd "$SLIM_DIR"
 ar x "$SS_DIR/build/libsuperscalar.a" \
   factory.c.o musig.c.o dw_state.c.o ladder.c.o \
-  tx_builder.c.o tapscript.c.o adaptor.c.o util.c.o shachain.c.o
+  tx_builder.c.o tapscript.c.o adaptor.c.o util.c.o shachain.c.o \
+  htlc_fee_bump.c.o
 
 # Rename the 6 utility-function conflicts in ALL extracted .o files
 for obj in *.o; do
