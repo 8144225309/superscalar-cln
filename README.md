@@ -55,6 +55,7 @@ The plugin registers CLN hooks (`custommsg`, `openchannel`, `htlc_accepted`, `bl
 | `factory-open-channels` | `instance_id` | Open Lightning channels inside the factory via `fundchannel_start`/`fundchannel_complete` with factory funding override |
 | `factory-forget-channel` | `id`, `channel_id` | Drop a factory channel from CLN without broadcasting a commitment transaction |
 | `factory-close-departed` | `instance_id`, `client_idx` | Close a departed client's channel using their extracted key (after key turnover) |
+| `factory-confirm-closed` | `instance_id`, `[force]` | Reap a factory the watcher has flagged as closed (lifecycle `closed_externally` or other closed-* state). Removes the factory from memory and deletes its datastore entries. Pass `force=true` to reap regardless of lifecycle — only do this after verifying funds are safe. |
 | `factory-migrate` | `instance_id` | Initiate key turnover for all clients, preparing to move channels to a new factory |
 | `factory-migrate-complete` | `instance_id`, `[new_funding_sats]` | Finalize migration after all cooperative clients have departed |
 | `factory-buy-liquidity` | `instance_id`, `client_idx`, `amount_sats` | Rebalance L-stock to client on a leaf (requires re-signing) |
@@ -96,6 +97,8 @@ The plugin registers CLN hooks (`custommsg`, `openchannel`, `htlc_accepted`, `bl
 Key fields:
 - `early_warning_time` — minimum CLTV headroom (in blocks) for HTLCs on this factory's channels. Derived from the DW tree depth. HTLCs with tighter timeouts are rejected by the `htlc_accepted` hook.
 - `epochs_remaining` — rotations left before DW exhaustion triggers migration.
+- `lifecycle` — state string. Active factories are `active`; `dying` means a close was initiated; `closed_externally` means the watcher observed the factory root spent without a plugin-initiated close (manual sweep, HSM-lost recovery, or a close driven outside this plugin). `closed_cooperative` / `closed_unilateral` / `closed_breached` are reserved for Phase 2 of the trustless-watcher plan.
+- `closed_externally_at_block` — present only when `lifecycle == "closed_externally"`; the block height at which the root-spend was observed. Useful for forensics and for deciding when to reap via `factory-confirm-closed`.
 
 ## Architecture
 

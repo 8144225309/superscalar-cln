@@ -24,13 +24,48 @@
 /* Max concurrent factories */
 #define MAX_FACTORIES 32
 
-/* Factory lifecycle */
+/* Factory lifecycle.
+ *
+ * States 0-3 (INIT/ACTIVE/DYING/EXPIRED) are the original state machine driven
+ * by the ceremony + force-close pathways.
+ *
+ * States 4-7 are terminal-closed states set by the watcher (Phase 1+ of the
+ * trustless-watcher plan). Only CLOSED_EXTERNALLY is populated by Phase 1; the
+ * remaining closed-* values are reserved so the persistence format stabilizes
+ * in one go and Phase 2's classifier can populate them without another version
+ * bump. Factories in any closed-* state are skipped by the breach scan and the
+ * ceremony paths, and are safe to reap via factory-confirm-closed.
+ *
+ * Do not renumber — enum values are serialized as u8 in persist.c. */
 typedef enum {
-	FACTORY_LIFECYCLE_INIT,		/* Being created, ceremony in progress */
-	FACTORY_LIFECYCLE_ACTIVE,	/* Signed tree, channels open */
-	FACTORY_LIFECYCLE_DYING,	/* Close initiated or timelock approaching */
-	FACTORY_LIFECYCLE_EXPIRED,	/* Closed on-chain, all settled */
+	FACTORY_LIFECYCLE_INIT = 0,		/* Being created, ceremony in progress */
+	FACTORY_LIFECYCLE_ACTIVE = 1,		/* Signed tree, channels open */
+	FACTORY_LIFECYCLE_DYING = 2,		/* Close initiated or timelock approaching */
+	FACTORY_LIFECYCLE_EXPIRED = 3,		/* nLockTime distribution TX path */
+
+	/* Watcher-populated terminal states (Phase 1+). */
+	FACTORY_LIFECYCLE_CLOSED_EXTERNALLY = 4, /* Root spent outside plugin
+						  * control (manual sweep, HSM-
+						  * lost recovery, etc.). Set by
+						  * the UTXO heartbeat in
+						  * breach_utxo_checked when the
+						  * factory was ACTIVE (i.e. we
+						  * didn't initiate the close). */
+	FACTORY_LIFECYCLE_CLOSED_COOPERATIVE = 5, /* Reserved — Phase 2 */
+	FACTORY_LIFECYCLE_CLOSED_UNILATERAL = 6,  /* Reserved — Phase 2 */
+	FACTORY_LIFECYCLE_CLOSED_BREACHED = 7,    /* Reserved — Phase 2+3 */
 } factory_lifecycle_t;
+
+/* Helper: a factory in any closed terminal state should not be scanned,
+ * advertised, or rotated. Centralizes the state check so Phase 2's classifier
+ * can add new closed states without hunting down every gate. */
+static inline bool factory_is_closed(factory_lifecycle_t l) {
+	return l == FACTORY_LIFECYCLE_EXPIRED
+	    || l == FACTORY_LIFECYCLE_CLOSED_EXTERNALLY
+	    || l == FACTORY_LIFECYCLE_CLOSED_COOPERATIVE
+	    || l == FACTORY_LIFECYCLE_CLOSED_UNILATERAL
+	    || l == FACTORY_LIFECYCLE_CLOSED_BREACHED;
+}
 
 /* Per-epoch breach data */
 typedef struct {
@@ -140,6 +175,13 @@ typedef struct factory_instance {
 	uint64_t funding_amount_sats;
 	uint8_t funding_spk[34];
 	uint8_t funding_spk_len;
+
+	/* Block height at which the watcher observed the funding root spent
+	 * outside plugin control. 0 for factories that never hit
+	 * CLOSED_EXTERNALLY. Persisted in meta v6+ so operator tooling can
+	 * show "zombie since block N" and forensics can line up with chain
+	 * history. */
+	uint32_t closed_externally_at_block;
 
 	/* Cached tree node count (persisted so factory-list works after restart
 	 * even when lib_factory hasn't been rebuilt yet). */
