@@ -8306,16 +8306,25 @@ static struct command_result *handle_block_added(struct command *cmd,
 		 * the last few blocks for a TX spending kickoff's output
 		 * catches the state TX directly.
 		 *
-		 * Gate: only for factories with a loaded lib_factory + non-
-		 * zero kickoff txid (cache check). Window is narrow (2 blocks)
-		 * because this runs every block — 144-block catchup lives in
-		 * the startup path + in breach_utxo_checked.
+		 * Gate: only for factories with real on-chain funding
+		 * (same gate as ss_launch_breach_scan — without confirmed
+		 * funding there's no kickoff that can possibly be on chain).
+		 * Window is narrow (2 blocks) because this runs every block
+		 * — 144-block catchup lives in the startup path + in
+		 * breach_utxo_checked.
 		 *
 		 * Cost: 2 RPCs per factory per block (getblockhash +
 		 * getblock). Cheap even with N=20 factories. */
 		{
+			bool has_real_funding = false;
+			for (int fb = 0; fb < 32; fb++) {
+				if (fi->funding_txid[fb] != 0) {
+					has_real_funding = true;
+					break;
+				}
+			}
 			factory_t *fct = (factory_t *)fi->lib_factory;
-			if (fct && fct->n_nodes > 0
+			if (has_real_funding && fct && fct->n_nodes > 0
 			    && !factory_is_closed(fi->lifecycle)) {
 				static const uint8_t zero32[32] = {0};
 				if (memcmp(fct->nodes[0].txid, zero32, 32) != 0)
@@ -9687,8 +9696,17 @@ json_dev_factory_trigger_deep_unwind_scan(struct command *cmd,
 		return command_fail(cmd, LIGHTNINGD, "Factory not found");
 
 	const char *skip_reason = NULL;
+	bool has_real_funding = false;
+	for (int fb = 0; fb < 32; fb++) {
+		if (fi->funding_txid[fb] != 0) {
+			has_real_funding = true;
+			break;
+		}
+	}
 	factory_t *fct = (factory_t *)fi->lib_factory;
-	if (!fct || fct->n_nodes == 0)
+	if (!has_real_funding)
+		skip_reason = "no_funding";
+	else if (!fct || fct->n_nodes == 0)
 		skip_reason = "no_lib_factory";
 	else if (factory_is_closed(fi->lifecycle))
 		skip_reason = "lifecycle_closed";

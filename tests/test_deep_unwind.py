@@ -30,16 +30,19 @@ def _create_factory(lsp, funding_sats: int = 100_000) -> str:
 
 
 def test_deep_unwind_scan_skips_stalled_ceremony(ss_node_factory):
-    """Stalled-ceremony factory has no lib_factory → scan MUST no-op
-    with skipped="no_lib_factory". Regression guard: a naive impl that
-    dereferences lib_factory would crash the daemon here."""
+    """Stalled-ceremony factory has no funding TX yet → scan MUST
+    no-op with skipped="no_funding". factory-create builds the tree
+    (lib_factory + nodes) immediately so we can't gate on that alone;
+    real funding lands later, after NONCE exchange completes. The
+    scan is pointless before funding confirms, so no_funding is the
+    earliest valid gate."""
     lsp = ss_node_factory.get_node()
     iid = _create_factory(lsp)
 
     r = lsp.rpc.call("dev-factory-trigger-deep-unwind-scan",
                      {"instance_id": iid})
     assert "skipped" in r
-    assert r["skipped"] == "no_lib_factory"
+    assert r["skipped"] == "no_funding"
 
 
 def test_deep_unwind_scan_skips_closed_factory(ss_node_factory):
@@ -54,10 +57,13 @@ def test_deep_unwind_scan_skips_closed_factory(ss_node_factory):
 
     r = lsp.rpc.call("dev-factory-trigger-deep-unwind-scan",
                      {"instance_id": iid})
-    # Could be skipped for either reason depending on init order;
-    # accept either "lifecycle_closed" or "no_lib_factory".
+    # Could be skipped for any of: no_funding (never funded),
+    # lifecycle_closed (just set), or no_lib_factory. All are correct
+    # — the contract is "does not launch the scan."
     assert "skipped" in r
-    assert r["skipped"] in {"lifecycle_closed", "no_lib_factory"}
+    assert r["skipped"] in {
+        "no_funding", "lifecycle_closed", "no_lib_factory",
+    }
 
 
 def test_deep_unwind_scan_trigger_rpc_stable(ss_node_factory):
