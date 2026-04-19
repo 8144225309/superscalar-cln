@@ -119,9 +119,17 @@ jobs:
           sed -i 's/\[--enable-module-ecdsa-s2c\]/[--enable-module-ecdsa-s2c], [--enable-module-musig]/' \
             external/libwally-core/configure.ac
 
-      - name: Install Python test deps
+      # Two Python dep sets:
+      #   - mako: CLN's tools/generate-wire.py uses it to render wire headers.
+      #     Without it, `make` on CLN fails at the first wiregen step.
+      #     (Upstream CLN's own CI pip-installs this via their requirements.)
+      #   - requirements-dev.txt: pyln-testing + pytest plugins we need for the
+      #     test suite itself.
+      - name: Install Python deps (CLN wire gen + pytest)
         working-directory: superscalar-cln
-        run: pip install -r requirements-dev.txt
+        run: |
+          pip install mako
+          pip install -r requirements-dev.txt
 
       - name: Build CLN
         working-directory: cln-blip56
