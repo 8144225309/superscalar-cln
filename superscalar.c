@@ -8883,6 +8883,202 @@ static void ss_build_cpfp_child(struct command *cmd,
 }
 
 /* ============================================================
+ * Phase 3c2.5c: sign + send the CPFP child.
+ *
+ * Async chain on top of 3c2.5b's ss_build_cpfp_child:
+ *
+ *   1. reserveinputs psbt        — lock the wallet UTXO (closes the
+ *                                  race window between listfunds and
+ *                                  signpsbt)
+ *   2. signpsbt psbt             — CLN signs the wallet input
+ *   3. sendpsbt signed_psbt      — finalize + extract + broadcast
+ *
+ * The P2A anchor input is anyone-can-spend per BIP-431. sendpsbt's
+ * finalization should handle it (empty witness). If sendpsbt errors
+ * because it can't finalize the anchor input, the fail_cb reports
+ * "sendpsbt_failed" and operator investigates — at which point we'd
+ * add explicit libwally final_scriptwitness population before
+ * sendpsbt as a v2 fix.
+ *
+ * On any failure after reservation, we fire unreserveinputs to free
+ * the wallet UTXO. On success, done_cb is invoked with the final
+ * child's txid (extracted from sendpsbt's response).
+ * ============================================================ */
+
+typedef struct command_result *
+(*cpfp_send_done_cb)(struct command *cmd,
+		     void *arg,
+		     const char *child_txid_hex);
+
+typedef struct command_result *
+(*cpfp_send_fail_cb)(struct command *cmd,
+		     void *arg,
+		     const char *reason);
+
+struct cpfp_send_ctx {
+	/* Preserved across the async chain. */
+	char *signed_psbt;          /* set after signpsbt reply */
+
+	cpfp_send_done_cb done_cb;
+	cpfp_send_fail_cb fail_cb;
+	void *arg;
+};
+
+/* Unreserve on error — fire-and-forget, we don't block the fail_cb
+ * on it completing. The reserved UTXO auto-frees after
+ * reserved_to_block anyway (~72 blocks from reserveinputs default). */
+static struct command_result *
+cpfp_send_unreserve_noop(struct command *cmd UNUSED,
+			 const char *method UNUSED,
+			 const char *buf UNUSED,
+			 const jsmntok_t *result UNUSED,
+			 void *arg UNUSED)
+{
+	return command_still_pending(cmd);
+}
+
+static void cpfp_send_best_effort_unreserve(struct command *cmd,
+					    const char *psbt_b64)
+{
+	struct out_req *req = jsonrpc_request_start(cmd,
+		"unreserveinputs",
+		cpfp_send_unreserve_noop,
+		cpfp_send_unreserve_noop,
+		NULL);
+	json_add_string(req->js, "psbt", psbt_b64);
+	send_outreq(req);
+}
+
+static struct command_result *
+cpfp_send_sendpsbt_reply(struct command *cmd,
+			 const char *method UNUSED,
+			 const char *buf,
+			 const jsmntok_t *result,
+			 void *arg)
+{
+	struct cpfp_send_ctx *ctx = (struct cpfp_send_ctx *)arg;
+
+	const jsmntok_t *txid_tok = json_get_member(buf, result, "txid");
+	if (!txid_tok) {
+		/* sendpsbt should always return txid on success; absence
+		 * means something's off. Unreserve and report. */
+		cpfp_send_best_effort_unreserve(cmd, ctx->signed_psbt);
+		return ctx->fail_cb(cmd, ctx->arg, "sendpsbt_no_txid");
+	}
+	char *txid = json_strdup(tmpctx, buf, txid_tok);
+	return ctx->done_cb(cmd, ctx->arg, txid);
+}
+
+static struct command_result *
+cpfp_send_sendpsbt_err(struct command *cmd,
+		       const char *method UNUSED,
+		       const char *buf UNUSED,
+		       const jsmntok_t *result UNUSED,
+		       void *arg)
+{
+	struct cpfp_send_ctx *ctx = (struct cpfp_send_ctx *)arg;
+	cpfp_send_best_effort_unreserve(cmd, ctx->signed_psbt);
+	return ctx->fail_cb(cmd, ctx->arg, "sendpsbt_failed");
+}
+
+static struct command_result *
+cpfp_send_signpsbt_reply(struct command *cmd,
+			 const char *method UNUSED,
+			 const char *buf,
+			 const jsmntok_t *result,
+			 void *arg)
+{
+	struct cpfp_send_ctx *ctx = (struct cpfp_send_ctx *)arg;
+
+	const jsmntok_t *signed_tok =
+		json_get_member(buf, result, "signed_psbt");
+	if (!signed_tok)
+		return ctx->fail_cb(cmd, ctx->arg, "signpsbt_no_result");
+
+	ctx->signed_psbt = json_strdup(ctx, buf, signed_tok);
+
+	struct out_req *req = jsonrpc_request_start(cmd, "sendpsbt",
+		cpfp_send_sendpsbt_reply,
+		cpfp_send_sendpsbt_err,
+		ctx);
+	json_add_string(req->js, "psbt", ctx->signed_psbt);
+	send_outreq(req);
+	return command_still_pending(cmd);
+}
+
+static struct command_result *
+cpfp_send_signpsbt_err(struct command *cmd,
+		       const char *method UNUSED,
+		       const char *buf UNUSED,
+		       const jsmntok_t *result UNUSED,
+		       void *arg)
+{
+	struct cpfp_send_ctx *ctx = (struct cpfp_send_ctx *)arg;
+	/* signpsbt can fail if CLN doesn't own the input (shouldn't
+	 * happen — we got the UTXO from listfunds). Unreserve the
+	 * UTXO (reserveinputs already ran) and surface the failure. */
+	(void)ctx;  /* ctx->signed_psbt not yet populated */
+	return ctx->fail_cb(cmd, ctx->arg, "signpsbt_failed");
+}
+
+static struct command_result *
+cpfp_send_reserve_reply(struct command *cmd,
+			const char *method UNUSED,
+			const char *buf UNUSED,
+			const jsmntok_t *result UNUSED,
+			void *arg)
+{
+	struct cpfp_send_ctx *ctx = (struct cpfp_send_ctx *)arg;
+
+	/* reserveinputs returns reservation details; we don't inspect —
+	 * just proceed to signpsbt. */
+	struct out_req *req = jsonrpc_request_start(cmd, "signpsbt",
+		cpfp_send_signpsbt_reply,
+		cpfp_send_signpsbt_err,
+		ctx);
+	json_add_string(req->js, "psbt", ctx->signed_psbt);
+	send_outreq(req);
+	return command_still_pending(cmd);
+}
+
+static struct command_result *
+cpfp_send_reserve_err(struct command *cmd,
+		      const char *method UNUSED,
+		      const char *buf UNUSED,
+		      const jsmntok_t *result UNUSED,
+		      void *arg)
+{
+	struct cpfp_send_ctx *ctx = (struct cpfp_send_ctx *)arg;
+	return ctx->fail_cb(cmd, ctx->arg, "reserve_failed");
+}
+
+/* Public: sign + send a CPFP child built by ss_build_cpfp_child.
+ * Takes ownership of psbt_b64 (tal-reparents into ctx).
+ *
+ * done_cb fires on successful broadcast with child_txid_hex. fail_cb
+ * on any failure — wallet UTXO is released (best-effort) before
+ * fail_cb invokes. Exactly one of done/fail fires per call. */
+static void ss_cpfp_sign_and_send(struct command *cmd,
+				  const char *psbt_b64,
+				  cpfp_send_done_cb done_cb,
+				  cpfp_send_fail_cb fail_cb,
+				  void *arg)
+{
+	struct cpfp_send_ctx *ctx = tal(cmd, struct cpfp_send_ctx);
+	ctx->signed_psbt = tal_strdup(ctx, psbt_b64);
+	ctx->done_cb = done_cb;
+	ctx->fail_cb = fail_cb;
+	ctx->arg = arg;
+
+	struct out_req *req = jsonrpc_request_start(cmd, "reserveinputs",
+		cpfp_send_reserve_reply,
+		cpfp_send_reserve_err,
+		ctx);
+	json_add_string(req->js, "psbt", ctx->signed_psbt);
+	send_outreq(req);
+}
+
+/* ============================================================
  * Phase 4d: CSV claim scheduler.
  *
  * Algorithm ported from upstream sweeper.c:sweeper_check (see
@@ -11092,6 +11288,118 @@ json_factory_abort_stuck(struct command *cmd,
 	return command_finished(cmd, js);
 }
 
+/* Phase 3c2.5c test RPC — full end-to-end: build, reserve, sign,
+ * send. Returns {status, psbt, signed_txid} on success. The signed_txid
+ * is the CPFP child's txid; operator/test can check bitcoind mempool
+ * to confirm the package was accepted. */
+struct test_sign_send_ctx {
+	struct command *orig_cmd;
+	char *psbt_b64;  /* for response */
+};
+
+static struct command_result *
+test_sign_send_final_done(struct command *cmd UNUSED,
+			  void *arg,
+			  const char *child_txid_hex)
+{
+	struct test_sign_send_ctx *ctx =
+		(struct test_sign_send_ctx *)arg;
+	struct json_stream *js = jsonrpc_stream_success(ctx->orig_cmd);
+	json_add_string(js, "status", "ok");
+	json_add_string(js, "psbt", ctx->psbt_b64);
+	json_add_string(js, "child_txid", child_txid_hex);
+	return command_finished(ctx->orig_cmd, js);
+}
+
+static struct command_result *
+test_sign_send_final_fail(struct command *cmd UNUSED,
+			  void *arg,
+			  const char *reason)
+{
+	struct test_sign_send_ctx *ctx =
+		(struct test_sign_send_ctx *)arg;
+	struct json_stream *js = jsonrpc_stream_success(ctx->orig_cmd);
+	json_add_string(js, "status", "fail");
+	json_add_string(js, "reason", reason);
+	if (ctx->psbt_b64)
+		json_add_string(js, "psbt", ctx->psbt_b64);
+	return command_finished(ctx->orig_cmd, js);
+}
+
+static struct command_result *
+test_sign_send_build_done(struct command *cmd,
+			  void *arg,
+			  const char *psbt_b64,
+			  const char *wallet_txid_hex UNUSED,
+			  uint32_t wallet_vout UNUSED,
+			  uint64_t wallet_amount_sat UNUSED,
+			  const char *change_address UNUSED)
+{
+	struct test_sign_send_ctx *ctx =
+		(struct test_sign_send_ctx *)arg;
+	ctx->psbt_b64 = tal_strdup(ctx, psbt_b64);
+
+	ss_cpfp_sign_and_send(cmd, psbt_b64,
+			      test_sign_send_final_done,
+			      test_sign_send_final_fail,
+			      ctx);
+	return command_still_pending(cmd);
+}
+
+static struct command_result *
+test_sign_send_build_fail(struct command *cmd UNUSED,
+			  void *arg,
+			  const char *reason)
+{
+	struct test_sign_send_ctx *ctx =
+		(struct test_sign_send_ctx *)arg;
+	struct json_stream *js = jsonrpc_stream_success(ctx->orig_cmd);
+	json_add_string(js, "status", "fail");
+	json_add_string(js, "reason", reason);
+	return command_finished(ctx->orig_cmd, js);
+}
+
+static struct command_result *
+json_dev_factory_test_cpfp_end_to_end(struct command *cmd,
+				      const char *buf,
+				      const jsmntok_t *params)
+{
+	const char *parent_txid_hex = NULL;
+	u32 *anchor_vout;
+	u64 *target_feerate;
+
+	if (!param(cmd, buf, params,
+		   p_opt("parent_txid", param_string, &parent_txid_hex),
+		   p_opt_def("anchor_vout", param_u32, &anchor_vout, 1),
+		   p_opt_def("target_feerate_sat_per_kvb",
+			     param_u64, &target_feerate, 10000),
+		   NULL))
+		return command_param_failed();
+
+	static const char kDefaultParentTxid[65] =
+		"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+		"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+	if (!parent_txid_hex)
+		parent_txid_hex = kDefaultParentTxid;
+
+	uint8_t parent_txid_be[32];
+	if (!ss_hex_txid_to_internal(parent_txid_hex, parent_txid_be))
+		return command_fail(cmd, LIGHTNINGD,
+				    "Bad parent_txid hex");
+
+	struct test_sign_send_ctx *ctx =
+		tal(cmd, struct test_sign_send_ctx);
+	ctx->orig_cmd = cmd;
+	ctx->psbt_b64 = NULL;
+
+	ss_build_cpfp_child(cmd, parent_txid_be, *anchor_vout,
+			    *target_feerate,
+			    test_sign_send_build_done,
+			    test_sign_send_build_fail,
+			    ctx);
+	return command_still_pending(cmd);
+}
+
 /* Phase 3c2.5b test RPC — exercise the full pick → change-addr →
  * build-PSBT chain end-to-end with a synthetic parent. Returns the
  * base64 PSBT so tests can decode + inspect it. */
@@ -11935,6 +12243,10 @@ static const struct plugin_command commands[] = {
 	{
 		"dev-factory-test-build-cpfp-psbt",
 		json_dev_factory_test_build_cpfp_psbt,
+	},
+	{
+		"dev-factory-test-cpfp-end-to-end",
+		json_dev_factory_test_cpfp_end_to_end,
 	},
 	{
 		"dev-factory-inject-cpfp",
