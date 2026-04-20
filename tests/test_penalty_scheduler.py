@@ -65,10 +65,14 @@ def test_inject_penalty_persists_record(ss_node_factory):
     assert p["state"] == "broadcast"  # set by register_pending_penalty
 
 
-def test_scheduler_bumps_feerate_as_urgency_approaches(ss_node_factory):
-    """tick the scheduler near the CSV deadline — upstream
-    htlc_fee_bump enters the urgent window and should_bump returns
-    true. We assert last_feerate increased between ticks."""
+def test_scheduler_rebroadcasts_burn_each_tick(ss_node_factory):
+    """Phase 3c-redux: scheduler rebroadcasts the burn TX every block
+    while the entry is BROADCAST. No fee math (burn TX is 100%-fee by
+    construction); just rebroadcast for liveness against propagation
+    failures. With no lib_factory in this fixture the scheduler can't
+    actually build the burn, so 'bumps' stays 0 — but the entry must
+    persist in BROADCAST state across ticks (no spurious transitions
+    away from rebroadcast-eligible)."""
     lsp = ss_node_factory.get_node()
     iid = _create_factory(lsp)
 
@@ -81,22 +85,16 @@ def test_scheduler_bumps_feerate_as_urgency_approaches(ss_node_factory):
         "first_broadcast_block": 500,
     })
 
-    # Without a real lib_factory loaded, the scheduler can't actually
-    # rebuild a burn TX — it will skip the broadcast path. But it still
-    # runs htlc_fee_bump_should_bump and logs. We assert the `bumps`
-    # count returned reflects what the scheduler decided. With no
-    # lib_factory, bumps stays 0 but the log line will show the
-    # intended feerate.
+    # Two ticks well within CSV window — entry stays BROADCAST.
     r1 = lsp.rpc.call("dev-factory-tick-scheduler",
                       {"instance_id": iid, "block_height": 600})
     r2 = lsp.rpc.call("dev-factory-tick-scheduler",
-                      {"instance_id": iid, "block_height": 996})
+                      {"instance_id": iid, "block_height": 900})
 
-    # Both ticks returned a response (scheduler ran without crashing).
-    # The urgent-window log line at height 996 is the ground truth;
-    # we assert the RPC responses are well-formed.
     assert r1["n_pending_penalties"] == 1
     assert r2["n_pending_penalties"] == 1
+    fs = _factory(lsp, iid)
+    assert fs["pending_penalties"][0]["state"] == "broadcast"
 
 
 def test_mark_confirmed_sets_signal_and_stops_bumps(ss_node_factory):

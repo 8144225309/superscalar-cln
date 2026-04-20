@@ -7631,25 +7631,34 @@ static void ss_launch_state_tx_scan(struct command *cmd,
 }
 
 /* ============================================================
- * Phase 3c: penalty pathway + fee bumping.
+ * Phase 3c (with 3c-redux simplification): penalty pathway.
  *
  * When the classifier fires CLOSED_BREACHED, the broadcast sites in
- * breach_utxo_checked have already sent a burn TX. We record that
- * broadcast as a pending_penalty_t and then let the per-block
- * scheduler (ss_penalty_scheduler_tick) re-evaluate it every block:
- *   - if unconfirmed and the scheduled feerate has risen ≥25%, RBF
- *   - if <6 blocks from the CSV deadline, bump every block (urgent)
- *   - if confirmed, stop rebroadcasting and set SIGNAL_PENALTY_CONFIRMED
- *   - if CSV deadline passed without confirm, mark PENALTY_STATE_REPLACED
- *     (we lost the race; counterparty can claim)
+ * breach_utxo_checked send a burn TX (factory_build_burn_tx). The
+ * penalty is RECORDED here as pending_penalty_t and the per-block
+ * scheduler (ss_penalty_scheduler_tick) just rebroadcasts it every
+ * block until confirmation:
+ *   - PENDING/BROADCAST: rebroadcast burn TX, idempotent on bitcoind
+ *   - CONFIRMED: stop, set SIGNAL_PENALTY_CONFIRMED (via mark RPC)
+ *   - REPLACED: lost the race (CSV + grace passed without confirm)
+ *   - STALE: source UTXO replaced via RBF (Phase 4b)
  *
- * Fee math is delegated to upstream SuperScalar's htlc_fee_bump.c
- * (linked in via the slim extraction list). We do NOT reimplement the
- * LND-style linear-fee function — see feedback_reuse_superscalar_upstream.
+ * Phase 3c-redux note: the original Phase 3c integrated upstream
+ * htlc_fee_bump.c for RBF-style feerate scheduling. This was
+ * misapplied — burn TXs are 100%-fee by construction (output is
+ * OP_RETURN with 0 sats; entire L-stock value becomes miner fee), so
+ * "feerate" doesn't apply in the htlc_fee_bump sense. The simplified
+ * scheduler just rebroadcasts; the 100% fee guarantees next-block
+ * confirmation barring catastrophic mempool conditions.
+ *
+ * htlc_fee_bump.c stays linked because Phase 3c2 (CPFP-via-anchor for
+ * dist/state/kickoff TXs) will use it for the CHILD's fee scheduling
+ * — that IS a real fee-bump scenario (the parent is pre-signed and
+ * non-RBF-able; the CPFP child carries the bump fee).
  *
  * Reorg resilience: if a previously-confirmed penalty txid disappears
- * from the chain (verified via gettxout), we reset confirmed_block=0
- * and kick the scheduler to rebroadcast.
+ * from the chain (Phase 4e ss_penalty_reorg_check), we reset
+ * confirmed_block=0 and the scheduler resumes rebroadcasting.
  * ============================================================ */
 
 /* Default CSV delay on L-stock outputs — upstream SuperScalar uses
@@ -7715,51 +7724,42 @@ static void ss_register_pending_penalty(factory_instance_t *fi,
 		   tx_vsize);
 }
 
-/* Turn a pending_penalty_t into an htlc_fee_bump_t so we can ask
- * upstream's fee scheduler "should we bump now?". Recomputed every
- * tick from persisted state — we don't hold the fb_t across calls
- * because htlc_fee_bump is a pure-function API. */
-static void ss_penalty_to_fb(const pending_penalty_t *pp,
-			     htlc_fee_bump_t *fb)
-{
-	memset(fb, 0, sizeof(*fb));
-	/* Init via the library's own initialiser. budget_pct=50 matches the
-	 * HTLC_FEE_BUMP_DEFAULT_BUDGET_PCT — half of the L-stock value is
-	 * the cap on our fee spend. tx_vsize is what we used at build
-	 * time. start_feerate seeded at 1000 sat/kvB (1 sat/vB); the
-	 * scheduler will escalate from there up to the budget cap as the
-	 * CSV deadline approaches. */
-	htlc_fee_bump_init(fb,
-			   pp->first_broadcast_block,
-			   pp->csv_unlock_block,
-			   pp->lstock_sats,
-			   HTLC_FEE_BUMP_DEFAULT_BUDGET_PCT,
-			   pp->tx_vsize ? pp->tx_vsize : LSTOCK_BURN_VSIZE_DEFAULT,
-			   1000);
-	fb->last_feerate = pp->last_feerate;
-	fb->last_bump_block = pp->last_broadcast_block;
-	if (pp->confirmed_block) {
-		fb->confirmed = 1;
-		fb->confirm_block = pp->confirmed_block;
-	}
-}
+/* Phase 3c-redux: grace blocks past CSV after which we mark a
+ * still-unconfirmed burn as REPLACED. CSV is when counterparty CAN
+ * claim; we give a small buffer for our 100%-fee burn to land before
+ * conceding. ~6 blocks (~1 hour) is generous: a 100%-fee TX confirms
+ * in 1 block barring extreme mempool backpressure. */
+#define BURN_TX_GRACE_BLOCKS 6
 
-/* Per-block scheduler. Called from handle_block_added for each factory
- * with pending penalties. Walks every entry and:
- *   - skips confirmed + replaced entries
- *   - if should_bump per upstream's fee scheduler, triggers a (logical)
- *     rebroadcast. The actual tx bytes come from re-running
- *     factory_build_burn_tx for the epoch/leaf. For v1, we just LOG the
- *     intent; the next commit will wire the actual rebroadcast. That
- *     keeps this PR's surface area narrow — algorithm + persistence
- *     first, broadcast integration second.
+/* Phase 3c-redux: per-block burn-TX scheduler. SIMPLIFIED from the
+ * original Phase 3c htlc_fee_bump-based RBF logic. Burn TXs are
+ * 100%-fee-by-construction — factory_build_burn_tx outputs OP_RETURN
+ * with 0 sats, so the entire L-stock value (e.g., 100k sats) becomes
+ * miner fee. There is no fee to "bump"; miners are maximally
+ * incentivized to mine these immediately. The original RBF math
+ * (htlc_fee_bump_should_bump, urgency window, 25% min-bump) doesn't
+ * apply — that mechanism is for HTLC sweep TXs whose fee is a small
+ * fraction of HTLC value.
  *
- * Returns the number of entries that would have been bumped. */
+ * What this scheduler actually does:
+ *   - PENDING/BROADCAST entries: rebroadcast burn TX every block via
+ *     ss_broadcast_factory_tx. Idempotent on bitcoind's side
+ *     (already-known reply handled by the broadcast classifier).
+ *   - CONFIRMED/REPLACED/STALE: skip (terminal-ish).
+ *   - Past CSV + grace without confirm: mark REPLACED (we lost the
+ *     race; counterparty can claim the L-stock outputs).
+ *
+ * pp->last_feerate / pp->tx_vsize remain in the struct as diagnostic
+ * fields written at registration time but no longer drive scheduling.
+ * (Kept for persist v12 backward compat — see Phase 3c-redux.)
+ *
+ * Returns count of broadcasts triggered. */
 static int ss_penalty_scheduler_tick(struct command *cmd,
 				     factory_instance_t *fi,
 				     uint32_t current_block)
 {
 	int bumps = 0;
+	bool dirty = false;
 	for (size_t i = 0; i < fi->n_pending_penalties; i++) {
 		pending_penalty_t *pp = &fi->pending_penalties[i];
 		if (pp->state == PENALTY_STATE_CONFIRMED
@@ -7767,85 +7767,60 @@ static int ss_penalty_scheduler_tick(struct command *cmd,
 		    || pp->state == PENALTY_STATE_STALE)
 			continue;
 
-		htlc_fee_bump_t fb;
-		ss_penalty_to_fb(pp, &fb);
-
-		if (htlc_fee_bump_is_expired(&fb, current_block)) {
-			if (pp->state != PENALTY_STATE_REPLACED) {
-				pp->state = PENALTY_STATE_REPLACED;
-				/* LOG_UNUSUAL not LOG_BROKEN: an adversarial
-				 * outcome (we lost the race), not a plugin
-				 * internal bug. pyln-testing treats BROKEN as
-				 * a fatal teardown error. */
-				plugin_log(plugin_handle, LOG_UNUSUAL,
-					   "PENALTY EXPIRED: epoch=%u leaf=%d "
-					   "CSV at block %u passed without "
-					   "our burn confirming. Counterparty "
-					   "can now claim the revoked output.",
-					   pp->epoch, pp->leaf_index,
-					   pp->csv_unlock_block);
-			}
+		/* Past CSV + grace and still not confirmed → we lost. */
+		if (pp->csv_unlock_block > 0
+		    && current_block >= pp->csv_unlock_block
+				        + BURN_TX_GRACE_BLOCKS) {
+			pp->state = PENALTY_STATE_REPLACED;
+			plugin_log(plugin_handle, LOG_UNUSUAL,
+				   "PENALTY EXPIRED: epoch=%u leaf=%d CSV at "
+				   "block %u + %u grace passed without our "
+				   "100%%-fee burn confirming. Counterparty "
+				   "can now claim the revoked output.",
+				   pp->epoch, pp->leaf_index,
+				   pp->csv_unlock_block,
+				   BURN_TX_GRACE_BLOCKS);
+			dirty = true;
 			continue;
 		}
 
-		if (!htlc_fee_bump_should_bump(&fb, current_block))
+		/* Don't churn — only one rebroadcast per block. */
+		if (pp->last_broadcast_block == current_block)
 			continue;
 
-		uint64_t scheduled_feerate =
-			htlc_fee_bump_calc_feerate(&fb, current_block);
-		int urgent = htlc_fee_bump_is_urgent(&fb, current_block);
-		uint32_t remaining =
-			htlc_fee_bump_blocks_remaining(&fb, current_block);
-
-		plugin_log(plugin_handle, LOG_INFORM,
-			   "penalty_scheduler: bump epoch=%u leaf=%d "
-			   "urgent=%d blocks_remaining=%u feerate=%"PRIu64
-			   " sat/kvB (last %"PRIu64" sat/kvB) — "
-			   "rebroadcast pending",
-			   pp->epoch, pp->leaf_index, urgent, remaining,
-			   scheduled_feerate, pp->last_feerate);
-
-		/* Rebroadcast: re-run factory_build_burn_tx for this
-		 * (epoch, leaf_index), broadcast via ss_broadcast_factory_tx,
-		 * update pp->last_feerate + last_broadcast_block. The
-		 * function is idempotent from bitcoind's perspective — a
-		 * second sendrawtransaction of the same burn returns
-		 * "already known" or "already in mempool/chain", which the
-		 * broadcast-reply classifier handles cleanly. */
 		factory_t *f = (factory_t *)fi->lib_factory;
-		if (f && pp->leaf_index >= 0
-		    && (size_t)pp->leaf_index < f->n_nodes) {
-			factory_node_t *leaf = &f->nodes[pp->leaf_index];
-			if (leaf->n_outputs > 0) {
-				uint32_t lstock_vout =
-					(uint32_t)(leaf->n_outputs - 1);
-				uint64_t lstock_amt =
-					leaf->outputs[lstock_vout].amount_sats;
+		if (!f || pp->leaf_index < 0
+		    || (size_t)pp->leaf_index >= f->n_nodes)
+			continue;
+		factory_node_t *leaf = &f->nodes[pp->leaf_index];
+		if (leaf->n_outputs == 0)
+			continue;
+		uint32_t lstock_vout = (uint32_t)(leaf->n_outputs - 1);
+		uint64_t lstock_amt = leaf->outputs[lstock_vout].amount_sats;
 
-				tx_buf_t burn_tx;
-				tx_buf_init(&burn_tx, 256);
-				if (factory_build_burn_tx(f, &burn_tx,
-							  leaf->txid,
-							  lstock_vout,
-							  lstock_amt,
-							  pp->epoch)) {
-					char *burn_hex = tal_arr(cmd, char,
-						burn_tx.len * 2 + 1);
-					for (size_t h = 0; h < burn_tx.len; h++)
-						sprintf(burn_hex + h*2, "%02x",
-							burn_tx.data[h]);
-					ss_broadcast_factory_tx(cmd, fi,
-								burn_hex,
-								FACTORY_TX_BURN);
-					pp->last_feerate = scheduled_feerate;
-					pp->last_broadcast_block = current_block;
-					bumps++;
-				}
-				tx_buf_free(&burn_tx);
-			}
+		tx_buf_t burn_tx;
+		tx_buf_init(&burn_tx, 256);
+		if (factory_build_burn_tx(f, &burn_tx, leaf->txid,
+					  lstock_vout, lstock_amt,
+					  pp->epoch)) {
+			char *burn_hex = tal_arr(cmd, char,
+				burn_tx.len * 2 + 1);
+			for (size_t h = 0; h < burn_tx.len; h++)
+				sprintf(burn_hex + h*2, "%02x",
+					burn_tx.data[h]);
+			ss_broadcast_factory_tx(cmd, fi, burn_hex,
+						FACTORY_TX_BURN);
+			pp->last_broadcast_block = current_block;
+			bumps++;
+			dirty = true;
+			plugin_log(plugin_handle, LOG_DBG,
+				   "penalty_scheduler: rebroadcast burn "
+				   "epoch=%u leaf=%d at block %u",
+				   pp->epoch, pp->leaf_index, current_block);
 		}
+		tx_buf_free(&burn_tx);
 	}
-	if (bumps > 0)
+	if (dirty)
 		ss_save_factory(cmd, fi);
 	return bumps;
 }
