@@ -6208,6 +6208,185 @@ static struct command_result *json_factory_list(struct command *cmd,
 	return command_finished(cmd, js);
 }
 
+/* Phase 5c: operator observability.
+ *
+ * factory-metrics aggregates counts across all factories and their
+ * pending_* sub-arrays into a single structured response suitable
+ * for scraping into a monitoring pipeline. Zero side effects — pure
+ * walk of in-memory state.
+ *
+ * Output shape:
+ *   {
+ *     "current_blockheight": N,
+ *     "factories": { "total": N,
+ *                    "by_lifecycle": { "active": N, "dying": N, ... },
+ *                    "total_custody_sats": N },
+ *     "penalties": { "total": N, "by_state": {...}, "highest_*_block": N },
+ *     "cpfps":     { "total": N, "by_state": {...} },
+ *     "sweeps":    { "total": N, "by_state": {...}, "n_failed": N }
+ *   }
+ *
+ * Consumers should alert on:
+ *   - sweeps.n_failed > 0 (operator must investigate)
+ *   - penalties.by_state.pending > 0 (breach detected but not broadcast)
+ *   - factories.by_lifecycle.dying > 0 sustained (stuck force-close)
+ */
+/* sweep_state_name and cpfp_state_name are already forward-declared
+ * near the top of this file; they're defined with the scheduler
+ * blocks below. We only add lifecycle_name_ext + penalty_state_name
+ * here since those have no pre-existing stringifier. */
+static const char *lifecycle_name_ext(factory_lifecycle_t l)
+{
+	switch (l) {
+	case FACTORY_LIFECYCLE_INIT:               return "init";
+	case FACTORY_LIFECYCLE_ACTIVE:             return "active";
+	case FACTORY_LIFECYCLE_DYING:              return "dying";
+	case FACTORY_LIFECYCLE_EXPIRED:            return "expired";
+	case FACTORY_LIFECYCLE_CLOSED_EXTERNALLY:  return "closed_externally";
+	case FACTORY_LIFECYCLE_CLOSED_COOPERATIVE: return "closed_cooperative";
+	case FACTORY_LIFECYCLE_CLOSED_UNILATERAL:  return "closed_unilateral";
+	case FACTORY_LIFECYCLE_CLOSED_BREACHED:    return "closed_breached";
+	case FACTORY_LIFECYCLE_ABORTED:            return "aborted";
+	default:                                    return "unknown";
+	}
+}
+
+static const char *penalty_state_name(uint8_t s)
+{
+	switch (s) {
+	case PENALTY_STATE_PENDING:   return "pending";
+	case PENALTY_STATE_BROADCAST: return "broadcast";
+	case PENALTY_STATE_CONFIRMED: return "confirmed";
+	case PENALTY_STATE_REPLACED:  return "replaced";
+	case PENALTY_STATE_STALE:     return "stale";
+	default:                       return "unknown";
+	}
+}
+
+static struct command_result *json_factory_metrics(struct command *cmd,
+						   const char *buf,
+						   const jsmntok_t *params)
+{
+	if (!param(cmd, buf, params, NULL))
+		return command_param_failed();
+
+	/* Lifecycle enumeration covers 9 discrete values — index by enum. */
+	#define LIFECYCLE_SLOTS 9
+	unsigned int by_lifecycle[LIFECYCLE_SLOTS] = {0};
+	uint64_t total_custody = 0;
+
+	/* For penalties + sweeps we know the state enum bounds; use a
+	 * fixed-size bucket that's zero-initialized and walk all values. */
+	unsigned int pen_by_state[8] = {0};
+	unsigned int cpfp_by_state[8] = {0};
+	unsigned int swp_by_state[8] = {0};
+	unsigned int n_penalties = 0, n_cpfps = 0, n_sweeps = 0;
+	unsigned int n_sweeps_failed = 0;
+
+	uint32_t highest_breach_block = 0;
+	uint32_t highest_burn_confirm_block = 0;
+	uint32_t highest_sweep_broadcast_block = 0;
+
+	for (size_t i = 0; i < ss_state.n_factories; i++) {
+		factory_instance_t *fi = ss_state.factories[i];
+		unsigned int lc_idx = (unsigned int)fi->lifecycle;
+		if (lc_idx < LIFECYCLE_SLOTS)
+			by_lifecycle[lc_idx]++;
+
+		if (fi->lifecycle == FACTORY_LIFECYCLE_ACTIVE
+		    || fi->lifecycle == FACTORY_LIFECYCLE_DYING
+		    || fi->lifecycle == FACTORY_LIFECYCLE_INIT)
+			total_custody += fi->funding_amount_sats;
+
+		for (size_t k = 0; k < fi->n_pending_penalties; k++) {
+			pending_penalty_t *pp = &fi->pending_penalties[k];
+			n_penalties++;
+			if (pp->state < 8) pen_by_state[pp->state]++;
+			/* first_broadcast_block proxies "breach response":
+			 * the moment we reacted to a detected breach by
+			 * broadcasting the burn TX. confirmed_block tracks
+			 * when the burn landed on chain. */
+			if (pp->first_broadcast_block > highest_breach_block)
+				highest_breach_block = pp->first_broadcast_block;
+			if (pp->confirmed_block > highest_burn_confirm_block)
+				highest_burn_confirm_block = pp->confirmed_block;
+		}
+
+		for (size_t k = 0; k < fi->n_pending_cpfps; k++) {
+			pending_cpfp_t *pc = &fi->pending_cpfps[k];
+			n_cpfps++;
+			if (pc->state < 8) cpfp_by_state[pc->state]++;
+		}
+
+		for (size_t k = 0; k < fi->n_pending_sweeps; k++) {
+			pending_sweep_t *ps = &fi->pending_sweeps[k];
+			n_sweeps++;
+			if (ps->state < 8) swp_by_state[ps->state]++;
+			if (ps->state == SWEEP_STATE_FAILED) n_sweeps_failed++;
+			if (ps->broadcast_block > highest_sweep_broadcast_block)
+				highest_sweep_broadcast_block = ps->broadcast_block;
+		}
+	}
+
+	struct json_stream *js = jsonrpc_stream_success(cmd);
+	json_add_u32(js, "current_blockheight", ss_state.current_blockheight);
+
+	json_object_start(js, "factories");
+	json_add_u32(js, "total", (u32)ss_state.n_factories);
+	json_add_u64(js, "total_custody_sats", total_custody);
+	json_object_start(js, "by_lifecycle");
+	for (unsigned int e = 0; e < LIFECYCLE_SLOTS; e++) {
+		if (by_lifecycle[e] > 0)
+			json_add_u32(js,
+				lifecycle_name_ext((factory_lifecycle_t)e),
+				by_lifecycle[e]);
+	}
+	json_object_end(js);
+	json_object_end(js);
+
+	json_object_start(js, "penalties");
+	json_add_u32(js, "total", n_penalties);
+	json_add_u32(js, "highest_burn_first_broadcast_block", highest_breach_block);
+	json_add_u32(js, "highest_burn_confirmed_block",
+		     highest_burn_confirm_block);
+	json_object_start(js, "by_state");
+	for (unsigned int s = 0; s < 8; s++) {
+		if (pen_by_state[s] > 0)
+			json_add_u32(js, penalty_state_name((uint8_t)s),
+				     pen_by_state[s]);
+	}
+	json_object_end(js);
+	json_object_end(js);
+
+	json_object_start(js, "cpfps");
+	json_add_u32(js, "total", n_cpfps);
+	json_object_start(js, "by_state");
+	for (unsigned int s = 0; s < 8; s++) {
+		if (cpfp_by_state[s] > 0)
+			json_add_u32(js, cpfp_state_name((uint8_t)s),
+				     cpfp_by_state[s]);
+	}
+	json_object_end(js);
+	json_object_end(js);
+
+	json_object_start(js, "sweeps");
+	json_add_u32(js, "total", n_sweeps);
+	json_add_u32(js, "n_failed", n_sweeps_failed);
+	json_add_u32(js, "highest_broadcast_block",
+		     highest_sweep_broadcast_block);
+	json_object_start(js, "by_state");
+	for (unsigned int s = 0; s < 8; s++) {
+		if (swp_by_state[s] > 0)
+			json_add_u32(js, sweep_state_name((uint8_t)s),
+				     swp_by_state[s]);
+	}
+	json_object_end(js);
+	json_object_end(js);
+
+	return command_finished(cmd, js);
+	#undef LIFECYCLE_SLOTS
+}
+
 /* factory-close RPC — LSP initiates cooperative close.
  * Splits factory value equally among participants (demo). */
 static struct command_result *json_factory_close(struct command *cmd,
@@ -13527,6 +13706,10 @@ static const struct plugin_command commands[] = {
 	{
 		"factory-list",
 		json_factory_list,
+	},
+	{
+		"factory-metrics",
+		json_factory_metrics,
 	},
 	{
 		"factory-rotate",
