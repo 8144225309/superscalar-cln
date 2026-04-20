@@ -16,7 +16,14 @@ from __future__ import annotations
 
 
 def _funded_lsp(ss_node_factory):
-    lsp = ss_node_factory.get_node()
+    # broken_log regex: our tests use synthetic parent_txid ("aaaa...")
+    # which doesn't exist on chain. When reserveinputs runs, CLN tries
+    # to validate the input and emits BROKEN "No transaction found for
+    # UTXO <txid>". That's expected in these scaffolding tests — the
+    # full end-to-end with a real parent is a Phase 5b regtest concern.
+    lsp = ss_node_factory.get_node(
+        broken_log=r"No transaction found for UTXO"
+    )
     lsp.fundwallet(10_000_000)
     return lsp
 
