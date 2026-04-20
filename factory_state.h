@@ -209,6 +209,52 @@ typedef struct {
 	uint8_t  reserved[4];      /* pad — keeps on-disk size stable */
 } pending_sweep_t;
 
+/* Phase 3c2: CPFP-via-anchor pipeline.
+ *
+ * For pre-signed multi-party TXs (dist TX broadcast at expiry, state
+ * TX in DYING cascade, kickoff in DYING cascade), the parent fee is
+ * baked in at signing time. If the network feerate has risen since
+ * signing, the parent gets stuck in mempool. Bitcoin-Core 28+ supports
+ * P2A (Pay-to-Anchor, BIP-431) outputs; upstream factory.c emits them
+ * on dist/state/kickoff TXs. We CPFP-bump by spending the anchor +
+ * a wallet UTXO in a child TX with high fee, amortized over the
+ * parent+child package.
+ *
+ * Reference: upstream watchtower.c:watchtower_build_cpfp_tx (1305 LOC
+ * of full impl with wallet_source_t vtable). Our Phase 3c2 v1 lands
+ * the state machine + scheduler + dev RPCs; v2 (3c2.5) adds the
+ * actual wally PSBT construction + CLN signpsbt RPC chain. */
+#define MAX_PENDING_CPFPS 8
+
+typedef enum {
+	CPFP_STATE_PENDING   = 0, /* parent broadcast, child not yet built */
+	CPFP_STATE_BROADCAST = 1, /* child in mempool, awaiting confirm */
+	CPFP_STATE_CONFIRMED = 2, /* parent + child both confirmed */
+	CPFP_STATE_FAILED    = 3, /* wallet input unavailable / construction failed */
+	CPFP_STATE_RESOLVED  = 4, /* parent confirmed without our help (network bumped) */
+} cpfp_state_t;
+
+typedef enum {
+	CPFP_PARENT_DIST    = 0, /* expiry-broadcast distribution TX */
+	CPFP_PARENT_STATE   = 1, /* DW cascade state TX */
+	CPFP_PARENT_KICKOFF = 2, /* DW cascade kickoff */
+} cpfp_parent_kind_t;
+
+typedef struct {
+	uint8_t  parent_kind;       /* cpfp_parent_kind_t */
+	uint8_t  state;             /* cpfp_state_t */
+	uint8_t  parent_txid[32];   /* parent we're CPFP'ing (internal BE) */
+	uint32_t parent_vout_anchor;/* P2A anchor vout (typically 1) */
+	uint64_t parent_value_at_stake; /* budget basis for fee allocation */
+	uint32_t parent_broadcast_block;
+	uint32_t deadline_block;    /* when we MUST get the parent confirmed */
+	uint8_t  cpfp_txid[32];     /* our CPFP child (zero = not built yet) */
+	uint32_t cpfp_broadcast_block;
+	uint64_t cpfp_last_feerate; /* sat/kvB on last child broadcast */
+	uint32_t parent_confirmed_block; /* 0 if parent unconfirmed */
+	uint8_t  reserved[4];       /* pad */
+} pending_cpfp_t;
+
 /* Per-epoch breach data */
 typedef struct {
 	uint32_t epoch;
@@ -307,6 +353,14 @@ typedef struct factory_instance {
 	 * lives in the sweep-type-specific handler (Phase 4d2). */
 	pending_sweep_t pending_sweeps[MAX_PENDING_SWEEPS];
 	size_t n_pending_sweeps;
+
+	/* Phase 3c2: pending CPFP-via-anchor records. Populated when we
+	 * broadcast a parent TX with a P2A anchor output (dist, state,
+	 * kickoff). Per-block scheduler ticks fee math via
+	 * htlc_fee_bump_t and (in 3c2.5) builds + broadcasts a CPFP
+	 * child spending the parent's anchor + a wallet UTXO. */
+	pending_cpfp_t pending_cpfps[MAX_PENDING_CPFPS];
+	size_t n_pending_cpfps;
 
 	/* Rotation */
 	bool rotation_in_progress;

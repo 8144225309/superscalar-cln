@@ -90,8 +90,9 @@ size_t ss_persist_serialize_meta(const factory_instance_t *fi, uint8_t **out)
 	 *      (watcher Phase 3c)
 	 *  v11 adds pending_sweeps array for CSV claim scheduler
 	 *      (watcher Phase 4d)
-	 *  v12 adds aborted_at_block (watcher Phase 4c) */
-	buf_u8(&buf, &len, &cap, 12);
+	 *  v12 adds aborted_at_block (watcher Phase 4c)
+	 *  v13 adds pending_cpfps array (watcher Phase 3c2) */
+	buf_u8(&buf, &len, &cap, 13);
 
 	/* Identity */
 	buf_append(&buf, &len, &cap, fi->instance_id, 32);
@@ -286,6 +287,37 @@ size_t ss_persist_serialize_meta(const factory_instance_t *fi, uint8_t **out)
 
 	/* v12: Phase 4c aborted_at_block. 0 = never aborted. */
 	buf_u32(&buf, &len, &cap, fi->aborted_at_block);
+
+	/* v13: Phase 3c2 pending_cpfps. u8 count then per-entry block. */
+	buf_u8(&buf, &len, &cap, (uint8_t)fi->n_pending_cpfps);
+	for (size_t i = 0; i < fi->n_pending_cpfps; i++) {
+		const pending_cpfp_t *pc = &fi->pending_cpfps[i];
+		buf_u8(&buf, &len, &cap, pc->parent_kind);
+		buf_u8(&buf, &len, &cap, pc->state);
+		buf_append(&buf, &len, &cap, pc->parent_txid, 32);
+		buf_u32(&buf, &len, &cap, pc->parent_vout_anchor);
+		{
+			uint64_t a = pc->parent_value_at_stake;
+			uint8_t ab[8] = { (a>>56)&0xFF, (a>>48)&0xFF,
+					   (a>>40)&0xFF, (a>>32)&0xFF,
+					   (a>>24)&0xFF, (a>>16)&0xFF,
+					   (a>>8)&0xFF, a&0xFF };
+			buf_append(&buf, &len, &cap, ab, 8);
+		}
+		buf_u32(&buf, &len, &cap, pc->parent_broadcast_block);
+		buf_u32(&buf, &len, &cap, pc->deadline_block);
+		buf_append(&buf, &len, &cap, pc->cpfp_txid, 32);
+		buf_u32(&buf, &len, &cap, pc->cpfp_broadcast_block);
+		{
+			uint64_t a = pc->cpfp_last_feerate;
+			uint8_t ab[8] = { (a>>56)&0xFF, (a>>48)&0xFF,
+					   (a>>40)&0xFF, (a>>32)&0xFF,
+					   (a>>24)&0xFF, (a>>16)&0xFF,
+					   (a>>8)&0xFF, a&0xFF };
+			buf_append(&buf, &len, &cap, ab, 8);
+		}
+		buf_u32(&buf, &len, &cap, pc->parent_confirmed_block);
+	}
 
 	*out = buf;
 	return len;
@@ -623,6 +655,66 @@ bool ss_persist_deserialize_meta(factory_instance_t *fi,
 	if (version >= 12) {
 		if (!read_u32(&p, &rem, &fi->aborted_at_block))
 			return false;
+	}
+
+	/* v13: Phase 3c2 pending_cpfps. Pre-v13 records default to empty. */
+	fi->n_pending_cpfps = 0;
+	memset(fi->pending_cpfps, 0, sizeof(fi->pending_cpfps));
+	if (version >= 13) {
+		uint8_t n_cp;
+		if (!read_u8(&p, &rem, &n_cp))
+			return false;
+		if (n_cp > MAX_PENDING_CPFPS)
+			return false;
+		for (uint8_t i = 0; i < n_cp; i++) {
+			pending_cpfp_t *pc = &fi->pending_cpfps[i];
+			if (!read_u8(&p, &rem, &pc->parent_kind))
+				return false;
+			if (!read_u8(&p, &rem, &pc->state)) return false;
+			if (!read_bytes(&p, &rem, pc->parent_txid, 32))
+				return false;
+			if (!read_u32(&p, &rem, &pc->parent_vout_anchor))
+				return false;
+			{
+				uint8_t ab[8];
+				if (!read_bytes(&p, &rem, ab, 8))
+					return false;
+				pc->parent_value_at_stake =
+					((uint64_t)ab[0] << 56) |
+					((uint64_t)ab[1] << 48) |
+					((uint64_t)ab[2] << 40) |
+					((uint64_t)ab[3] << 32) |
+					((uint64_t)ab[4] << 24) |
+					((uint64_t)ab[5] << 16) |
+					((uint64_t)ab[6] <<  8) |
+					 (uint64_t)ab[7];
+			}
+			if (!read_u32(&p, &rem, &pc->parent_broadcast_block))
+				return false;
+			if (!read_u32(&p, &rem, &pc->deadline_block))
+				return false;
+			if (!read_bytes(&p, &rem, pc->cpfp_txid, 32))
+				return false;
+			if (!read_u32(&p, &rem, &pc->cpfp_broadcast_block))
+				return false;
+			{
+				uint8_t ab[8];
+				if (!read_bytes(&p, &rem, ab, 8))
+					return false;
+				pc->cpfp_last_feerate =
+					((uint64_t)ab[0] << 56) |
+					((uint64_t)ab[1] << 48) |
+					((uint64_t)ab[2] << 40) |
+					((uint64_t)ab[3] << 32) |
+					((uint64_t)ab[4] << 24) |
+					((uint64_t)ab[5] << 16) |
+					((uint64_t)ab[6] <<  8) |
+					 (uint64_t)ab[7];
+			}
+			if (!read_u32(&p, &rem, &pc->parent_confirmed_block))
+				return false;
+		}
+		fi->n_pending_cpfps = n_cp;
 	}
 
 	return true;

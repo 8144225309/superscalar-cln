@@ -67,6 +67,10 @@ static void ss_broadcast_factory_tx(struct command *cmd,
 static const char *sweep_state_name(uint8_t s);
 static const char *sweep_type_name(uint8_t t);
 
+/* Phase 3c2: CPFP-state name helpers used by factory-list. */
+static const char *cpfp_state_name(uint8_t s);
+static const char *cpfp_parent_kind_name(uint8_t k);
+
 /* Phase 4c: blocks an INIT factory must remain stuck before we log a
  * warning. ~1 day at 10-min blocks. Operator decides whether to abort. */
 #define FACTORY_INIT_STUCK_BLOCKS 144
@@ -5908,6 +5912,52 @@ static struct command_result *json_factory_list(struct command *cmd,
 			json_array_end(js);
 		}
 
+		/* Phase 3c2: pending CPFPs surfaced for operator visibility
+		 * into the anchor-bumping pipeline. */
+		if (fi->n_pending_cpfps > 0) {
+			json_array_start(js, "pending_cpfps");
+			for (size_t ci = 0; ci < fi->n_pending_cpfps; ci++) {
+				pending_cpfp_t *pc =
+					&fi->pending_cpfps[ci];
+				json_object_start(js, NULL);
+				json_add_string(js, "parent_kind",
+					cpfp_parent_kind_name(pc->parent_kind));
+				json_add_string(js, "state",
+					cpfp_state_name(pc->state));
+				{
+					char thex[65];
+					for (int j = 0; j < 32; j++)
+						sprintf(thex + j*2, "%02x",
+							pc->parent_txid[31-j]);
+					thex[64] = '\0';
+					json_add_string(js, "parent_txid",
+							thex);
+				}
+				json_add_u32(js, "parent_vout_anchor",
+					     pc->parent_vout_anchor);
+				json_add_u64(js, "parent_value_at_stake",
+					     pc->parent_value_at_stake);
+				json_add_u32(js, "parent_broadcast_block",
+					     pc->parent_broadcast_block);
+				json_add_u32(js, "deadline_block",
+					     pc->deadline_block);
+				if (pc->parent_confirmed_block)
+					json_add_u32(js,
+						"parent_confirmed_block",
+						pc->parent_confirmed_block);
+				if (pc->cpfp_broadcast_block)
+					json_add_u32(js,
+						"cpfp_broadcast_block",
+						pc->cpfp_broadcast_block);
+				if (pc->cpfp_last_feerate)
+					json_add_u64(js,
+						"cpfp_last_feerate",
+						pc->cpfp_last_feerate);
+				json_object_end(js);
+			}
+			json_array_end(js);
+		}
+
 		/* Phase 4d: pending sweeps surfaced for operator visibility
 		 * into the CSV claim pipeline. */
 		if (fi->n_pending_sweeps > 0) {
@@ -8095,6 +8145,191 @@ static int ss_penalty_source_check(struct command *cmd,
 }
 
 /* ============================================================
+ * Phase 3c2: CPFP-via-anchor scheduler.
+ *
+ * For pre-signed multi-party TXs (dist, state, kickoff) that carry
+ * P2A anchor outputs (per upstream factory.c construction). When the
+ * parent gets stuck in mempool, we CPFP-bump by spending the anchor
+ * + a wallet UTXO in a child TX with high fee. Bitcoin Core 28+
+ * package relay (BIP-431) carries the bump fee back to the parent.
+ *
+ * State machine:
+ *   PENDING   — parent broadcast, child not yet built
+ *   BROADCAST — child in mempool, awaiting parent confirm
+ *   CONFIRMED — parent + child both confirmed (≥1 conf each)
+ *   FAILED    — wallet had no suitable UTXO; will retry next block
+ *   RESOLVED  — parent confirmed without our help (network bumped)
+ *
+ * V1 (this PR): state machine + scheduler + dev RPCs + persistence.
+ *   ss_cpfp_scheduler_tick walks entries, decides "should we bump"
+ *   via htlc_fee_bump_t, and LOGS the intended action. Actual TX
+ *   construction + wallet integration is Phase 3c2.5.
+ *
+ * V2 (Phase 3c2.5): build the child TX with libwally PSBT, sign the
+ *   wallet input via CLN signpsbt RPC, broadcast via
+ *   ss_broadcast_factory_tx. References upstream watchtower.c:
+ *   watchtower_build_cpfp_tx (lines 964-1080).
+ *
+ * ============================================================ */
+
+/* Estimated vsize of CPFP child: P2A anchor input + 1 wallet input
+ * (taproot keypath) + 1 P2TR change output. Matches upstream's
+ * WATCHTOWER_CPFP_CHILD_VSIZE = 264. */
+#define CPFP_CHILD_VSIZE_DEFAULT 264
+
+/* Blocks a parent must remain unconfirmed before we trigger a CPFP.
+ * Conservative — most parents confirm within 1-3 blocks at correct
+ * sign-time feerate. Only fire CPFP when we're past that. */
+#define CPFP_TRIGGER_THRESHOLD_BLOCKS 6
+
+static const char *cpfp_state_name(uint8_t s)
+{
+	switch (s) {
+	case CPFP_STATE_PENDING:   return "pending";
+	case CPFP_STATE_BROADCAST: return "broadcast";
+	case CPFP_STATE_CONFIRMED: return "confirmed";
+	case CPFP_STATE_FAILED:    return "failed";
+	case CPFP_STATE_RESOLVED:  return "resolved";
+	default:                   return "unknown";
+	}
+}
+
+static const char *cpfp_parent_kind_name(uint8_t k)
+{
+	switch (k) {
+	case CPFP_PARENT_DIST:    return "dist";
+	case CPFP_PARENT_STATE:   return "state";
+	case CPFP_PARENT_KICKOFF: return "kickoff";
+	default:                  return "unknown";
+	}
+}
+
+/* Register a parent TX with anchor for CPFP monitoring. Dedup by
+ * parent_txid. Called from dist/state/kickoff broadcast sites. */
+static void ss_register_pending_cpfp(factory_instance_t *fi,
+				     uint8_t parent_kind,
+				     const uint8_t *parent_txid,
+				     uint32_t anchor_vout,
+				     uint64_t value_at_stake,
+				     uint32_t deadline_block,
+				     uint32_t current_block)
+{
+	for (size_t i = 0; i < fi->n_pending_cpfps; i++) {
+		pending_cpfp_t *e = &fi->pending_cpfps[i];
+		if (memcmp(e->parent_txid, parent_txid, 32) == 0) {
+			/* Already tracking; refresh deadline if caller knows
+			 * better. Don't reset state — preserve any
+			 * already-broadcast child. */
+			if (deadline_block > e->deadline_block)
+				e->deadline_block = deadline_block;
+			return;
+		}
+	}
+
+	if (fi->n_pending_cpfps >= MAX_PENDING_CPFPS) {
+		plugin_log(plugin_handle, LOG_UNUSUAL,
+			   "pending_cpfp: cap reached (%d) — parent not "
+			   "tracked for CPFP",
+			   MAX_PENDING_CPFPS);
+		return;
+	}
+
+	pending_cpfp_t *pc = &fi->pending_cpfps[fi->n_pending_cpfps++];
+	memset(pc, 0, sizeof(*pc));
+	pc->parent_kind = parent_kind;
+	pc->state = CPFP_STATE_PENDING;
+	memcpy(pc->parent_txid, parent_txid, 32);
+	pc->parent_vout_anchor = anchor_vout;
+	pc->parent_value_at_stake = value_at_stake;
+	pc->parent_broadcast_block = current_block;
+	pc->deadline_block = deadline_block;
+
+	plugin_log(plugin_handle, LOG_INFORM,
+		   "pending_cpfp registered: kind=%s anchor_vout=%u "
+		   "stake=%"PRIu64" deadline=%u",
+		   cpfp_parent_kind_name(parent_kind), anchor_vout,
+		   value_at_stake, deadline_block);
+}
+
+/* Per-block CPFP scheduler tick. Walks pending_cpfps and for each
+ * entry where the parent is stuck > CPFP_TRIGGER_THRESHOLD_BLOCKS,
+ * computes the target feerate via htlc_fee_bump and (in V2) builds
+ * + broadcasts a CPFP child. V1 logs the intent. Returns intended-
+ * bump count. */
+static int ss_cpfp_scheduler_tick(struct command *cmd,
+				  factory_instance_t *fi,
+				  uint32_t current_block)
+{
+	int intents = 0;
+	bool dirty = false;
+
+	for (size_t i = 0; i < fi->n_pending_cpfps; i++) {
+		pending_cpfp_t *pc = &fi->pending_cpfps[i];
+		if (pc->state == CPFP_STATE_CONFIRMED
+		    || pc->state == CPFP_STATE_RESOLVED)
+			continue;
+
+		/* Parent confirmed without us? V2 will check via getrawtx;
+		 * for V1, rely on dev RPC to mark this. */
+		if (pc->parent_confirmed_block > 0
+		    && pc->state != CPFP_STATE_BROADCAST) {
+			pc->state = CPFP_STATE_RESOLVED;
+			plugin_log(plugin_handle, LOG_INFORM,
+				   "cpfp: parent kind=%s confirmed at block %u "
+				   "without our help (RESOLVED)",
+				   cpfp_parent_kind_name(pc->parent_kind),
+				   pc->parent_confirmed_block);
+			dirty = true;
+			continue;
+		}
+
+		/* Not yet stuck enough to warrant CPFP. */
+		if (current_block < pc->parent_broadcast_block
+		                    + CPFP_TRIGGER_THRESHOLD_BLOCKS)
+			continue;
+
+		/* Compute target feerate via htlc_fee_bump. Budget is 25%
+		 * of value_at_stake (defensive — anchor CPFP is cheap). */
+		htlc_fee_bump_t fb;
+		htlc_fee_bump_init(&fb,
+				   pc->parent_broadcast_block,
+				   pc->deadline_block ? pc->deadline_block
+				                      : current_block + 144,
+				   pc->parent_value_at_stake,
+				   25, /* budget pct */
+				   CPFP_CHILD_VSIZE_DEFAULT,
+				   1000);
+		fb.last_feerate = pc->cpfp_last_feerate;
+		fb.last_bump_block = pc->cpfp_broadcast_block;
+
+		if (!htlc_fee_bump_should_bump(&fb, current_block))
+			continue;
+
+		uint64_t target_feerate =
+			htlc_fee_bump_calc_feerate(&fb, current_block);
+
+		plugin_log(plugin_handle, LOG_INFORM,
+			   "cpfp_scheduler: WOULD BUMP kind=%s parent_vout=%u "
+			   "target_feerate=%"PRIu64" sat/kvB last=%"PRIu64
+			   " sat/kvB blocks_remaining=%u (Phase 3c2.5 will "
+			   "actually build + broadcast the child)",
+			   cpfp_parent_kind_name(pc->parent_kind),
+			   pc->parent_vout_anchor,
+			   target_feerate, pc->cpfp_last_feerate,
+			   htlc_fee_bump_blocks_remaining(&fb, current_block));
+
+		/* V1 stub: would-have-broadcast intent recorded. V2 will
+		 * call ss_build_and_broadcast_cpfp_child(...) here, then
+		 * update last_feerate + broadcast_block on success. */
+		intents++;
+	}
+
+	if (dirty)
+		ss_save_factory(cmd, fi);
+	return intents;
+}
+
+/* ============================================================
  * Phase 4d: CSV claim scheduler.
  *
  * Algorithm ported from upstream sweeper.c:sweeper_check (see
@@ -8794,6 +9029,14 @@ static struct command_result *handle_block_added(struct command *cmd,
 		 * array. */
 		if (fi->n_pending_sweeps > 0) {
 			ss_sweep_scheduler_tick(cmd, fi,
+				ss_state.current_blockheight);
+		}
+
+		/* Phase 3c2: CPFP-via-anchor scheduler tick. Walks pending
+		 * cpfps for parents that are stuck and would benefit from a
+		 * child. V1 logs intents; V2 (3c2.5) will build + broadcast. */
+		if (fi->n_pending_cpfps > 0) {
+			ss_cpfp_scheduler_tick(cmd, fi,
 				ss_state.current_blockheight);
 		}
 
@@ -10296,6 +10539,176 @@ json_factory_abort_stuck(struct command *cmd,
 	return command_finished(cmd, js);
 }
 
+/* dev-factory-inject-cpfp — test-only hook for Phase 3c2. Registers
+ * a synthetic pending_cpfp_t so tests can drive the scheduler without
+ * a real chain interaction. */
+static struct command_result *
+json_dev_factory_inject_cpfp(struct command *cmd,
+			     const char *buf,
+			     const jsmntok_t *params)
+{
+	const char *id_hex;
+	const char *kind_str;
+	u32 *anchor_vout;
+	u64 *value_at_stake;
+	u32 *deadline_block;
+	u32 *parent_broadcast_block;
+
+	if (!param(cmd, buf, params,
+		   p_req("instance_id", param_string, &id_hex),
+		   p_req("kind", param_string, &kind_str),
+		   p_req("anchor_vout", param_u32, &anchor_vout),
+		   p_req("value_at_stake", param_u64, &value_at_stake),
+		   p_req("deadline_block", param_u32, &deadline_block),
+		   p_opt("parent_broadcast_block", param_u32,
+			 &parent_broadcast_block),
+		   NULL))
+		return command_param_failed();
+
+	if (strlen(id_hex) != 64)
+		return command_fail(cmd, LIGHTNINGD, "Bad instance_id");
+
+	uint8_t instance_id[32];
+	for (int j = 0; j < 32; j++) {
+		unsigned int b;
+		if (sscanf(id_hex + j*2, "%02x", &b) != 1)
+			return command_fail(cmd, LIGHTNINGD,
+					    "Bad instance_id hex");
+		instance_id[j] = (uint8_t)b;
+	}
+
+	factory_instance_t *fi = ss_factory_find(&ss_state, instance_id);
+	if (!fi)
+		return command_fail(cmd, LIGHTNINGD, "Factory not found");
+
+	uint8_t kind = CPFP_PARENT_DIST;
+	if (!strcmp(kind_str, "dist"))    kind = CPFP_PARENT_DIST;
+	else if (!strcmp(kind_str, "state"))   kind = CPFP_PARENT_STATE;
+	else if (!strcmp(kind_str, "kickoff")) kind = CPFP_PARENT_KICKOFF;
+	else
+		return command_fail(cmd, LIGHTNINGD,
+				    "Unknown CPFP kind '%s'", kind_str);
+
+	uint8_t fake_txid[32];
+	memset(fake_txid, 0, 32);
+	fake_txid[0] = 0xc9; fake_txid[1] = 0xfb;
+	fake_txid[28] = (uint8_t)(*anchor_vout & 0xFF);
+	fake_txid[29] = kind;
+	fake_txid[30] = (uint8_t)((*deadline_block >> 8) & 0xFF);
+	fake_txid[31] = (uint8_t)(*deadline_block & 0xFF);
+
+	uint32_t start = parent_broadcast_block
+		? *parent_broadcast_block
+		: ss_state.current_blockheight;
+
+	ss_register_pending_cpfp(fi, kind, fake_txid, *anchor_vout,
+				 *value_at_stake, *deadline_block, start);
+	ss_save_factory(cmd, fi);
+
+	struct json_stream *js = jsonrpc_stream_success(cmd);
+	json_add_string(js, "instance_id", id_hex);
+	json_add_u32(js, "n_pending_cpfps", (u32)fi->n_pending_cpfps);
+	return command_finished(cmd, js);
+}
+
+/* dev-factory-tick-cpfp-scheduler — drive the CPFP scheduler at a
+ * caller-supplied block height. */
+static struct command_result *
+json_dev_factory_tick_cpfp_scheduler(struct command *cmd,
+				     const char *buf,
+				     const jsmntok_t *params)
+{
+	const char *id_hex;
+	u32 *block_height;
+
+	if (!param(cmd, buf, params,
+		   p_req("instance_id", param_string, &id_hex),
+		   p_req("block_height", param_u32, &block_height),
+		   NULL))
+		return command_param_failed();
+
+	if (strlen(id_hex) != 64)
+		return command_fail(cmd, LIGHTNINGD, "Bad instance_id");
+
+	uint8_t instance_id[32];
+	for (int j = 0; j < 32; j++) {
+		unsigned int b;
+		if (sscanf(id_hex + j*2, "%02x", &b) != 1)
+			return command_fail(cmd, LIGHTNINGD,
+					    "Bad instance_id hex");
+		instance_id[j] = (uint8_t)b;
+	}
+
+	factory_instance_t *fi = ss_factory_find(&ss_state, instance_id);
+	if (!fi)
+		return command_fail(cmd, LIGHTNINGD, "Factory not found");
+
+	int intents = ss_cpfp_scheduler_tick(cmd, fi, *block_height);
+
+	struct json_stream *js = jsonrpc_stream_success(cmd);
+	json_add_string(js, "instance_id", id_hex);
+	json_add_u32(js, "block_height", *block_height);
+	json_add_u32(js, "intents", (u32)intents);
+	json_add_u32(js, "n_pending_cpfps", (u32)fi->n_pending_cpfps);
+	return command_finished(cmd, js);
+}
+
+/* dev-factory-mark-cpfp-parent-confirmed — flip parent_confirmed_block
+ * and let scheduler resolve to RESOLVED state. */
+static struct command_result *
+json_dev_factory_mark_cpfp_parent_confirmed(struct command *cmd,
+					    const char *buf,
+					    const jsmntok_t *params)
+{
+	const char *id_hex;
+	u32 *anchor_vout;
+	u32 *confirmed_block;
+
+	if (!param(cmd, buf, params,
+		   p_req("instance_id", param_string, &id_hex),
+		   p_req("anchor_vout", param_u32, &anchor_vout),
+		   p_req("confirmed_block", param_u32, &confirmed_block),
+		   NULL))
+		return command_param_failed();
+
+	if (strlen(id_hex) != 64)
+		return command_fail(cmd, LIGHTNINGD, "Bad instance_id");
+
+	uint8_t instance_id[32];
+	for (int j = 0; j < 32; j++) {
+		unsigned int b;
+		if (sscanf(id_hex + j*2, "%02x", &b) != 1)
+			return command_fail(cmd, LIGHTNINGD,
+					    "Bad instance_id hex");
+		instance_id[j] = (uint8_t)b;
+	}
+
+	factory_instance_t *fi = ss_factory_find(&ss_state, instance_id);
+	if (!fi)
+		return command_fail(cmd, LIGHTNINGD, "Factory not found");
+
+	pending_cpfp_t *pc = NULL;
+	for (size_t i = 0; i < fi->n_pending_cpfps; i++) {
+		if (fi->pending_cpfps[i].parent_vout_anchor
+		    == *anchor_vout) {
+			pc = &fi->pending_cpfps[i];
+			break;
+		}
+	}
+	if (!pc)
+		return command_fail(cmd, LIGHTNINGD,
+				    "No pending CPFP for anchor_vout=%u",
+				    *anchor_vout);
+
+	pc->parent_confirmed_block = *confirmed_block;
+	ss_save_factory(cmd, fi);
+
+	struct json_stream *js = jsonrpc_stream_success(cmd);
+	json_add_string(js, "instance_id", id_hex);
+	json_add_u32(js, "parent_confirmed_block", *confirmed_block);
+	return command_finished(cmd, js);
+}
+
 /* factory-source-check — operator-facing RPC that probes the source
  * UTXO each pending burn-TX spends. Flips matching pending_penalty
  * entries to STALE if the source is gone (state TX RBF'd). Phase 4b. */
@@ -10758,6 +11171,18 @@ static const struct plugin_command commands[] = {
 	{
 		"factory-abort-stuck",
 		json_factory_abort_stuck,
+	},
+	{
+		"dev-factory-inject-cpfp",
+		json_dev_factory_inject_cpfp,
+	},
+	{
+		"dev-factory-tick-cpfp-scheduler",
+		json_dev_factory_tick_cpfp_scheduler,
+	},
+	{
+		"dev-factory-mark-cpfp-parent-confirmed",
+		json_dev_factory_mark_cpfp_parent_confirmed,
 	},
 	{
 		"factory-create",
