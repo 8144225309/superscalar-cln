@@ -54,6 +54,16 @@ typedef enum {
 	FACTORY_LIFECYCLE_CLOSED_COOPERATIVE = 5, /* Reserved — Phase 2 */
 	FACTORY_LIFECYCLE_CLOSED_UNILATERAL = 6,  /* Reserved — Phase 2 */
 	FACTORY_LIFECYCLE_CLOSED_BREACHED = 7,    /* Reserved — Phase 2+3 */
+	FACTORY_LIFECYCLE_ABORTED = 8,            /* Phase 4c: ceremony stalled
+						   * indefinitely (typically
+						   * counterparty never
+						   * responded). Operator-
+						   * triggered via
+						   * factory-abort-stuck.
+						   * Funded ABORTED factories
+						   * recover via the existing
+						   * CLTV unilateral exit at
+						   * factory expiry. */
 } factory_lifecycle_t;
 
 /* Helper: a factory in any closed terminal state should not be scanned,
@@ -64,7 +74,8 @@ static inline bool factory_is_closed(factory_lifecycle_t l) {
 	    || l == FACTORY_LIFECYCLE_CLOSED_EXTERNALLY
 	    || l == FACTORY_LIFECYCLE_CLOSED_COOPERATIVE
 	    || l == FACTORY_LIFECYCLE_CLOSED_UNILATERAL
-	    || l == FACTORY_LIFECYCLE_CLOSED_BREACHED;
+	    || l == FACTORY_LIFECYCLE_CLOSED_BREACHED
+	    || l == FACTORY_LIFECYCLE_ABORTED;
 }
 
 /* Phase 2a: values for factory_instance_t.closed_by. Stored as uint8_t
@@ -324,6 +335,13 @@ typedef struct factory_instance {
 	 * show "zombie since block N" and forensics can line up with chain
 	 * history. */
 	uint32_t closed_externally_at_block;
+
+	/* Phase 4c: block at which an operator (or auto-detector) flipped
+	 * this factory to ABORTED via factory-abort-stuck. 0 means
+	 * never aborted. Used by factory-list to show "aborted at block N"
+	 * and by future auto-recovery to schedule unilateral CLTV exit
+	 * once factory expiry is reached. */
+	uint32_t aborted_at_block;
 
 	/* Phase 2a: spending-TX identification.
 	 *

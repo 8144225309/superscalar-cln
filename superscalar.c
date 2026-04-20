@@ -67,6 +67,10 @@ static void ss_broadcast_factory_tx(struct command *cmd,
 static const char *sweep_state_name(uint8_t s);
 static const char *sweep_type_name(uint8_t t);
 
+/* Phase 4c: blocks an INIT factory must remain stuck before we log a
+ * warning. ~1 day at 10-min blocks. Operator decides whether to abort. */
+#define FACTORY_INIT_STUCK_BLOCKS 144
+
 
 /* bLIP-56 factory message type */
 /* ODD type = CLN allows it through connectd without any fork changes.
@@ -5818,10 +5822,21 @@ static struct command_result *json_factory_list(struct command *cmd,
 				? "closed_unilateral" :
 			fi->lifecycle == FACTORY_LIFECYCLE_CLOSED_BREACHED
 				? "closed_breached" :
+			fi->lifecycle == FACTORY_LIFECYCLE_ABORTED
+				? "aborted" :
 			"unknown");
 		if (fi->closed_externally_at_block > 0)
 			json_add_u32(js, "closed_externally_at_block",
 				     fi->closed_externally_at_block);
+		if (fi->aborted_at_block > 0)
+			json_add_u32(js, "aborted_at_block",
+				     fi->aborted_at_block);
+		if (fi->lifecycle == FACTORY_LIFECYCLE_INIT
+		    && fi->creation_block > 0
+		    && ss_state.current_blockheight >= fi->creation_block)
+			json_add_u32(js, "blocks_in_init",
+				     ss_state.current_blockheight
+				     - fi->creation_block);
 
 		/* Phase 2a classification output. Only render when we have
 		 * something meaningful — all-zero spending_txid means the
@@ -8806,6 +8821,35 @@ static struct command_result *handle_block_added(struct command *cmd,
 			ss_sweep_scheduler_tick(cmd, fi,
 				ss_state.current_blockheight);
 		}
+
+		/* Phase 4c: stuck-INIT detection. Once per
+		 * FACTORY_INIT_STUCK_BLOCKS interval beyond creation, log a
+		 * loud warning. We don't auto-abort — operator decides
+		 * (some ceremonies legitimately take a long time over slow
+		 * networks). The warning_close_triggered flag is reused
+		 * here as a one-shot per-restart latch so the warning
+		 * doesn't spam every block. */
+		if (fi->lifecycle == FACTORY_LIFECYCLE_INIT
+		    && fi->creation_block > 0
+		    && !fi->warning_close_triggered
+		    && ss_state.current_blockheight
+		       >= fi->creation_block + FACTORY_INIT_STUCK_BLOCKS) {
+			char iid_hex[65];
+			for (int j = 0; j < 32; j++)
+				sprintf(iid_hex + j*2, "%02x",
+					fi->instance_id[j]);
+			iid_hex[64] = '\0';
+			plugin_log(plugin_handle, LOG_UNUSUAL,
+				   "STUCK INIT: factory %s in lifecycle=INIT "
+				   "for %u blocks (since block %u). "
+				   "Counterparty likely never responded. "
+				   "Consider factory-abort-stuck %s.",
+				   iid_hex,
+				   ss_state.current_blockheight
+				     - fi->creation_block,
+				   fi->creation_block, iid_hex);
+			fi->warning_close_triggered = true;
+		}
 	}
 
 	/* Ladder lifecycle: advance block, evict expired factories,
@@ -9933,6 +9977,8 @@ static struct command_result *json_dev_factory_set_signal(struct command *cmd,
 			? "closed_unilateral" :
 		fi->lifecycle == FACTORY_LIFECYCLE_CLOSED_BREACHED
 			? "closed_breached" :
+		fi->lifecycle == FACTORY_LIFECYCLE_ABORTED
+			? "aborted" :
 		"unknown");
 	return command_finished(cmd, js);
 }
@@ -10189,6 +10235,89 @@ json_dev_factory_trigger_deep_unwind_scan(struct command *cmd,
 		json_add_string(js, "skipped", skip_reason);
 	else
 		json_add_string(js, "status", "scan_launched");
+	return command_finished(cmd, js);
+}
+
+/* factory-abort-stuck — operator-facing RPC. Flips an INIT factory to
+ * ABORTED. Use after determining the ceremony will never complete
+ * (counterparty won't respond). For factories with on-chain funding,
+ * the existing CLTV unilateral-exit path recovers funds at expiry —
+ * this RPC just removes the factory from active-watcher consideration
+ * and surfaces the abort timestamp for forensics.
+ *
+ * Refuses to abort non-INIT factories — those have closer-to-correct
+ * lifecycle labels already. */
+static struct command_result *
+json_factory_abort_stuck(struct command *cmd,
+			 const char *buf,
+			 const jsmntok_t *params)
+{
+	const char *id_hex;
+	bool *force;
+
+	if (!param(cmd, buf, params,
+		   p_req("instance_id", param_string, &id_hex),
+		   p_opt("force", param_bool, &force),
+		   NULL))
+		return command_param_failed();
+
+	if (strlen(id_hex) != 64)
+		return command_fail(cmd, LIGHTNINGD, "Bad instance_id");
+
+	uint8_t instance_id[32];
+	for (int j = 0; j < 32; j++) {
+		unsigned int b;
+		if (sscanf(id_hex + j*2, "%02x", &b) != 1)
+			return command_fail(cmd, LIGHTNINGD,
+					    "Bad instance_id hex");
+		instance_id[j] = (uint8_t)b;
+	}
+
+	factory_instance_t *fi = ss_factory_find(&ss_state, instance_id);
+	if (!fi)
+		return command_fail(cmd, LIGHTNINGD, "Factory not found");
+
+	if (fi->lifecycle != FACTORY_LIFECYCLE_INIT
+	    && !(force && *force))
+		return command_fail(cmd, LIGHTNINGD,
+				    "Factory lifecycle is %d, not INIT — "
+				    "use force=true to override",
+				    (int)fi->lifecycle);
+
+	bool has_funding = false;
+	for (int b = 0; b < 32; b++)
+		if (fi->funding_txid[b] != 0) {
+			has_funding = true; break;
+		}
+
+	factory_lifecycle_t prior = fi->lifecycle;
+	fi->lifecycle = FACTORY_LIFECYCLE_ABORTED;
+	fi->aborted_at_block = ss_state.current_blockheight;
+	ss_save_factory(cmd, fi);
+
+	plugin_log(plugin_handle, LOG_UNUSUAL,
+		   "factory-abort-stuck: instance_id=%s lifecycle %d → "
+		   "ABORTED at block %u. has_funding=%d. %s",
+		   id_hex, (int)prior, ss_state.current_blockheight,
+		   has_funding ? 1 : 0,
+		   has_funding
+		     ? "Funds are 2-of-2 multisig-locked; recover via the "
+		       "existing CLTV unilateral-exit path at factory "
+		       "expiry block."
+		     : "No on-chain funding to recover; safe to reap via "
+		       "factory-confirm-closed.");
+
+	struct json_stream *js = jsonrpc_stream_success(cmd);
+	json_add_string(js, "instance_id", id_hex);
+	json_add_string(js, "previous_lifecycle",
+		prior == FACTORY_LIFECYCLE_INIT ? "init" : "other");
+	json_add_string(js, "lifecycle", "aborted");
+	json_add_u32(js, "aborted_at_block",
+		     ss_state.current_blockheight);
+	json_add_bool(js, "has_on_chain_funding", has_funding);
+	if (has_funding)
+		json_add_string(js, "recovery_path",
+			"unilateral_cltv_exit_at_factory_expiry");
 	return command_finished(cmd, js);
 }
 
@@ -10650,6 +10779,10 @@ static const struct plugin_command commands[] = {
 	{
 		"factory-source-check",
 		json_factory_source_check,
+	},
+	{
+		"factory-abort-stuck",
+		json_factory_abort_stuck,
 	},
 	{
 		"factory-create",

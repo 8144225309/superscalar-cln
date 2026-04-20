@@ -89,8 +89,9 @@ size_t ss_persist_serialize_meta(const factory_instance_t *fi, uint8_t **out)
 	 *  v10 adds pending_penalties array for fee-bump scheduler
 	 *      (watcher Phase 3c)
 	 *  v11 adds pending_sweeps array for CSV claim scheduler
-	 *      (watcher Phase 4d) */
-	buf_u8(&buf, &len, &cap, 11);
+	 *      (watcher Phase 4d)
+	 *  v12 adds aborted_at_block (watcher Phase 4c) */
+	buf_u8(&buf, &len, &cap, 12);
 
 	/* Identity */
 	buf_append(&buf, &len, &cap, fi->instance_id, 32);
@@ -282,6 +283,9 @@ size_t ss_persist_serialize_meta(const factory_instance_t *fi, uint8_t **out)
 		buf_u32(&buf, &len, &cap, ps->broadcast_block);
 		buf_u32(&buf, &len, &cap, ps->sweep_confirmed_block);
 	}
+
+	/* v12: Phase 4c aborted_at_block. 0 = never aborted. */
+	buf_u32(&buf, &len, &cap, fi->aborted_at_block);
 
 	*out = buf;
 	return len;
@@ -611,6 +615,14 @@ bool ss_persist_deserialize_meta(factory_instance_t *fi,
 				return false;
 		}
 		fi->n_pending_sweeps = n_sw;
+	}
+
+	/* v12: Phase 4c aborted_at_block. Pre-v12 records default to 0
+	 * (never aborted). */
+	fi->aborted_at_block = 0;
+	if (version >= 12) {
+		if (!read_u32(&p, &rem, &fi->aborted_at_block))
+			return false;
 	}
 
 	return true;
