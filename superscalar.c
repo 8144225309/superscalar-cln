@@ -8662,7 +8662,11 @@ static char *ss_build_cpfp_child_psbt(
 		*err_out = "psbt_append_anchor";
 		return NULL;
 	}
-	psbt_input_set_wit_utxo(psbt, 0, CPFP_P2A_SPK, CPFP_P2A_SPK_LEN,
+	/* CLN's psbt_input_set_wit_utxo derives length from tal_count —
+	 * pass a tal_arr copy rather than the static const. */
+	u8 *anchor_spk_tal = tal_dup_arr(psbt, u8, CPFP_P2A_SPK,
+					 CPFP_P2A_SPK_LEN, 0);
+	psbt_input_set_wit_utxo(psbt, 0, anchor_spk_tal,
 				AMOUNT_SAT(CPFP_ANCHOR_AMOUNT_SAT));
 
 	/* Input 1: wallet UTXO. */
@@ -8676,7 +8680,9 @@ static char *ss_build_cpfp_child_psbt(
 		*err_out = "psbt_append_wallet";
 		return NULL;
 	}
-	psbt_input_set_wit_utxo(psbt, 1, wallet_spk, wallet_spk_len,
+	u8 *wallet_spk_tal = tal_dup_arr(psbt, u8, wallet_spk,
+					 wallet_spk_len, 0);
+	psbt_input_set_wit_utxo(psbt, 1, wallet_spk_tal,
 				AMOUNT_SAT(wallet_amount_sat));
 
 	/* Output 0: P2TR change back to wallet. */
@@ -11134,22 +11140,25 @@ json_dev_factory_test_build_cpfp_psbt(struct command *cmd,
 				      const char *buf,
 				      const jsmntok_t *params)
 {
-	const char *parent_txid_hex;
+	const char *parent_txid_hex = NULL;
 	u32 *anchor_vout;
 	u64 *target_feerate;
 
 	if (!param(cmd, buf, params,
-		   p_opt_def("parent_txid", param_string, &parent_txid_hex,
-			     /* synthetic default: 0xAA repeated */
-			     "aa" "aa" "aa" "aa" "aa" "aa" "aa" "aa"
-			     "aa" "aa" "aa" "aa" "aa" "aa" "aa" "aa"
-			     "aa" "aa" "aa" "aa" "aa" "aa" "aa" "aa"
-			     "aa" "aa" "aa" "aa" "aa" "aa" "aa" "aa"),
+		   p_opt("parent_txid", param_string, &parent_txid_hex),
 		   p_opt_def("anchor_vout", param_u32, &anchor_vout, 1),
 		   p_opt_def("target_feerate_sat_per_kvb",
 			     param_u64, &target_feerate, 10000),
 		   NULL))
 		return command_param_failed();
+
+	/* Default synthetic parent txid: 0xAA repeated. Used by tests
+	 * that don't care about the specific outpoint. */
+	static const char kDefaultParentTxid[65] =
+		"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+		"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+	if (!parent_txid_hex)
+		parent_txid_hex = kDefaultParentTxid;
 
 	uint8_t parent_txid_be[32];
 	if (!ss_hex_txid_to_internal(parent_txid_hex, parent_txid_be))
