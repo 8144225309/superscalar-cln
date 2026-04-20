@@ -19,6 +19,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include <secp256k1.h>
+
 /* Build a signed P2TR key-path sweep of a single input.
  *
  * On success, returns a malloc()'d hex string (NUL-terminated) that can
@@ -44,6 +46,7 @@
  *                       for the key-path spend.
  */
 char *ss_build_p2tr_keypath_sweep_hex(
+	secp256k1_context *ctx,
 	const uint8_t *source_txid32,
 	uint32_t source_vout,
 	uint64_t source_amount,

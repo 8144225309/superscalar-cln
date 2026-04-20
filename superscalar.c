@@ -9829,6 +9829,7 @@ ss_sweep_newaddr_reply(struct command *cmd,
 
 	uint8_t sweep_txid_out[32];
 	char *hex = ss_build_p2tr_keypath_sweep_hex(
+		global_secp_ctx,
 		ps->source_txid, ps->source_vout, ps->amount_sats,
 		our_sec, dest_spk, spk_len,
 		SS_SWEEP_DEFAULT_FEERATE_KVB, sweep_txid_out);

@@ -24,11 +24,8 @@
 extern void ss_sha256_tagged(const char *tag, const unsigned char *data,
 			     size_t data_len, unsigned char out[32]);
 
-/* Global secp context shared with the rest of the plugin. Defined in
- * superscalar.c. */
-extern secp256k1_context *global_secp_ctx;
-
 char *ss_build_p2tr_keypath_sweep_hex(
+	secp256k1_context *ctx,
 	const uint8_t *source_txid32,
 	uint32_t source_vout,
 	uint64_t source_amount,
@@ -38,7 +35,7 @@ char *ss_build_p2tr_keypath_sweep_hex(
 	uint64_t fee_per_kvb,
 	uint8_t sweep_txid_out[32])
 {
-	if (!source_txid32 || !internal_secret32 || !dest_spk || !global_secp_ctx)
+	if (!source_txid32 || !internal_secret32 || !dest_spk || !ctx)
 		return NULL;
 	if (dest_spk_len == 0 || dest_spk_len > sizeof(((tx_output_t *)0)->script_pubkey))
 		return NULL;
@@ -59,19 +56,19 @@ char *ss_build_p2tr_keypath_sweep_hex(
 
 	/* Derive the internal xonly pubkey from the secret. */
 	secp256k1_keypair kp;
-	if (!secp256k1_keypair_create(global_secp_ctx, &kp, internal_secret32))
+	if (!secp256k1_keypair_create(ctx, &kp, internal_secret32))
 		return NULL;
 
 	secp256k1_xonly_pubkey internal_xonly;
 	int parity = 0;
-	if (!secp256k1_keypair_xonly_pub(global_secp_ctx, &internal_xonly,
+	if (!secp256k1_keypair_xonly_pub(ctx, &internal_xonly,
 					 &parity, &kp)) {
 		memset(&kp, 0, sizeof(kp));
 		return NULL;
 	}
 
 	uint8_t internal_ser[32];
-	if (!secp256k1_xonly_pubkey_serialize(global_secp_ctx, internal_ser,
+	if (!secp256k1_xonly_pubkey_serialize(ctx, internal_ser,
 					      &internal_xonly)) {
 		memset(&kp, 0, sizeof(kp));
 		return NULL;
@@ -82,7 +79,7 @@ char *ss_build_p2tr_keypath_sweep_hex(
 	ss_sha256_tagged("TapTweak", internal_ser, 32, tweak);
 
 	/* Tweak the signing keypair in place. */
-	if (!secp256k1_keypair_xonly_tweak_add(global_secp_ctx, &kp, tweak)) {
+	if (!secp256k1_keypair_xonly_tweak_add(ctx, &kp, tweak)) {
 		memset(&kp, 0, sizeof(kp));
 		return NULL;
 	}
@@ -91,7 +88,7 @@ char *ss_build_p2tr_keypath_sweep_hex(
 	 * xonly pubkey is the output key; its 32-byte serialization sits
 	 * after 0x51 0x20 in the source scriptPubKey. */
 	secp256k1_xonly_pubkey output_xonly;
-	if (!secp256k1_keypair_xonly_pub(global_secp_ctx, &output_xonly,
+	if (!secp256k1_keypair_xonly_pub(ctx, &output_xonly,
 					 &parity, &kp)) {
 		memset(&kp, 0, sizeof(kp));
 		return NULL;
@@ -123,7 +120,7 @@ char *ss_build_p2tr_keypath_sweep_hex(
 	}
 
 	uint8_t sig[64];
-	if (!secp256k1_schnorrsig_sign32(global_secp_ctx, sig, sighash, &kp, NULL)) {
+	if (!secp256k1_schnorrsig_sign32(ctx, sig, sighash, &kp, NULL)) {
 		tx_buf_free(&unsigned_tx);
 		memset(&kp, 0, sizeof(kp));
 		return NULL;
