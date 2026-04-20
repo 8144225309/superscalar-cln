@@ -79,6 +79,13 @@ static void ss_scheduler_launch_cpfp(struct command *cmd,
 				     size_t pc_idx,
 				     uint64_t target_feerate);
 
+/* Phase 4b2: forward decl — state_scan_block_cb auto-invokes the
+ * burn rebuild path when a new epoch is identified after RBF. Helper
+ * lives in Phase 4b's block. */
+static int ss_rebuild_breach_burns(struct command *cmd,
+				   factory_instance_t *fi,
+				   uint32_t target_epoch);
+
 /* Phase 4c: blocks an INIT factory must remain stuck before we log a
  * warning. ~1 day at 10-min blocks. Operator decides whether to abort. */
 #define FACTORY_INIT_STUCK_BLOCKS 144
@@ -7628,6 +7635,8 @@ static struct command_result *state_scan_block_cb(struct command *cmd,
 			for (size_t i = 0; i < fi->n_history_kickoff_sigs; i++) {
 				if (memcmp(spending_txid,
 					   fi->history_state_root_txids[i], 32) == 0) {
+					uint32_t prev_match_epoch =
+						fi->state_tx_match_epoch;
 					fi->state_tx_match_epoch =
 						fi->history_kickoff_epochs[i];
 					fi->signals_observed |=
@@ -7640,6 +7649,21 @@ static struct command_result *state_scan_block_cb(struct command *cmd,
 						fi->state_tx_match_epoch,
 						fi->epoch);
 					ss_apply_signals(cmd, fi);
+
+					/* Phase 4b2: if the newly-matched epoch
+					 * differs from what we had before AND
+					 * it's a revoked epoch (not current),
+					 * rebuild the breach burns against the
+					 * new state TX. This is the RBF auto-
+					 * rebuild path. */
+					if (prev_match_epoch
+					    != fi->state_tx_match_epoch
+					    && fi->state_tx_match_epoch
+					    != fi->epoch) {
+						ss_rebuild_breach_burns(cmd,
+							fi,
+							fi->state_tx_match_epoch);
+					}
 					return aux_command_done(cmd);
 				}
 			}
@@ -8030,6 +8054,85 @@ static void ss_penalty_reorg_check_stub(factory_instance_t *fi)
 	(void)fi;
 }
 
+/* Phase 4b2: rebuild and broadcast breach burns for a specific revoked
+ * epoch. Extracted from breach_utxo_checked so we can re-run just the
+ * burn-construction path when the state-TX scan finds a new epoch
+ * (e.g. after counterparty RBF'd a previously-targeted state TX).
+ *
+ * Walks fi->breach_data[] for matching epoch + has_revocation, then
+ * iterates every leaf node, builds factory_build_burn_tx, broadcasts
+ * via ss_broadcast_factory_tx, registers a fresh pending_penalty_t.
+ *
+ * Returns count of burns broadcast. */
+static int ss_rebuild_breach_burns(struct command *cmd,
+				   factory_instance_t *fi,
+				   uint32_t target_epoch)
+{
+	factory_t *f = (factory_t *)fi->lib_factory;
+	if (!f)
+		return 0;
+
+	int n_broadcast = 0;
+	for (size_t bi = 0; bi < fi->n_breach_epochs; bi++) {
+		epoch_breach_data_t *bd = &fi->breach_data[bi];
+		if (bd->epoch != target_epoch)
+			continue;
+		if (!bd->has_revocation)
+			continue;
+		if (bd->epoch >= fi->epoch)
+			continue;  /* current epoch — not a breach */
+
+		for (int ls = 0; ls < f->n_leaf_nodes; ls++) {
+			size_t leaf_idx = f->leaf_node_indices[ls];
+			if (leaf_idx >= f->n_nodes) continue;
+			factory_node_t *leaf = &f->nodes[leaf_idx];
+			if (leaf->n_outputs == 0) continue;
+
+			uint32_t lstock_vout =
+				(uint32_t)(leaf->n_outputs - 1);
+			uint64_t lstock_amt =
+				leaf->outputs[lstock_vout].amount_sats;
+
+			tx_buf_t burn_tx;
+			tx_buf_init(&burn_tx, 256);
+			if (factory_build_burn_tx(f, &burn_tx, leaf->txid,
+						  lstock_vout, lstock_amt,
+						  bd->epoch)) {
+				char *burn_hex = tal_arr(cmd, char,
+					burn_tx.len * 2 + 1);
+				for (size_t h = 0; h < burn_tx.len; h++)
+					sprintf(burn_hex + h*2, "%02x",
+						burn_tx.data[h]);
+				ss_broadcast_factory_tx(cmd, fi, burn_hex,
+							FACTORY_TX_BURN);
+
+				uint8_t burn_txid[32];
+				struct sha256 h1, h2;
+				sha256(&h1, burn_tx.data, burn_tx.len);
+				sha256(&h2, &h1, sizeof(h1));
+				memcpy(burn_txid, &h2, 32);
+				uint32_t csv_unlock =
+					ss_state.current_blockheight
+					+ LSTOCK_CSV_DELAY_DEFAULT;
+				ss_register_pending_penalty(fi, bd->epoch,
+					(int)leaf_idx, burn_txid,
+					lstock_amt, csv_unlock,
+					(uint32_t)burn_tx.len,
+					ss_state.current_blockheight);
+				n_broadcast++;
+
+				plugin_log(plugin_handle, LOG_UNUSUAL,
+					"Phase 4b2 rebuild: broadcast burn for "
+					"epoch=%u leaf=%zu amt=%"PRIu64
+					" (RBF-triggered replacement)",
+					bd->epoch, leaf_idx, lstock_amt);
+			}
+			tx_buf_free(&burn_tx);
+		}
+	}
+	return n_broadcast;
+}
+
 /* ============================================================
  * Phase 4b: RBF / mempool-race detection.
  *
@@ -8095,11 +8198,26 @@ source_check_gettxout_reply(struct command *cmd,
 		plugin_log(plugin_handle, LOG_UNUSUAL,
 			   "RBF DETECTED: penalty epoch=%u leaf=%d source "
 			   "UTXO no longer exists. State TX likely RBF'd; "
-			   "marking penalty STALE. Re-scan for replacement "
-			   "via factory-scan-external-close.",
+			   "marking penalty STALE. Auto-rebuild via state-TX "
+			   "scan (Phase 4b2).",
 			   pp->epoch, pp->leaf_index);
 		pp->state = PENALTY_STATE_STALE;
 		ss_save_factory(cmd, fi);
+
+		/* Phase 4b2: kick off a state-TX scan from the kickoff
+		 * output so state_scan_block_cb can identify any replacement
+		 * state TX. When it finds one at a revoked epoch, it sets
+		 * SIGNAL_STATE_TX_MATCH + state_tx_match_epoch. The classifier
+		 * in ss_apply_signals then latches CLOSED_BREACHED with the
+		 * updated breach_epoch, and state_scan_block_cb invokes
+		 * ss_rebuild_breach_burn to construct a fresh penalty. */
+		factory_t *f = (factory_t *)fi->lib_factory;
+		if (f && f->n_nodes > 0) {
+			static const uint8_t zero32[32] = {0};
+			if (memcmp(f->nodes[0].txid, zero32, 32) != 0)
+				ss_launch_state_tx_scan(cmd, fi,
+					f->nodes[0].txid, 144);
+		}
 	}
 	return aux_command_done(cmd);
 }
@@ -10098,6 +10216,17 @@ static struct command_result *handle_block_added(struct command *cmd,
 			ss_penalty_reorg_check_stub(fi);
 			ss_penalty_scheduler_tick(cmd, fi,
 				ss_state.current_blockheight);
+
+			/* Phase 4b2: auto-trigger source_check every block
+			 * for any PENDING/BROADCAST pending_penalty. If the
+			 * source UTXO has been RBF'd away, the callback flips
+			 * state to STALE and launches a state-TX scan which
+			 * (via state_scan_block_cb) will auto-rebuild the
+			 * penalty against the new state TX.
+			 *
+			 * Cost: N BROADCAST pending_penalty entries ×
+			 * 1 checkutxo RPC per block. Cheap for typical N<=16. */
+			ss_penalty_source_check(cmd, fi);
 		}
 
 		/* Phase 4d: sweep scheduler tick. Cheap; only walks in-memory
