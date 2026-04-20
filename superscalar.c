@@ -33,7 +33,50 @@
 #include <superscalar/ladder.h>
 #include <superscalar/adaptor.h>
 #include <superscalar/htlc_fee_bump.h>
+#include <superscalar/fee_estimator.h>
 #include <common/bech32.h>
+
+/* Phase 3c3: static sanity — fee_estimator_storage on factory_instance_t
+ * must be large enough for a fee_estimator_static_t. Checked at compile
+ * time so we catch any upstream size change immediately. */
+_Static_assert(sizeof(fee_estimator_static_t) <= 64,
+	       "factory_instance_t.fee_estimator_storage too small; "
+	       "bump size in factory_state.h");
+
+/* Phase 3c3: default feerate for factory tree TX fee estimator. 1000
+ * sat/kvB = 1 sat/vB — Bitcoin Core's minimum mempool acceptance floor.
+ * Triggers fee_should_use_anchor=true so tree TXs get P2A anchors,
+ * activating Phase 3c2/3c2.5's CPFP pipeline. Can be made dynamic via
+ * fee_estimator_rpc_t (queries bitcoind estimatesmartfee) in a follow-up. */
+#define SS_DEFAULT_FEE_RATE_SAT_PER_KVB 1000
+
+/* Phase 3c3: initialize the per-factory fee estimator + wire into
+ * factory_t. Call right after factory_init_from_pubkeys, before any
+ * tree-building that needs anchor decisions. */
+static void ss_factory_wire_fee_estimator(factory_instance_t *fi,
+					  factory_t *factory)
+{
+	fee_estimator_static_t *fe =
+		(fee_estimator_static_t *)fi->fee_estimator_storage;
+	fee_estimator_static_init(fe, SS_DEFAULT_FEE_RATE_SAT_PER_KVB);
+	factory->fee = (fee_estimator_t *)fe;
+}
+
+/* Phase 3c3: lazy retrofit. Called from handle_block_added for each
+ * factory. If factory_t->fee is NULL (never wired at the specific
+ * construction site — e.g. persistence reload path), wire it now.
+ * Essentially free: one pointer check per factory per block. */
+static void ss_ensure_factory_fee_wired(factory_instance_t *fi)
+{
+	factory_t *f = (factory_t *)fi->lib_factory;
+	if (!f || f->fee)
+		return;
+	ss_factory_wire_fee_estimator(fi, f);
+	plugin_log(plugin_handle, LOG_DBG,
+		   "Phase 3c3: retrofit-wired fee estimator on factory "
+		   "(lib_factory was initialized without it — likely "
+		   "persistence reload path)");
+}
 
 static struct plugin *plugin_handle;
 static superscalar_state_t ss_state;
@@ -2049,6 +2092,10 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 			factory_init_from_pubkeys(factory, ctx,
 				pubkeys, nb->n_participants,
 				DW_STEP_BLOCKS, 16);
+			/* Phase 3c3: wire fee estimator on the client side too
+			 * so client's view of tree TXs has matching anchor
+			 * outputs (keeps sighashes + txids in sync with LSP). */
+			ss_factory_wire_fee_estimator(fi, factory);
 			if (nb->n_participants <= 2)
 				factory_set_arity(factory, FACTORY_ARITY_1);
 			else
@@ -5432,6 +5479,10 @@ static struct command_result *json_factory_create(struct command *cmd,
 					  pubkeys, n_total,
 					  DW_STEP_BLOCKS,
 					  16); /* states_per_layer */
+
+		/* Phase 3c3: wire the fee estimator so tree TXs carry
+		 * P2A anchors (activates Phase 3c2/3c2.5 CPFP). */
+		ss_factory_wire_fee_estimator(fi, factory);
 
 		/* Set arity: 1 client/leaf for 2 participants, 2 for more */
 		if (fi->n_clients <= 1) {
@@ -9936,7 +9987,40 @@ static struct command_result *handle_block_added(struct command *cmd,
 		if (height_tok) {
 			u32 height;
 			json_to_u32(buf, height_tok, &height);
+
+			/* Phase 4e2: reorg auto-trigger. If the new tip is
+			 * at or below the last height we observed, something
+			 * reorganized. Invoke ss_penalty_reorg_check for
+			 * every factory with confirmed penalties — the async
+			 * getrawtransaction per confirmed burn will flip
+			 * reorg-ed penalties back to BROADCAST so the
+			 * scheduler rebroadcasts.
+			 *
+			 * Seed-skip: last_observed_blockheight == 0 means
+			 * this is our first block_added; don't misread it
+			 * as a regression. */
+			if (ss_state.last_observed_blockheight > 0
+			    && height <= ss_state.last_observed_blockheight) {
+				plugin_log(plugin_handle, LOG_UNUSUAL,
+					   "Phase 4e2: tip regression detected "
+					   "(%u → %u). Launching penalty "
+					   "reorg-check for all factories with "
+					   "confirmed penalties.",
+					   ss_state.last_observed_blockheight,
+					   height);
+				for (size_t i = 0;
+				     i < ss_state.n_factories; i++) {
+					factory_instance_t *cfi =
+						ss_state.factories[i];
+					if (!cfi) continue;
+					if (cfi->n_pending_penalties == 0)
+						continue;
+					ss_penalty_reorg_check(cmd, cfi);
+				}
+			}
+
 			ss_state.current_blockheight = height;
+			ss_state.last_observed_blockheight = height;
 		}
 	}
 
@@ -9950,6 +10034,12 @@ static struct command_result *handle_block_added(struct command *cmd,
 		if (fi->lifecycle == FACTORY_LIFECYCLE_EXPIRED
 		    || fi->lifecycle == FACTORY_LIFECYCLE_CLOSED_EXTERNALLY)
 			continue;
+
+		/* Phase 3c3: lazy retrofit — catch factories whose lib_factory
+		 * was constructed without fee-estimator wiring (persistence
+		 * reload, mid-ceremony rebuild paths). Free when already
+		 * wired. */
+		ss_ensure_factory_fee_wired(fi);
 
 		if (ss_factory_should_close(fi, ss_state.current_blockheight)) {
 			if (fi->lifecycle == FACTORY_LIFECYCLE_ACTIVE) {
