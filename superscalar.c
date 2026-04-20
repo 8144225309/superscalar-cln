@@ -67,6 +67,10 @@ static void ss_broadcast_factory_tx(struct command *cmd,
 static const char *sweep_state_name(uint8_t s);
 static const char *sweep_type_name(uint8_t t);
 
+/* Phase 4c: blocks an INIT factory must remain stuck before we log a
+ * warning. ~1 day at 10-min blocks. Operator decides whether to abort. */
+#define FACTORY_INIT_STUCK_BLOCKS 144
+
 
 /* bLIP-56 factory message type */
 /* ODD type = CLN allows it through connectd without any fork changes.
@@ -10233,10 +10237,6 @@ json_dev_factory_trigger_deep_unwind_scan(struct command *cmd,
 		json_add_string(js, "status", "scan_launched");
 	return command_finished(cmd, js);
 }
-
-/* Phase 4c: blocks an INIT factory must remain stuck before we log a
- * warning. ~1 day at 10-min blocks. Operator decides whether to abort. */
-#define FACTORY_INIT_STUCK_BLOCKS 144
 
 /* factory-abort-stuck — operator-facing RPC. Flips an INIT factory to
  * ABORTED. Use after determining the ceremony will never complete
