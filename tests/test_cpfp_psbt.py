@@ -73,19 +73,20 @@ def test_build_cpfp_psbt_fails_when_wallet_empty(ss_node_factory):
     }, f"unexpected reason: {r['reason']!r}"
 
 
-def test_build_cpfp_psbt_decodepsbt_valid(ss_node_factory):
-    """Pipe the built PSBT through CLN's decodepsbt and sanity-check
-    structure. Ensures the bytes we emit are a real, parseable PSBT."""
+def test_build_cpfp_psbt_reserve_then_sign_works(ss_node_factory):
+    """Built PSBT is structurally valid AND wallet-signable after
+    reserveinputs. Mirrors the 3c2.5c downstream flow: build PSBT,
+    reserve the wallet UTXO, signpsbt signs it.
+
+    Phase 3c2.5b helper doesn't call reserveinputs (deferred) — we
+    call it here manually to exercise the full path."""
     lsp = _funded_lsp(ss_node_factory)
     r = lsp.rpc.call("dev-factory-test-build-cpfp-psbt", {})
     assert r["status"] == "ok"
 
-    # bitcoind's decodepsbt returns structured info; CLN has no direct
-    # equivalent but we can bounce via setpsbtversion (no-op on v0)
-    # or simply re-parse via fundpsbt's output shape… In fact, the
-    # simplest validation: just re-encode via signpsbt (which may
-    # partially-sign or no-op on inputs it doesn't own). If the PSBT
-    # is malformed, signpsbt errors.
+    # Reserve the wallet UTXO so signpsbt will touch it.
+    lsp.rpc.call("reserveinputs", {"psbt": r["psbt"]})
+
     sig_result = lsp.rpc.call("signpsbt", {"psbt": r["psbt"]})
     assert "signed_psbt" in sig_result
     assert sig_result["signed_psbt"]
