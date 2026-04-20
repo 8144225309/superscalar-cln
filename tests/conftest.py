@@ -157,6 +157,38 @@ def datastore_has(node, key_path: list[str], timeout: float = 30.0) -> bool:
     return False
 
 
+def wait_for_ceremony_complete(lsp, iid: str,
+                               timeout: float = 120.0) -> str:
+    """Poll factory-list until the factory's ceremony field reports
+    'complete'. Returns the final ceremony value (typically 'complete'
+    on success). Raises TimeoutError if the ceremony doesn't advance
+    within the timeout.
+
+    Used by Phase 5b regtest tests to drive a full ceremony end-to-end
+    and assert it landed, instead of just checking that factory-create
+    returned an instance_id."""
+    deadline = time.time() + timeout
+    last_seen = "unknown"
+    while time.time() < deadline:
+        try:
+            out = lsp.rpc.call("factory-list")
+            for f in out.get("factories", []):
+                if f["instance_id"] == iid:
+                    last_seen = f.get("ceremony", "unknown")
+                    if last_seen == "complete":
+                        return last_seen
+                    break
+        except Exception:
+            # RPC can transiently fail during plugin async work; ignore.
+            pass
+        time.sleep(0.5)
+    raise TimeoutError(
+        f"factory {iid} ceremony stalled at {last_seen!r} after "
+        f"{timeout}s. Check both nodes' logs for custommsg 33001 "
+        f"exchange progress."
+    )
+
+
 def create_two_party_factory(
     lsp,
     client,
