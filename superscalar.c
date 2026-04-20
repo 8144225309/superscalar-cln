@@ -8328,6 +8328,8 @@ static int ss_cpfp_scheduler_tick(struct command *cmd,
 		ss_save_factory(cmd, fi);
 	return intents;
 }
+
+/* ============================================================
  * Phase 4d: CSV claim scheduler.
  *
  * Algorithm ported from upstream sweeper.c:sweeper_check (see
