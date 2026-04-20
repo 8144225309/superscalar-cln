@@ -362,6 +362,23 @@ typedef struct factory_instance {
 	pending_cpfp_t pending_cpfps[MAX_PENDING_CPFPS];
 	size_t n_pending_cpfps;
 
+	/* Phase 3c3: per-factory fee estimator. Passed to libsuperscalar's
+	 * factory_t->fee pointer so factory_build_node_tx's
+	 * fee_should_use_anchor() gate returns true, causing P2A anchor
+	 * outputs to be appended to tree TXs. Without this, Phase
+	 * 3c2/3c2.5's CPFP pipeline would never fire (no anchors to spend).
+	 *
+	 * Stored inline on factory_instance_t so its lifetime matches the
+	 * factory_t (which holds a pointer to this struct's base member).
+	 * Initialized to a static constant rate in json_factory_create and
+	 * in the dispatch_superscalar_submsg LSP/client-side factory init.
+	 *
+	 * Declared as opaque bytes because factory_state.h is plain-C and
+	 * doesn't pull in superscalar/fee_estimator.h. Actual type is
+	 * fee_estimator_static_t (= base fee_estimator_t + u64 rate).
+	 * sizeof check in superscalar.c asserts it fits. */
+	uint8_t fee_estimator_storage[64];
+
 	/* Rotation */
 	bool rotation_in_progress;
 
@@ -561,6 +578,13 @@ typedef struct superscalar_state {
 	bool is_lsp;			/* Global mode: LSP or client */
 	uint8_t our_node_id[33];	/* Our compressed pubkey */
 	uint32_t current_blockheight;
+
+	/* Phase 4e2: previous block height observed, for reorg auto-
+	 * trigger. handle_block_added checks if new <= prev and invokes
+	 * ss_penalty_reorg_check on every factory with confirmed
+	 * penalties. Starts at 0 — first block_added seed-populates it. */
+	uint32_t last_observed_blockheight;
+
 	uint8_t factory_master_key[32];	/* HSM-derived master key for factories */
 	bool has_master_key;		/* Whether master key was derived */
 } superscalar_state_t;

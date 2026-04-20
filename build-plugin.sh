@@ -45,7 +45,8 @@ cd "$SLIM_DIR"
 ar x "$SS_DIR/build/libsuperscalar.a" \
   factory.c.o musig.c.o dw_state.c.o ladder.c.o \
   tx_builder.c.o tapscript.c.o adaptor.c.o util.c.o shachain.c.o \
-  htlc_fee_bump.c.o
+  htlc_fee_bump.c.o \
+  fee_estimator_static.c.o
 
 # Rename the 6 utility-function conflicts in ALL extracted .o files
 for obj in *.o; do
