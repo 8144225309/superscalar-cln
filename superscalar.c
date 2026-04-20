@@ -72,6 +72,13 @@ static const char *sweep_type_name(uint8_t t);
 static const char *cpfp_state_name(uint8_t s);
 static const char *cpfp_parent_kind_name(uint8_t k);
 
+/* Phase 3c2.5d: forward decl — scheduler_tick calls this, but the
+ * implementation lives below in the Phase 3c2.5c block. */
+static void ss_scheduler_launch_cpfp(struct command *cmd,
+				     factory_instance_t *fi,
+				     size_t pc_idx,
+				     uint64_t target_feerate);
+
 /* Phase 4c: blocks an INIT factory must remain stuck before we log a
  * warning. ~1 day at 10-min blocks. Operator decides whether to abort. */
 #define FACTORY_INIT_STUCK_BLOCKS 144
@@ -8183,6 +8190,86 @@ static int ss_penalty_source_check(struct command *cmd,
  * sign-time feerate. Only fire CPFP when we're past that. */
 #define CPFP_TRIGGER_THRESHOLD_BLOCKS 6
 
+/* Absolute ceiling on per-CPFP bump fee (sats). Prevents scheduler
+ * runaway: htlc_fee_bump's linear-escalation near deadline can
+ * budget very aggressively if parent_value_at_stake is large (e.g.
+ * 25% of a 1M-sat factory = 250k sat). Hard cap here caps wallet
+ * exposure per bump. Upstream has the same mechanism via
+ * wt->max_bump_fee_sat (watchtower.c line 919). */
+#define CPFP_MAX_BUMP_FEE_CEILING_SAT 50000
+
+/* Scan a serialized Bitcoin TX for a P2A (Pay-to-Anchor per BIP-431)
+ * output and return its vout. Returns -1 if no P2A output present
+ * (e.g. factory fee was sub-1-sat/vB and anchor was skipped by
+ * factory_build_*'s fee_should_use_anchor() gate).
+ *
+ * Parses just enough TX structure to walk outputs: version (4) +
+ * optional witness marker/flag + input count + each input (outpoint
+ * + scriptSig + sequence) + output count + each output (value +
+ * scriptPubKey). We stop after the output loop; witness + locktime
+ * aren't needed for output-script inspection.
+ *
+ * P2A magic: 0x51 0x02 0x4e 0x73 (OP_1 OP_PUSHBYTES_2 0x4e73) — the
+ * constant BIP-431 script shape. */
+static int ss_find_p2a_vout(const uint8_t *tx, size_t len)
+{
+	if (!tx || len < 10) return -1;
+	size_t p = 4; /* skip nVersion */
+
+	/* Optional segwit marker + flag: 0x00 0x01 */
+	if (p + 2 <= len && tx[p] == 0x00 && tx[p+1] == 0x01)
+		p += 2;
+
+	/* Input count (varint — assume < 0xfd for our factory TXs which
+	 * have 1 input). If varint prefix 0xfd/0xfe/0xff, bail: either
+	 * malformed or too exotic to bother with. */
+	if (p >= len) return -1;
+	uint8_t vi = tx[p];
+	if (vi >= 0xfd) return -1;
+	size_t n_in = vi;
+	p += 1;
+
+	for (size_t i = 0; i < n_in; i++) {
+		/* outpoint (36) + scriptSig varint + script + sequence (4) */
+		if (p + 36 > len) return -1;
+		p += 36;
+		if (p >= len) return -1;
+		uint8_t s_vi = tx[p];
+		if (s_vi >= 0xfd) return -1;
+		p += 1;
+		p += s_vi;
+		if (p + 4 > len) return -1;
+		p += 4;
+	}
+
+	/* Output count varint. Again assume < 0xfd. */
+	if (p >= len) return -1;
+	uint8_t o_vi = tx[p];
+	if (o_vi >= 0xfd) return -1;
+	size_t n_out = o_vi;
+	p += 1;
+
+	for (size_t j = 0; j < n_out; j++) {
+		/* 8-byte value, scriptPubKey varint, scriptPubKey. */
+		if (p + 8 > len) return -1;
+		p += 8;
+		if (p >= len) return -1;
+		uint8_t spk_vi = tx[p];
+		if (spk_vi >= 0xfd) return -1;
+		p += 1;
+		if (p + spk_vi > len) return -1;
+
+		/* Check for P2A: 4 bytes, 0x51 0x02 0x4e 0x73. */
+		if (spk_vi == 4
+		    && tx[p] == 0x51 && tx[p+1] == 0x02
+		    && tx[p+2] == 0x4e && tx[p+3] == 0x73)
+			return (int)j;
+
+		p += spk_vi;
+	}
+	return -1;
+}
+
 static const char *cpfp_state_name(uint8_t s)
 {
 	switch (s) {
@@ -8303,6 +8390,11 @@ static int ss_cpfp_scheduler_tick(struct command *cmd,
 		fb.last_feerate = pc->cpfp_last_feerate;
 		fb.last_bump_block = pc->cpfp_broadcast_block;
 
+		/* Phase 3c2.5d: clamp budget to absolute ceiling (defense
+		 * against runaway escalation near deadline). */
+		if (fb.budget_sat > CPFP_MAX_BUMP_FEE_CEILING_SAT)
+			fb.budget_sat = CPFP_MAX_BUMP_FEE_CEILING_SAT;
+
 		if (!htlc_fee_bump_should_bump(&fb, current_block))
 			continue;
 
@@ -8310,18 +8402,20 @@ static int ss_cpfp_scheduler_tick(struct command *cmd,
 			htlc_fee_bump_calc_feerate(&fb, current_block);
 
 		plugin_log(plugin_handle, LOG_INFORM,
-			   "cpfp_scheduler: WOULD BUMP kind=%s parent_vout=%u "
+			   "cpfp_scheduler: BUMP kind=%s parent_vout=%u "
 			   "target_feerate=%"PRIu64" sat/kvB last=%"PRIu64
-			   " sat/kvB blocks_remaining=%u (Phase 3c2.5 will "
-			   "actually build + broadcast the child)",
+			   " sat/kvB blocks_remaining=%u — building child",
 			   cpfp_parent_kind_name(pc->parent_kind),
 			   pc->parent_vout_anchor,
 			   target_feerate, pc->cpfp_last_feerate,
 			   htlc_fee_bump_blocks_remaining(&fb, current_block));
 
-		/* V1 stub: would-have-broadcast intent recorded. V2 will
-		 * call ss_build_and_broadcast_cpfp_child(...) here, then
-		 * update last_feerate + broadcast_block on success. */
+		/* Phase 3c2.5d: kick off the async build → sign → send
+		 * chain. The tick itself returns immediately; the chain
+		 * updates pc->state via scheduler_cpfp_* callbacks. Each
+		 * CPFP uses its own aux_command so replies outlive the
+		 * notification cmd that invoked the tick. */
+		ss_scheduler_launch_cpfp(cmd, fi, i, target_feerate);
 		intents++;
 	}
 
@@ -9079,6 +9173,158 @@ static void ss_cpfp_sign_and_send(struct command *cmd,
 }
 
 /* ============================================================
+ * Phase 3c2.5d: scheduler → CPFP integration.
+ *
+ * ss_scheduler_launch_cpfp is the glue that ss_cpfp_scheduler_tick
+ * calls when htlc_fee_bump decides it's time to bump a pending parent.
+ * Fires the async build → sign → send chain on an aux_command (so
+ * callbacks survive the block_added notification's cmd lifetime),
+ * then updates the pending_cpfp_t on success or failure.
+ *
+ * Defensive: the pc_idx captured at launch time could be stale if
+ * pending_cpfps[] is concurrently modified. Done callback
+ * cross-checks parent_txid match before writing to the entry.
+ * ============================================================ */
+
+struct scheduler_cpfp_ctx {
+	factory_instance_t *fi;
+	size_t pc_idx;
+	uint8_t parent_txid_snap[32]; /* captured for staleness check */
+	uint64_t target_feerate;
+};
+
+/* Find entry matching parent_txid — guards against pc_idx going
+ * stale between launch and async callback. */
+static pending_cpfp_t *
+scheduler_cpfp_lookup(factory_instance_t *fi,
+		      const uint8_t parent_txid[32])
+{
+	for (size_t i = 0; i < fi->n_pending_cpfps; i++) {
+		if (memcmp(fi->pending_cpfps[i].parent_txid,
+			   parent_txid, 32) == 0)
+			return &fi->pending_cpfps[i];
+	}
+	return NULL;
+}
+
+static struct command_result *
+scheduler_cpfp_sent(struct command *cmd,
+		    void *arg,
+		    const char *child_txid_hex)
+{
+	struct scheduler_cpfp_ctx *sctx =
+		(struct scheduler_cpfp_ctx *)arg;
+	pending_cpfp_t *pc = scheduler_cpfp_lookup(sctx->fi,
+						   sctx->parent_txid_snap);
+	if (!pc) {
+		plugin_log(plugin_handle, LOG_UNUSUAL,
+			   "cpfp_scheduler: pending entry vanished during "
+			   "broadcast (child_txid=%s). Ignoring.",
+			   child_txid_hex);
+		return aux_command_done(cmd);
+	}
+
+	/* Store child txid in internal byte order. */
+	ss_hex_txid_to_internal(child_txid_hex, pc->cpfp_txid);
+	pc->cpfp_broadcast_block = ss_state.current_blockheight;
+	pc->cpfp_last_feerate = sctx->target_feerate;
+	pc->state = CPFP_STATE_BROADCAST;
+	ss_save_factory(cmd, sctx->fi);
+
+	plugin_log(plugin_handle, LOG_INFORM,
+		   "cpfp_scheduler: child broadcast (txid=%s feerate=%"PRIu64
+		   " sat/kvB). Parent should pull in via package relay.",
+		   child_txid_hex, sctx->target_feerate);
+	return aux_command_done(cmd);
+}
+
+static struct command_result *
+scheduler_cpfp_send_failed(struct command *cmd,
+			   void *arg,
+			   const char *reason)
+{
+	struct scheduler_cpfp_ctx *sctx =
+		(struct scheduler_cpfp_ctx *)arg;
+	pending_cpfp_t *pc = scheduler_cpfp_lookup(sctx->fi,
+						   sctx->parent_txid_snap);
+	if (pc) {
+		pc->state = CPFP_STATE_FAILED;
+		ss_save_factory(cmd, sctx->fi);
+	}
+	plugin_log(plugin_handle, LOG_UNUSUAL,
+		   "cpfp_scheduler: send failed (%s). Next tick will retry "
+		   "if parent still unconfirmed.", reason);
+	/* Reset FAILED back to PENDING on next tick so we can retry:
+	 * the failure might have been transient (reserveinputs race,
+	 * temporary bitcoind backpressure). But don't do it here —
+	 * the tick's own can_bump check will handle state transition. */
+	return aux_command_done(cmd);
+}
+
+static struct command_result *
+scheduler_cpfp_built(struct command *cmd,
+		     void *arg,
+		     const char *psbt_b64,
+		     const char *wallet_txid_hex UNUSED,
+		     uint32_t wallet_vout UNUSED,
+		     uint64_t wallet_amount_sat UNUSED,
+		     const char *change_address UNUSED)
+{
+	struct scheduler_cpfp_ctx *sctx =
+		(struct scheduler_cpfp_ctx *)arg;
+	ss_cpfp_sign_and_send(cmd, psbt_b64,
+			      scheduler_cpfp_sent,
+			      scheduler_cpfp_send_failed,
+			      sctx);
+	return command_still_pending(cmd);
+}
+
+static struct command_result *
+scheduler_cpfp_build_failed(struct command *cmd,
+			    void *arg,
+			    const char *reason)
+{
+	struct scheduler_cpfp_ctx *sctx =
+		(struct scheduler_cpfp_ctx *)arg;
+	pending_cpfp_t *pc = scheduler_cpfp_lookup(sctx->fi,
+						   sctx->parent_txid_snap);
+	if (pc) {
+		pc->state = CPFP_STATE_FAILED;
+		ss_save_factory(cmd, sctx->fi);
+	}
+	plugin_log(plugin_handle, LOG_UNUSUAL,
+		   "cpfp_scheduler: build failed (%s). Retry on next tick "
+		   "if parent still unconfirmed.", reason);
+	return aux_command_done(cmd);
+}
+
+/* Kick off a CPFP via the Phase 3c2.5b/c async chain. The aux_command
+ * wrap ensures reply callbacks outlive the block_added notification
+ * that invoked ss_cpfp_scheduler_tick. */
+static void ss_scheduler_launch_cpfp(struct command *cmd,
+				     factory_instance_t *fi,
+				     size_t pc_idx,
+				     uint64_t target_feerate)
+{
+	pending_cpfp_t *pc = &fi->pending_cpfps[pc_idx];
+	struct command *acmd = aux_command(cmd);
+	struct scheduler_cpfp_ctx *sctx =
+		tal(acmd, struct scheduler_cpfp_ctx);
+	sctx->fi = fi;
+	sctx->pc_idx = pc_idx;
+	memcpy(sctx->parent_txid_snap, pc->parent_txid, 32);
+	sctx->target_feerate = target_feerate;
+
+	ss_build_cpfp_child(acmd,
+			    pc->parent_txid,
+			    pc->parent_vout_anchor,
+			    target_feerate,
+			    scheduler_cpfp_built,
+			    scheduler_cpfp_build_failed,
+			    sctx);
+}
+
+/* ============================================================
  * Phase 4d: CSV claim scheduler.
  *
  * Algorithm ported from upstream sweeper.c:sweeper_check (see
@@ -9487,6 +9733,30 @@ static struct command_result *breach_utxo_checked(struct command *cmd,
 			ss_broadcast_factory_tx(cmd, fi, tx_hex,
 						ni == 0 ? FACTORY_TX_KICKOFF
 							: FACTORY_TX_STATE);
+
+			/* Phase 3c2.5d: register for CPFP if this TX has an
+			 * anchor. Same pattern as handle_block_added DYING
+			 * cascade — breach response is just another path to
+			 * the same "broadcast tree nodes under duress" flow. */
+			tx_buf_t *ntx = &f->nodes[ni].signed_tx;
+			int anchor_vout_b =
+				ss_find_p2a_vout(ntx->data, ntx->len);
+			if (anchor_vout_b >= 0) {
+				uint8_t tx_txid[32];
+				struct sha256 h1, h2;
+				sha256(&h1, ntx->data, ntx->len);
+				sha256(&h2, &h1, sizeof(h1));
+				memcpy(tx_txid, &h2, 32);
+				uint64_t value = f->nodes[ni].n_outputs > 0
+					? f->nodes[ni].outputs[0].amount_sats
+					: fi->funding_amount_sats;
+				ss_register_pending_cpfp(fi,
+					ni == 0 ? CPFP_PARENT_KICKOFF
+						: CPFP_PARENT_STATE,
+					tx_txid, (uint32_t)anchor_vout_b,
+					value, fi->expiry_block,
+					ss_state.current_blockheight);
+			}
 		}
 	}
 
@@ -9546,6 +9816,30 @@ static struct command_result *handle_block_added(struct command *cmd,
 					   "Broadcasting distribution TX "
 					   "(%zu bytes) — client fallback",
 					   fi->dist_signed_tx_len);
+
+				/* Phase 3c2.5d: register the dist TX for CPFP
+				 * if it carries an anchor. The dist TX is
+				 * the fallback that lets clients claim their
+				 * funds after factory expiry — a stuck dist
+				 * TX is a real problem. */
+				int dist_anchor_vout =
+					ss_find_p2a_vout(fi->dist_signed_tx,
+							 fi->dist_signed_tx_len);
+				if (dist_anchor_vout >= 0) {
+					uint8_t dist_txid[32];
+					struct sha256 h1, h2;
+					sha256(&h1, fi->dist_signed_tx,
+					       fi->dist_signed_tx_len);
+					sha256(&h2, &h1, sizeof(h1));
+					memcpy(dist_txid, &h2, 32);
+					ss_register_pending_cpfp(fi,
+						CPFP_PARENT_DIST,
+						dist_txid,
+						(uint32_t)dist_anchor_vout,
+						fi->funding_amount_sats,
+						fi->expiry_block + 144,
+						ss_state.current_blockheight);
+				}
 			}
 
 			/* Build and broadcast timeout spend TXs for each
@@ -9696,6 +9990,38 @@ static struct command_result *handle_block_added(struct command *cmd,
 					ss_broadcast_factory_tx(cmd, fi, tx_hex,
 								ni == 0 ? FACTORY_TX_KICKOFF
 									: FACTORY_TX_STATE);
+
+					/* Phase 3c2.5d: register for CPFP
+					 * monitoring. Compute child txid,
+					 * locate the P2A anchor vout via
+					 * scanner (handles the anchor-at-
+					 * variable-vout reality). Skip if no
+					 * anchor (fee_should_use_anchor off). */
+					int anchor_vout =
+						ss_find_p2a_vout(stx->data,
+								 stx->len);
+					if (anchor_vout >= 0) {
+						uint8_t tx_txid[32];
+						struct sha256 h1, h2;
+						sha256(&h1, stx->data, stx->len);
+						sha256(&h2, &h1, sizeof(h1));
+						memcpy(tx_txid, &h2, 32);
+
+						uint64_t value = fcl->nodes[ni]
+							.n_outputs > 0
+							? fcl->nodes[ni]
+							   .outputs[0].amount_sats
+							: fi->funding_amount_sats;
+						ss_register_pending_cpfp(fi,
+							ni == 0
+							  ? CPFP_PARENT_KICKOFF
+							  : CPFP_PARENT_STATE,
+							tx_txid,
+							(uint32_t)anchor_vout,
+							value,
+							fi->expiry_block,
+							ss_state.current_blockheight);
+					}
 				}
 			}
 		}
