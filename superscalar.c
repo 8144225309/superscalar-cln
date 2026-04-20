@@ -11,6 +11,7 @@
 #include <plugins/libplugin.h>
 #include <bitcoin/psbt.h>
 #include <bitcoin/privkey.h>
+#include <common/addr.h>
 #include <common/features.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -8569,6 +8570,319 @@ static void ss_get_change_p2tr(struct command *cmd,
 }
 
 /* ============================================================
+ * Phase 3c2.5b: CPFP child PSBT construction.
+ *
+ * Composes the Phase 3c2.5a helpers (pick_wallet_utxo +
+ * get_change_p2tr) and builds an unsigned PSBT shaped for CPFP
+ * against a pre-signed parent TX with P2A anchor:
+ *
+ *   vin[0]: parent_txid:anchor_vout  (P2A, 240 sats, anyone-can-spend)
+ *   vin[1]: wallet_utxo              (CLN wallet, signed by 3c2.5c)
+ *   vout[0]: change (P2TR to LSP wallet)
+ *
+ * Witness UTXOs are populated on both inputs so signpsbt has amounts
+ * to sign against. Signing + finalization + broadcast happens in
+ * Phase 3c2.5c.
+ *
+ * Fee math: CPFP_CHILD_VSIZE_DEFAULT (264 vbytes) × target_feerate_kvb
+ * / 1000. Phase 3c2.5c will tie target_feerate to htlc_fee_bump's
+ * linear schedule.
+ * ============================================================ */
+
+/* BIP-431 Pay-to-Anchor scriptPubKey: OP_1 OP_PUSHBYTES_2 0x4e73.
+ * Matches upstream channel.h:P2A_SPK. */
+static const uint8_t CPFP_P2A_SPK[4] = {0x51, 0x02, 0x4e, 0x73};
+#define CPFP_P2A_SPK_LEN 4
+
+/* Standard P2A anchor amount on SuperScalar-built dist/state/kickoff
+ * TXs. Matches upstream factory.c ANCHOR_OUTPUT_AMOUNT. */
+#define CPFP_ANCHOR_AMOUNT_SAT 240
+
+/* Dust limit for P2TR outputs (Bitcoin Core 28+). Change below this
+ * is rolled into fee instead of creating a dust output. */
+#define CPFP_CHANGE_DUST_LIMIT_SAT 294
+
+/* Build an unsigned CPFP child PSBT. Returns base64 string on success
+ * (tal-allocated on ctx), NULL on failure. Failure modes: insufficient
+ * wallet input to cover fee, change below dust, address decode error. */
+static char *ss_build_cpfp_child_psbt(
+	const tal_t *ctx,
+	const uint8_t *parent_txid,     /* 32 bytes, internal byte order */
+	uint32_t anchor_vout,
+	const uint8_t *wallet_txid,     /* 32 bytes, internal byte order */
+	uint32_t wallet_vout,
+	uint64_t wallet_amount_sat,
+	const uint8_t *wallet_spk,      /* wallet UTXO's scriptPubKey */
+	size_t wallet_spk_len,
+	const char *change_address,     /* bech32m P2TR */
+	uint64_t target_feerate_sat_per_kvb,
+	const char **err_out)
+{
+	*err_out = NULL;
+
+	/* Fee estimate: vsize × feerate / 1000. Round up. */
+	uint64_t fee_sat = (target_feerate_sat_per_kvb
+			    * CPFP_CHILD_VSIZE_DEFAULT + 999) / 1000;
+
+	uint64_t total_in = (uint64_t)CPFP_ANCHOR_AMOUNT_SAT
+			    + wallet_amount_sat;
+	if (total_in <= fee_sat) {
+		*err_out = "wallet_insufficient";
+		return NULL;
+	}
+	uint64_t change_sat = total_in - fee_sat;
+	if (change_sat < CPFP_CHANGE_DUST_LIMIT_SAT) {
+		*err_out = "change_dust";
+		return NULL;
+	}
+
+	/* Decode change address via CLN's chainparams-aware decoder. */
+	u8 *change_spk = NULL;
+	if (!decode_scriptpubkey_from_addr(ctx, chainparams,
+					    change_address, &change_spk)) {
+		*err_out = "change_addr_decode";
+		return NULL;
+	}
+
+	/* Create empty PSBT with nLockTime=0. */
+	struct wally_psbt *psbt = create_psbt(ctx, 0, 0, 0);
+	if (!psbt) {
+		*err_out = "psbt_create";
+		return NULL;
+	}
+
+	/* Input 0: anchor from parent. sequence=0xFFFFFFFE (RBF signal). */
+	struct bitcoin_outpoint anchor_op;
+	memcpy(&anchor_op.txid, parent_txid, 32);
+	anchor_op.n = anchor_vout;
+	struct wally_psbt_input *anchor_in =
+		psbt_append_input(psbt, &anchor_op, 0xFFFFFFFE,
+				  NULL, NULL, NULL);
+	if (!anchor_in) {
+		*err_out = "psbt_append_anchor";
+		return NULL;
+	}
+	/* CLN's psbt_input_set_wit_utxo derives length from tal_count —
+	 * pass a tal_arr copy rather than the static const. */
+	u8 *anchor_spk_tal = tal_dup_arr(psbt, u8, CPFP_P2A_SPK,
+					 CPFP_P2A_SPK_LEN, 0);
+	psbt_input_set_wit_utxo(psbt, 0, anchor_spk_tal,
+				AMOUNT_SAT(CPFP_ANCHOR_AMOUNT_SAT));
+
+	/* Input 1: wallet UTXO. */
+	struct bitcoin_outpoint wallet_op;
+	memcpy(&wallet_op.txid, wallet_txid, 32);
+	wallet_op.n = wallet_vout;
+	struct wally_psbt_input *wallet_in =
+		psbt_append_input(psbt, &wallet_op, 0xFFFFFFFE,
+				  NULL, NULL, NULL);
+	if (!wallet_in) {
+		*err_out = "psbt_append_wallet";
+		return NULL;
+	}
+	u8 *wallet_spk_tal = tal_dup_arr(psbt, u8, wallet_spk,
+					 wallet_spk_len, 0);
+	psbt_input_set_wit_utxo(psbt, 1, wallet_spk_tal,
+				AMOUNT_SAT(wallet_amount_sat));
+
+	/* Output 0: P2TR change back to wallet. */
+	psbt_append_output(psbt, change_spk, AMOUNT_SAT(change_sat));
+
+	/* Encode to base64. fmt_wally_psbt returns tal-allocated. */
+	char *b64 = fmt_wally_psbt(ctx, psbt);
+	if (!b64) {
+		*err_out = "psbt_encode";
+		return NULL;
+	}
+	return b64;
+}
+
+/* Decode a hex-encoded txid string into internal byte order (reversed
+ * from display). Returns true on success, false on malformed input. */
+static bool ss_hex_txid_to_internal(const char *hex, uint8_t *out32)
+{
+	if (strlen(hex) != 64) return false;
+	for (int j = 0; j < 32; j++) {
+		unsigned int b;
+		if (sscanf(hex + j*2, "%02x", &b) != 1)
+			return false;
+		out32[31 - j] = (uint8_t)b;
+	}
+	return true;
+}
+
+/* Decode a hex string into bytes. Caller provides buffer of len/2
+ * bytes. Returns true on success, false on malformed/odd-length. */
+static bool ss_hex_to_bytes(const char *hex, uint8_t *out, size_t out_len)
+{
+	size_t hex_len = strlen(hex);
+	if (hex_len != out_len * 2) return false;
+	for (size_t j = 0; j < out_len; j++) {
+		unsigned int b;
+		if (sscanf(hex + j*2, "%02x", &b) != 1)
+			return false;
+		out[j] = (uint8_t)b;
+	}
+	return true;
+}
+
+/* Async wrapper: chain pick_wallet_utxo → get_change_p2tr → build PSBT
+ * → invoke caller's done_cb with the base64 PSBT. Caller supplies the
+ * parent_txid + anchor_vout + target_feerate; we fetch everything else
+ * from the wallet. */
+
+typedef struct command_result *
+(*cpfp_build_done_cb)(struct command *cmd,
+		      void *arg,
+		      const char *psbt_b64,
+		      const char *wallet_txid_hex,
+		      uint32_t wallet_vout,
+		      uint64_t wallet_amount_sat,
+		      const char *change_address);
+
+typedef struct command_result *
+(*cpfp_build_fail_cb)(struct command *cmd,
+		      void *arg,
+		      const char *reason);
+
+struct cpfp_build_ctx {
+	uint8_t parent_txid[32];  /* internal BE */
+	uint32_t anchor_vout;
+	uint64_t target_feerate_sat_per_kvb;
+
+	/* Filled in as the async chain progresses. */
+	uint8_t wallet_txid_be[32];
+	char *wallet_txid_hex;
+	uint32_t wallet_vout;
+	uint64_t wallet_amount_sat;
+	uint8_t *wallet_spk;
+	size_t wallet_spk_len;
+
+	cpfp_build_done_cb done_cb;
+	cpfp_build_fail_cb fail_cb;
+	void *arg;
+};
+
+static struct command_result *
+cpfp_build_change_addr_done(struct command *cmd,
+			    void *arg,
+			    const char *address);
+
+static struct command_result *
+cpfp_build_change_addr_fail(struct command *cmd,
+			    void *arg,
+			    const char *reason)
+{
+	struct cpfp_build_ctx *ctx = (struct cpfp_build_ctx *)arg;
+	return ctx->fail_cb(cmd, ctx->arg, reason);
+}
+
+static struct command_result *
+cpfp_build_utxo_done(struct command *cmd,
+		     void *arg,
+		     const char *txid_hex,
+		     uint32_t vout,
+		     uint64_t amount_sat,
+		     const char *spk_hex,
+		     const char *address UNUSED)
+{
+	struct cpfp_build_ctx *ctx = (struct cpfp_build_ctx *)arg;
+
+	if (!ss_hex_txid_to_internal(txid_hex, ctx->wallet_txid_be))
+		return ctx->fail_cb(cmd, ctx->arg, "wallet_txid_parse");
+
+	ctx->wallet_txid_hex = tal_strdup(ctx, txid_hex);
+	ctx->wallet_vout = vout;
+	ctx->wallet_amount_sat = amount_sat;
+
+	size_t spk_bytes_len = strlen(spk_hex) / 2;
+	ctx->wallet_spk = tal_arr(ctx, uint8_t, spk_bytes_len);
+	if (!ss_hex_to_bytes(spk_hex, ctx->wallet_spk, spk_bytes_len))
+		return ctx->fail_cb(cmd, ctx->arg, "wallet_spk_parse");
+	ctx->wallet_spk_len = spk_bytes_len;
+
+	/* Next step: get a change address. */
+	ss_get_change_p2tr(cmd,
+			   cpfp_build_change_addr_done,
+			   cpfp_build_change_addr_fail,
+			   ctx);
+	return command_still_pending(cmd);
+}
+
+static struct command_result *
+cpfp_build_utxo_fail(struct command *cmd,
+		     void *arg,
+		     const char *reason)
+{
+	struct cpfp_build_ctx *ctx = (struct cpfp_build_ctx *)arg;
+	return ctx->fail_cb(cmd, ctx->arg, reason);
+}
+
+static struct command_result *
+cpfp_build_change_addr_done(struct command *cmd,
+			    void *arg,
+			    const char *address)
+{
+	struct cpfp_build_ctx *ctx = (struct cpfp_build_ctx *)arg;
+
+	const char *err = NULL;
+	char *psbt_b64 = ss_build_cpfp_child_psbt(
+		ctx,
+		ctx->parent_txid, ctx->anchor_vout,
+		ctx->wallet_txid_be, ctx->wallet_vout,
+		ctx->wallet_amount_sat,
+		ctx->wallet_spk, ctx->wallet_spk_len,
+		address,
+		ctx->target_feerate_sat_per_kvb,
+		&err);
+	if (!psbt_b64)
+		return ctx->fail_cb(cmd, ctx->arg,
+				    err ? err : "psbt_build_unknown");
+
+	return ctx->done_cb(cmd, ctx->arg, psbt_b64,
+			    ctx->wallet_txid_hex,
+			    ctx->wallet_vout,
+			    ctx->wallet_amount_sat,
+			    address);
+}
+
+/* Public entry: async-build an unsigned CPFP child PSBT. Requires the
+ * LSP wallet to have a spendable UTXO >= bump_fee + dust. */
+static void ss_build_cpfp_child(struct command *cmd,
+				const uint8_t *parent_txid,
+				uint32_t anchor_vout,
+				uint64_t target_feerate_sat_per_kvb,
+				cpfp_build_done_cb done_cb,
+				cpfp_build_fail_cb fail_cb,
+				void *arg)
+{
+	struct cpfp_build_ctx *ctx = tal(cmd, struct cpfp_build_ctx);
+	memcpy(ctx->parent_txid, parent_txid, 32);
+	ctx->anchor_vout = anchor_vout;
+	ctx->target_feerate_sat_per_kvb = target_feerate_sat_per_kvb;
+	ctx->wallet_spk = NULL;
+	ctx->wallet_spk_len = 0;
+	ctx->wallet_txid_hex = NULL;
+	ctx->done_cb = done_cb;
+	ctx->fail_cb = fail_cb;
+	ctx->arg = arg;
+
+	/* Pick UTXO sized for: bump_fee + generous dust margin. */
+	uint64_t bump_fee = (target_feerate_sat_per_kvb
+			     * CPFP_CHILD_VSIZE_DEFAULT + 999) / 1000;
+	uint64_t min_amount = bump_fee + CPFP_CHANGE_DUST_LIMIT_SAT
+			      + CPFP_ANCHOR_AMOUNT_SAT;
+	/* Subtract anchor contribution: it covers some of the fee. */
+	if (min_amount > CPFP_ANCHOR_AMOUNT_SAT)
+		min_amount -= CPFP_ANCHOR_AMOUNT_SAT;
+
+	ss_pick_wallet_utxo(cmd, min_amount,
+			    cpfp_build_utxo_done,
+			    cpfp_build_utxo_fail,
+			    ctx);
+}
+
+/* ============================================================
  * Phase 4d: CSV claim scheduler.
  *
  * Algorithm ported from upstream sweeper.c:sweeper_check (see
@@ -10778,6 +11092,91 @@ json_factory_abort_stuck(struct command *cmd,
 	return command_finished(cmd, js);
 }
 
+/* Phase 3c2.5b test RPC — exercise the full pick → change-addr →
+ * build-PSBT chain end-to-end with a synthetic parent. Returns the
+ * base64 PSBT so tests can decode + inspect it. */
+struct test_build_psbt_ctx {
+	struct command *orig_cmd;
+};
+
+static struct command_result *
+test_build_psbt_done(struct command *cmd UNUSED,
+		     void *arg,
+		     const char *psbt_b64,
+		     const char *wallet_txid_hex,
+		     uint32_t wallet_vout,
+		     uint64_t wallet_amount_sat,
+		     const char *change_address)
+{
+	struct test_build_psbt_ctx *ctx =
+		(struct test_build_psbt_ctx *)arg;
+	struct json_stream *js =
+		jsonrpc_stream_success(ctx->orig_cmd);
+	json_add_string(js, "status", "ok");
+	json_add_string(js, "psbt", psbt_b64);
+	json_add_string(js, "wallet_txid", wallet_txid_hex);
+	json_add_u32(js, "wallet_vout", wallet_vout);
+	json_add_u64(js, "wallet_amount_sat", wallet_amount_sat);
+	json_add_string(js, "change_address", change_address);
+	return command_finished(ctx->orig_cmd, js);
+}
+
+static struct command_result *
+test_build_psbt_fail(struct command *cmd UNUSED,
+		     void *arg,
+		     const char *reason)
+{
+	struct test_build_psbt_ctx *ctx =
+		(struct test_build_psbt_ctx *)arg;
+	struct json_stream *js =
+		jsonrpc_stream_success(ctx->orig_cmd);
+	json_add_string(js, "status", "fail");
+	json_add_string(js, "reason", reason);
+	return command_finished(ctx->orig_cmd, js);
+}
+
+static struct command_result *
+json_dev_factory_test_build_cpfp_psbt(struct command *cmd,
+				      const char *buf,
+				      const jsmntok_t *params)
+{
+	const char *parent_txid_hex = NULL;
+	u32 *anchor_vout;
+	u64 *target_feerate;
+
+	if (!param(cmd, buf, params,
+		   p_opt("parent_txid", param_string, &parent_txid_hex),
+		   p_opt_def("anchor_vout", param_u32, &anchor_vout, 1),
+		   p_opt_def("target_feerate_sat_per_kvb",
+			     param_u64, &target_feerate, 10000),
+		   NULL))
+		return command_param_failed();
+
+	/* Default synthetic parent txid: 0xAA repeated. Used by tests
+	 * that don't care about the specific outpoint. */
+	static const char kDefaultParentTxid[65] =
+		"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+		"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+	if (!parent_txid_hex)
+		parent_txid_hex = kDefaultParentTxid;
+
+	uint8_t parent_txid_be[32];
+	if (!ss_hex_txid_to_internal(parent_txid_hex, parent_txid_be))
+		return command_fail(cmd, LIGHTNINGD,
+				    "Bad parent_txid hex");
+
+	struct test_build_psbt_ctx *ctx =
+		tal(cmd, struct test_build_psbt_ctx);
+	ctx->orig_cmd = cmd;
+
+	ss_build_cpfp_child(cmd, parent_txid_be, *anchor_vout,
+			    *target_feerate,
+			    test_build_psbt_done,
+			    test_build_psbt_fail,
+			    ctx);
+	return command_still_pending(cmd);
+}
+
 /* Phase 3c2.5a test RPCs — exercise the wallet helpers end-to-end
  * without invoking the full CPFP pipeline. Used by pytest to verify
  * the async RPC chains work + UTXO selection picks the right coin.
@@ -11532,6 +11931,10 @@ static const struct plugin_command commands[] = {
 	{
 		"dev-factory-test-change-addr",
 		json_dev_factory_test_change_addr,
+	},
+	{
+		"dev-factory-test-build-cpfp-psbt",
+		json_dev_factory_test_build_cpfp_psbt,
 	},
 	{
 		"dev-factory-inject-cpfp",
