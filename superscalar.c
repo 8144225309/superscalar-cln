@@ -72,10 +72,8 @@ static void ss_ensure_factory_fee_wired(factory_instance_t *fi)
 	if (!f || f->fee)
 		return;
 	ss_factory_wire_fee_estimator(fi, f);
-	plugin_log(plugin_handle, LOG_DBG,
-		   "Phase 3c3: retrofit-wired fee estimator on factory "
-		   "(lib_factory was initialized without it — likely "
-		   "persistence reload path)");
+	/* No log here — plugin_handle is forward-declared below us. Silent
+	 * retrofit is fine; it's a free no-op in steady state. */
 }
 
 static struct plugin *plugin_handle;
