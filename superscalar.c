@@ -6617,6 +6617,36 @@ static struct command_result *json_factory_force_close(struct command *cmd,
 		ss_broadcast_factory_tx(cmd, fi, tx_hex,
 					ni == 0 ? FACTORY_TX_KICKOFF
 						: FACTORY_TX_STATE);
+
+		/* Phase 3c2.5d coverage fix: register for CPFP monitoring
+		 * here too. Phase 3c2.5d wired registration at block_added's
+		 * DYING cascade and at breach_utxo_checked, but NOT at this
+		 * direct operator-triggered site. When operator calls
+		 * factory-force-close, kickoff/state TXs get broadcast but
+		 * no block_added auto-fires in a test harness — so CPFP
+		 * monitoring would never start. Register explicitly here. */
+		{
+			tx_buf_t *ntx = &factory->nodes[ni].signed_tx;
+			int anchor_vout =
+				ss_find_p2a_vout(ntx->data, ntx->len);
+			if (anchor_vout >= 0) {
+				uint8_t tx_txid[32];
+				struct sha256 h1, h2;
+				sha256(&h1, ntx->data, ntx->len);
+				sha256(&h2, &h1, sizeof(h1));
+				memcpy(tx_txid, &h2, 32);
+				uint64_t value = factory->nodes[ni].n_outputs > 0
+					? factory->nodes[ni].outputs[0].amount_sats
+					: fi->funding_amount_sats;
+				ss_register_pending_cpfp(fi,
+					ni == 0 ? CPFP_PARENT_KICKOFF
+						: CPFP_PARENT_STATE,
+					tx_txid, (uint32_t)anchor_vout,
+					value, fi->expiry_block,
+					ss_state.current_blockheight);
+			}
+		}
+
 		plugin_log(plugin_handle, LOG_INFORM,
 			   "force-close: broadcast node %zu (txid=%s)",
 			   ni, txid_hex);
