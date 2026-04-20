@@ -13239,10 +13239,12 @@ json_dev_factory_tick_sweep_scheduler(struct command *cmd,
 		return command_fail(cmd, LIGHTNINGD, "Factory not found");
 
 	int transitions = ss_sweep_scheduler_tick(cmd, fi, *block_height);
-	/* Phase 4d2: dev tick also fires kickoff for any entries that
-	 * transitioned to READY. Tests rely on this to drive full
-	 * state-machine advancement without waiting on a real block. */
-	ss_sweep_kick_all_ready(cmd, fi);
+	/* NOTE: dev-tick deliberately does NOT fire ss_sweep_kick_all_ready.
+	 * Auto-kickoff runs only from the real block_added hook. Tests that
+	 * need to exercise state-machine advancement without side-effects
+	 * keep using dev-factory-mark-sweep-broadcast; tests that want to
+	 * exercise the real kickoff path drive bitcoind generate_block
+	 * instead (which fires the block_added scheduler integration). */
 
 	struct json_stream *js = jsonrpc_stream_success(cmd);
 	json_add_string(js, "instance_id", id_hex);
