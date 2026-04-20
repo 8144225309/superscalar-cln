@@ -135,15 +135,20 @@ typedef struct {
 	uint32_t epoch;          /* revoked epoch this burns */
 	int32_t  leaf_index;     /* which leaf's L-stock we target */
 	uint8_t  burn_txid[32];  /* txid of our burn broadcast (internal BE) */
-	uint64_t lstock_sats;    /* value at stake — budget basis */
+	uint64_t lstock_sats;    /* value at stake — diagnostic only post-3c-redux */
 	uint32_t csv_unlock_block; /* deadline: counterparty can claim after this */
 	uint32_t first_broadcast_block;
 	uint32_t last_broadcast_block;
 	uint32_t confirmed_block; /* 0 if unconfirmed */
-	uint64_t last_feerate;    /* sat/kvB, 0 until first broadcast */
-	uint32_t tx_vsize;        /* vbytes for fee math */
+	/* Phase 3c-redux: last_feerate + tx_vsize were used by the original
+	 * htlc_fee_bump-based RBF scheduler, which doesn't apply to burn
+	 * TXs (they're 100%-fee by construction — full L-stock value goes
+	 * to miner). Kept in struct for persist v12 backward compat;
+	 * written at registration but not used for scheduling decisions. */
+	uint64_t last_feerate;    /* DIAGNOSTIC ONLY — not used post-redux */
+	uint32_t tx_vsize;        /* DIAGNOSTIC ONLY — not used post-redux */
 	uint8_t  state;           /* penalty_state_t */
-	uint8_t  cpfp_attempted;  /* 1 if we've tried an anchor child */
+	uint8_t  cpfp_attempted;  /* reserved for Phase 3c2 CPFP-via-anchor */
 } pending_penalty_t;
 
 /* Phase 4d: CSV claim scheduler.
