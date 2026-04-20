@@ -6231,10 +6231,10 @@ static struct command_result *json_factory_list(struct command *cmd,
  *   - penalties.by_state.pending > 0 (breach detected but not broadcast)
  *   - factories.by_lifecycle.dying > 0 sustained (stuck force-close)
  */
-/* Forward decl: sweep_state_name is defined near the sweep scheduler
- * but called from the earlier metrics RPC. */
-static const char *sweep_state_name(uint8_t s);
-
+/* sweep_state_name and cpfp_state_name are already forward-declared
+ * near the top of this file; they're defined with the scheduler
+ * blocks below. We only add lifecycle_name_ext + penalty_state_name
+ * here since those have no pre-existing stringifier. */
 static const char *lifecycle_name_ext(factory_lifecycle_t l)
 {
 	switch (l) {
@@ -6260,18 +6260,6 @@ static const char *penalty_state_name(uint8_t s)
 	case PENALTY_STATE_REPLACED:  return "replaced";
 	case PENALTY_STATE_STALE:     return "stale";
 	default:                       return "unknown";
-	}
-}
-
-static const char *cpfp_state_name(uint8_t s)
-{
-	switch (s) {
-	case CPFP_STATE_PENDING:   return "pending";
-	case CPFP_STATE_BROADCAST: return "broadcast";
-	case CPFP_STATE_CONFIRMED: return "confirmed";
-	case CPFP_STATE_FAILED:    return "failed";
-	case CPFP_STATE_RESOLVED:  return "resolved";
-	default:                    return "unknown";
 	}
 }
 
