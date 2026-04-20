@@ -30,7 +30,8 @@ cp "$PLUGIN_SRC/superscalar.c" "$PLUGIN_SRC/factory_state.h" \
    "$PLUGIN_SRC/factory_state.c" "$PLUGIN_SRC/persist.c" \
    "$PLUGIN_SRC/persist.h" "$PLUGIN_SRC/nonce_exchange.c" \
    "$PLUGIN_SRC/nonce_exchange.h" "$PLUGIN_SRC/fee_stubs.c" \
-   "$PLUGIN_SRC/ceremony.h" plugins/
+   "$PLUGIN_SRC/ceremony.h" "$PLUGIN_SRC/sweep_builder.c" \
+   "$PLUGIN_SRC/sweep_builder.h" plugins/
 
 # --- Step 1: Build slim libsuperscalar (only the 10 files we need) ---
 # The full libsuperscalar.a has 106 .o files. 96 of them export symbols
@@ -82,7 +83,7 @@ CFLAGS="-DCLN_NEXT_VERSION=\"v25.12\" \
   -DCOMPAT_V081=1 -DCOMPAT_V082=1 -DCOMPAT_V090=1 -DCOMPAT_V0100=1 \
   -DCOMPAT_V0121=1"
 
-for src in superscalar factory_state persist nonce_exchange fee_stubs; do
+for src in superscalar factory_state persist nonce_exchange fee_stubs sweep_builder; do
   cc $CFLAGS -c plugins/$src.c -o plugins/$src.o
 done
 
@@ -92,7 +93,8 @@ done
 # No --allow-multiple-definition needed.
 cc -Og -o plugins/superscalar \
   plugins/superscalar.o plugins/factory_state.o plugins/nonce_exchange.o \
-  plugins/persist.o plugins/fee_stubs.o plugins/libplugin.o \
+  plugins/persist.o plugins/fee_stubs.o plugins/sweep_builder.o \
+  plugins/libplugin.o \
   "$SLIM_DIR/libsuperscalar_slim.a" \
   libcommon.a libccan.a \
   -Lexternal/build-$(uname -m)-linux-gnu -lwallycore -lsecp256k1 -ljsmn -lbacktrace \

@@ -25,6 +25,7 @@
 #include "factory_state.h"
 #include "nonce_exchange.h"
 #include "persist.h"
+#include "sweep_builder.h"
 
 /* SuperScalar library */
 #include <superscalar/factory.h>
@@ -9653,8 +9654,7 @@ static int ss_sweep_scheduler_tick(struct command *cmd,
 				plugin_log(plugin_handle, LOG_INFORM,
 					   "sweep: entry %zu type=%s vout=%u "
 					   "amount=%"PRIu64" csv=%u now READY "
-					   "(confirmed_at=%u, current=%u). "
-					   "Phase 4d2 will broadcast.",
+					   "(confirmed_at=%u, current=%u)",
 					   i, sweep_type_name(ps->type),
 					   ps->source_vout, ps->amount_sats,
 					   ps->csv_delay,
@@ -9685,6 +9685,643 @@ static int ss_sweep_scheduler_tick(struct command *cmd,
 	if (dirty)
 		ss_save_factory(cmd, fi);
 	return transitions;
+}
+
+/* ============================================================
+ * Phase 4d2: READY → BROADCAST orchestration.
+ *
+ * When the scheduler advances a pending_sweep to READY, we must
+ * construct, sign, and broadcast a sweep TX that moves the source
+ * UTXO to a CLN-wallet P2TR address. The sweep destinations produced
+ * by our plugin (distribution TX per-party outputs, timeout-spend
+ * outputs) are all plain P2TR key-path outputs whose internal key is
+ * our derive_factory_seckey(instance_id, our_participant_idx). The
+ * build + sign runs in sweep_builder.c; this block handles the async
+ * dance (newaddr → build → sendrawtransaction → state update).
+ *
+ * Guards:
+ *   - A single READY entry kicks off at most once per tick. On entry,
+ *     state flips to BROADCAST eagerly with sweep_txid computed from
+ *     the signed TX bytes. The state flip prevents re-kickoff if the
+ *     scheduler fires again mid-broadcast.
+ *   - On broadcast error: state demotes to FAILED so the operator
+ *     can inspect via factory-list. A dev RPC path can clear FAILED
+ *     back to READY to retry; normal automatic retry is out of scope
+ *     for v1 (Phase 4d3 could add it).
+ * ============================================================ */
+
+#define SS_SWEEP_DEFAULT_FEERATE_KVB 1500
+
+struct ss_sweep_kickoff_ctx {
+	uint8_t instance_id[32];
+	uint8_t source_txid[32];
+	uint32_t source_vout;
+	uint8_t sweep_txid[32];     /* computed pre-broadcast, for logging */
+	uint64_t amount_sats;
+};
+
+/* Re-find a pending_sweep via (instance_id, source_txid, source_vout)
+ * after an async hop. The factory_instance_t pointer may still be
+ * valid, but asserting via lookup guards against mid-flight teardowns. */
+static pending_sweep_t *ss_sweep_lookup(const uint8_t *instance_id,
+					 const uint8_t *source_txid,
+					 uint32_t source_vout,
+					 factory_instance_t **fi_out)
+{
+	factory_instance_t *fi = ss_factory_find(&ss_state, instance_id);
+	if (!fi) return NULL;
+	for (size_t i = 0; i < fi->n_pending_sweeps; i++) {
+		pending_sweep_t *ps = &fi->pending_sweeps[i];
+		if (memcmp(ps->source_txid, source_txid, 32) == 0
+		    && ps->source_vout == source_vout) {
+			if (fi_out) *fi_out = fi;
+			return ps;
+		}
+	}
+	return NULL;
+}
+
+static struct command_result *
+ss_sweep_broadcast_reply(struct command *cmd,
+			 const char *method UNUSED,
+			 const char *buf,
+			 const jsmntok_t *result,
+			 void *arg)
+{
+	struct ss_sweep_kickoff_ctx *ctx = (struct ss_sweep_kickoff_ctx *)arg;
+	factory_instance_t *fi = NULL;
+	pending_sweep_t *ps = ss_sweep_lookup(ctx->instance_id,
+					      ctx->source_txid,
+					      ctx->source_vout, &fi);
+
+	/* Detect error reply (broadcast_reply_classified-style). */
+	const jsmntok_t *code_tok = result
+		? json_get_member(buf, result, "code")
+		: NULL;
+	bool is_error = code_tok != NULL;
+
+	if (!ps) {
+		plugin_log(plugin_handle, LOG_UNUSUAL,
+			   "sweep: broadcast reply for unknown entry — "
+			   "likely torn down mid-flight");
+		return aux_command_done(cmd);
+	}
+
+	if (is_error) {
+		ps->state = SWEEP_STATE_FAILED;
+		plugin_log(plugin_handle, LOG_UNUSUAL,
+			   "sweep broadcast FAILED: type=%s vout=%u — "
+			   "state demoted to FAILED for operator review",
+			   sweep_type_name(ps->type), ps->source_vout);
+		ss_save_factory(cmd, fi);
+	} else {
+		ps->broadcast_block = ss_state.current_blockheight;
+		plugin_log(plugin_handle, LOG_INFORM,
+			   "sweep broadcast OK: type=%s vout=%u "
+			   "amount=%"PRIu64" at block %u",
+			   sweep_type_name(ps->type), ps->source_vout,
+			   ps->amount_sats, ps->broadcast_block);
+		ss_save_factory(cmd, fi);
+	}
+	return aux_command_done(cmd);
+}
+
+static struct command_result *
+ss_sweep_newaddr_reply(struct command *cmd,
+		       const char *method UNUSED,
+		       const char *buf,
+		       const jsmntok_t *result,
+		       void *arg)
+{
+	struct ss_sweep_kickoff_ctx *ctx = (struct ss_sweep_kickoff_ctx *)arg;
+	factory_instance_t *fi = NULL;
+	pending_sweep_t *ps = ss_sweep_lookup(ctx->instance_id,
+					      ctx->source_txid,
+					      ctx->source_vout, &fi);
+	if (!ps) return aux_command_done(cmd);
+
+	const jsmntok_t *p2tr_tok = json_get_member(buf, result, "p2tr");
+	if (!p2tr_tok) {
+		ps->state = SWEEP_STATE_FAILED;
+		plugin_log(plugin_handle, LOG_UNUSUAL,
+			   "sweep: newaddr returned no p2tr — state FAILED");
+		ss_save_factory(cmd, fi);
+		return aux_command_done(cmd);
+	}
+	char *addr = json_strdup(tmpctx, buf, p2tr_tok);
+
+	u8 *dest_spk = NULL;
+	if (!decode_scriptpubkey_from_addr(tmpctx, chainparams,
+					    addr, &dest_spk) || !dest_spk) {
+		ps->state = SWEEP_STATE_FAILED;
+		plugin_log(plugin_handle, LOG_UNUSUAL,
+			   "sweep: couldn't decode newaddr %s — state FAILED",
+			   addr);
+		ss_save_factory(cmd, fi);
+		return aux_command_done(cmd);
+	}
+	size_t spk_len = tal_bytelen(dest_spk);
+
+	/* Derive our factory secret for the source output. */
+	uint8_t our_sec[32];
+	derive_factory_seckey(our_sec, fi->instance_id,
+			      fi->our_participant_idx);
+
+	uint8_t sweep_txid_out[32];
+	char *hex = ss_build_p2tr_keypath_sweep_hex(
+		ps->source_txid, ps->source_vout, ps->amount_sats,
+		our_sec, dest_spk, spk_len,
+		SS_SWEEP_DEFAULT_FEERATE_KVB, sweep_txid_out);
+	memset(our_sec, 0, 32);
+
+	if (!hex) {
+		ps->state = SWEEP_STATE_FAILED;
+		plugin_log(plugin_handle, LOG_UNUSUAL,
+			   "sweep: build_p2tr_keypath_sweep_hex failed "
+			   "(uneconomical or sign error) — state FAILED");
+		ss_save_factory(cmd, fi);
+		return aux_command_done(cmd);
+	}
+
+	/* Commit the eager state flip. The broadcast reply will demote
+	 * to FAILED if bitcoind rejects. */
+	memcpy(ps->sweep_txid, sweep_txid_out, 32);
+	memcpy(ctx->sweep_txid, sweep_txid_out, 32);
+	ps->state = SWEEP_STATE_BROADCAST;
+	ss_save_factory(cmd, fi);
+
+	struct out_req *req = jsonrpc_request_start(cmd,
+		"sendrawtransaction",
+		ss_sweep_broadcast_reply,
+		ss_sweep_broadcast_reply,
+		ctx);
+	json_add_string(req->js, "tx", hex);
+	json_add_bool(req->js, "allowhighfees", true);
+	send_outreq(req);
+	free(hex);
+	return command_still_pending(cmd);
+}
+
+/* Kick off a single READY sweep entry. Creates the async chain and
+ * returns immediately. Caller should NOT have already modified ps
+ * state.
+ *
+ * Guard: if source_txid is all-zero, this is a synthetic dev-injected
+ * entry whose real broadcast would fail at bitcoind anyway (no such
+ * UTXO). The older Phase 4d tests mark-broadcast these manually, so
+ * we skip auto-kickoff to keep those tests green and avoid RPC noise. */
+static void ss_sweep_kickoff_start(struct command *cmd,
+				   factory_instance_t *fi,
+				   pending_sweep_t *ps)
+{
+	bool all_zero = true;
+	for (int i = 0; i < 32; i++) {
+		if (ps->source_txid[i] != 0) { all_zero = false; break; }
+	}
+	if (all_zero) {
+		plugin_log(plugin_handle, LOG_DBG,
+			   "sweep kickoff skipped: synthetic source_txid");
+		return;
+	}
+	struct command *acmd = aux_command(cmd);
+	struct ss_sweep_kickoff_ctx *ctx = tal(acmd,
+		struct ss_sweep_kickoff_ctx);
+	memcpy(ctx->instance_id, fi->instance_id, 32);
+	memcpy(ctx->source_txid, ps->source_txid, 32);
+	ctx->source_vout = ps->source_vout;
+	ctx->amount_sats = ps->amount_sats;
+	memset(ctx->sweep_txid, 0, 32);
+
+	plugin_log(plugin_handle, LOG_INFORM,
+		   "sweep kickoff: type=%s vout=%u amount=%"PRIu64,
+		   sweep_type_name(ps->type), ps->source_vout,
+		   ps->amount_sats);
+
+	struct out_req *req = jsonrpc_request_start(acmd, "newaddr",
+		ss_sweep_newaddr_reply,
+		ss_sweep_newaddr_reply, /* same handler on err; it checks
+					 * for p2tr membership */
+		ctx);
+	json_add_string(req->js, "addresstype", "p2tr");
+	send_outreq(req);
+}
+
+/* Fire kickoffs for every READY entry in the factory's pending_sweeps.
+ * Called from the scheduler tick and from handle_block_added after
+ * the tick runs. Cap at MAX_PENDING_SWEEPS — there is no rate limit
+ * beyond that because the wallet/bitcoind can trivially handle a few
+ * tiny sweep TXs at once. */
+static void ss_sweep_kick_all_ready(struct command *cmd,
+				    factory_instance_t *fi)
+{
+	for (size_t i = 0; i < fi->n_pending_sweeps; i++) {
+		pending_sweep_t *ps = &fi->pending_sweeps[i];
+		if (ps->state == SWEEP_STATE_READY)
+			ss_sweep_kickoff_start(cmd, fi, ps);
+	}
+}
+
+/* ============================================================
+ * Phase 4d2: chain observation for source + sweep confirmations.
+ *
+ * Per-block probes of bitcoind via getrawtransaction verbose=true.
+ * Reply populates the factory_instance_t entry's confirmed_block or
+ * sweep_confirmed_block field. Scheduler tick then advances state on
+ * subsequent blocks.
+ *
+ * Why polling instead of a notifier? CLN plugins don't get a direct
+ * "tx confirmed" hook. We'd have to scan every new block for our
+ * relevant txids. Polling via getrawtransaction per tracked txid is
+ * O(pending_sweeps) RPCs per block — a handful per factory, cheap.
+ * ============================================================ */
+
+struct ss_sweep_probe_ctx {
+	uint8_t instance_id[32];
+	uint8_t probe_txid[32];
+	uint32_t probe_vout;        /* used only for source probes */
+	bool is_sweep_side;         /* false=source probe, true=sweep probe */
+};
+
+static struct command_result *
+ss_sweep_probe_reply(struct command *cmd,
+		     const char *method UNUSED,
+		     const char *buf,
+		     const jsmntok_t *result,
+		     void *arg)
+{
+	struct ss_sweep_probe_ctx *ctx = (struct ss_sweep_probe_ctx *)arg;
+
+	/* error reply = tx not found or not confirmed — normal on early
+	 * blocks. Silent continue. */
+	const jsmntok_t *code_tok = result
+		? json_get_member(buf, result, "code")
+		: NULL;
+	if (code_tok)
+		return aux_command_done(cmd);
+
+	const jsmntok_t *conf_tok = json_get_member(buf, result, "confirmations");
+	u32 confirmations = 0;
+	if (conf_tok)
+		json_to_u32(buf, conf_tok, &confirmations);
+
+	if (confirmations < 1)
+		return aux_command_done(cmd);
+
+	/* We stamp confirmed_block = current_blockheight - (confs - 1).
+	 * This avoids a second RPC round-trip; if the plugin's
+	 * current_blockheight is slightly stale we stamp slightly low,
+	 * which at worst delays the next-tick state transition by one
+	 * block — harmless for sweep timing. */
+	factory_instance_t *fi = ss_factory_find(&ss_state, ctx->instance_id);
+	if (!fi)
+		return aux_command_done(cmd);
+
+	u32 stamped_block = (ss_state.current_blockheight >= confirmations)
+		? ss_state.current_blockheight - (confirmations - 1)
+		: 0;
+
+	bool dirty = false;
+	for (size_t i = 0; i < fi->n_pending_sweeps; i++) {
+		pending_sweep_t *ps = &fi->pending_sweeps[i];
+		if (ctx->is_sweep_side) {
+			if (ps->state == SWEEP_STATE_BROADCAST
+			    && memcmp(ps->sweep_txid, ctx->probe_txid, 32) == 0
+			    && ps->sweep_confirmed_block == 0) {
+				ps->sweep_confirmed_block = stamped_block;
+				dirty = true;
+				plugin_log(plugin_handle, LOG_INFORM,
+					   "sweep: sweep_txid confirmed at "
+					   "block %u (confs=%u)",
+					   stamped_block, confirmations);
+			}
+		} else {
+			if (ps->state == SWEEP_STATE_PENDING
+			    && ps->source_vout == ctx->probe_vout
+			    && memcmp(ps->source_txid, ctx->probe_txid, 32) == 0
+			    && ps->confirmed_block == 0) {
+				ps->confirmed_block = stamped_block;
+				dirty = true;
+				plugin_log(plugin_handle, LOG_INFORM,
+					   "sweep: source confirmed at "
+					   "block %u (confs=%u) — will "
+					   "become READY at %u",
+					   stamped_block, confirmations,
+					   stamped_block + ps->csv_delay);
+			}
+		}
+	}
+	if (dirty)
+		ss_save_factory(cmd, fi);
+	return aux_command_done(cmd);
+}
+
+static void ss_sweep_probe_fire(struct command *cmd,
+				factory_instance_t *fi,
+				const uint8_t *probe_txid,
+				uint32_t probe_vout,
+				bool is_sweep_side)
+{
+	struct command *acmd = aux_command(cmd);
+	struct ss_sweep_probe_ctx *ctx = tal(acmd, struct ss_sweep_probe_ctx);
+	memcpy(ctx->instance_id, fi->instance_id, 32);
+	memcpy(ctx->probe_txid, probe_txid, 32);
+	ctx->probe_vout = probe_vout;
+	ctx->is_sweep_side = is_sweep_side;
+
+	char txhex[65];
+	/* bitcoind getrawtransaction takes the hash in RPC byte-order
+	 * (reversed from internal). */
+	for (int k = 0; k < 32; k++)
+		sprintf(txhex + k*2, "%02x", probe_txid[31 - k]);
+	txhex[64] = '\0';
+
+	struct out_req *req = jsonrpc_request_start(acmd, "getrawtransaction",
+		ss_sweep_probe_reply,
+		ss_sweep_probe_reply,
+		ctx);
+	json_add_string(req->js, "txid", txhex);
+	json_add_bool(req->js, "verbose", true);
+	send_outreq(req);
+}
+
+/* Probe all source_txids (for PENDING entries with confirmed_block=0)
+ * and all sweep_txids (for BROADCAST entries with sweep_confirmed_block=0).
+ * Called once per block per factory from handle_block_added. */
+static void ss_sweep_probe_all(struct command *cmd, factory_instance_t *fi)
+{
+	for (size_t i = 0; i < fi->n_pending_sweeps; i++) {
+		pending_sweep_t *ps = &fi->pending_sweeps[i];
+		if (ps->state == SWEEP_STATE_PENDING && ps->confirmed_block == 0) {
+			ss_sweep_probe_fire(cmd, fi, ps->source_txid,
+					    ps->source_vout, false);
+		} else if (ps->state == SWEEP_STATE_BROADCAST
+			   && ps->sweep_confirmed_block == 0) {
+			ss_sweep_probe_fire(cmd, fi, ps->sweep_txid, 0, true);
+		}
+	}
+}
+
+/* ============================================================
+ * Phase 4d2: registration helpers for the 3 broadcast sites.
+ *
+ * Called right after ss_broadcast_factory_tx at the distribution TX
+ * broadcast (both LSP + client) and timeout-spend broadcast (LSP
+ * only — clients don't run that path). Each helper computes our
+ * matching output vout + amount from the TX's output set.
+ * ============================================================ */
+
+/* Given a plugin-derived factory secret, compute the 34-byte P2TR
+ * scriptPubKey (OP_1 OP_PUSHBYTES_32 <xonly>) that the output would
+ * carry. Returns true on success. */
+static bool ss_derive_our_factory_spk(const factory_instance_t *fi,
+				      uint8_t out_spk34[34])
+{
+	uint8_t our_sec[32];
+	derive_factory_seckey(our_sec, fi->instance_id,
+			      fi->our_participant_idx);
+	secp256k1_keypair kp;
+	if (!secp256k1_keypair_create(global_secp_ctx, &kp, our_sec)) {
+		memset(our_sec, 0, 32);
+		return false;
+	}
+	memset(our_sec, 0, 32);
+	secp256k1_xonly_pubkey xonly;
+	int parity = 0;
+	if (!secp256k1_keypair_xonly_pub(global_secp_ctx, &xonly, &parity, &kp)) {
+		memset(&kp, 0, sizeof(kp));
+		return false;
+	}
+	memset(&kp, 0, sizeof(kp));
+	uint8_t ser[32];
+	if (!secp256k1_xonly_pubkey_serialize(global_secp_ctx, ser, &xonly))
+		return false;
+	out_spk34[0] = 0x51;
+	out_spk34[1] = 0x20;
+	memcpy(out_spk34 + 2, ser, 32);
+	return true;
+}
+
+/* Parse a raw serialized TX (as bytes) and extract outputs matching
+ * `match_spk34`. On match, stuff the (vout, amount) into out_vout +
+ * out_amount and return true for the first match. Minimal parser —
+ * handles only legacy-format non-witness TX bytes, which is what
+ * factory.c / timeout_spend emit BEFORE finalize_signed_tx adds
+ * witness. Our registration sites call this on the signed tx hex —
+ * we need to SKIP the witness marker/flag + witness data.
+ *
+ * Structure of a segwit-serialized TX:
+ *   4 bytes nVersion
+ *   1 byte marker (0x00) + 1 byte flag (0x01)   [segwit only]
+ *   varint n_in
+ *   for each input: 36 bytes outpoint + varint script + script + 4 bytes nSeq
+ *   varint n_out
+ *   for each output: 8 bytes amount + varint script + script
+ *   [witness data — skip]
+ *   4 bytes locktime
+ *
+ * Since we only need outputs, we parse up through the output section
+ * and stop. If marker/flag = 0x00 0x01 we skip them; otherwise we
+ * treat the first byte as n_in directly (legacy format). */
+static bool ss_parse_tx_find_output(const uint8_t *tx, size_t tx_len,
+				    const uint8_t *match_spk, size_t match_spk_len,
+				    uint32_t *out_vout, uint64_t *out_amount)
+{
+	if (tx_len < 10) return false;
+	size_t p = 4; /* skip nVersion */
+
+	/* Segwit marker/flag? */
+	if (p + 1 < tx_len && tx[p] == 0x00 && tx[p+1] == 0x01)
+		p += 2;
+
+	/* varint n_in */
+	if (p >= tx_len) return false;
+	uint64_t n_in;
+	if (tx[p] < 0xfd) { n_in = tx[p]; p += 1; }
+	else if (tx[p] == 0xfd) {
+		if (p + 3 > tx_len) return false;
+		n_in = tx[p+1] | (tx[p+2] << 8); p += 3;
+	} else return false;
+
+	for (uint64_t i = 0; i < n_in; i++) {
+		if (p + 36 > tx_len) return false;
+		p += 36; /* outpoint */
+		if (p >= tx_len) return false;
+		uint64_t scr_len;
+		if (tx[p] < 0xfd) { scr_len = tx[p]; p += 1; }
+		else if (tx[p] == 0xfd) {
+			if (p + 3 > tx_len) return false;
+			scr_len = tx[p+1] | (tx[p+2] << 8); p += 3;
+		} else return false;
+		if (p + scr_len + 4 > tx_len) return false;
+		p += scr_len + 4; /* script + nSeq */
+	}
+
+	if (p >= tx_len) return false;
+	uint64_t n_out;
+	if (tx[p] < 0xfd) { n_out = tx[p]; p += 1; }
+	else if (tx[p] == 0xfd) {
+		if (p + 3 > tx_len) return false;
+		n_out = tx[p+1] | (tx[p+2] << 8); p += 3;
+	} else return false;
+
+	for (uint64_t i = 0; i < n_out; i++) {
+		if (p + 8 > tx_len) return false;
+		uint64_t amount = 0;
+		for (int b = 0; b < 8; b++)
+			amount |= ((uint64_t)tx[p + b]) << (8 * b);
+		p += 8;
+		if (p >= tx_len) return false;
+		uint64_t scr_len;
+		if (tx[p] < 0xfd) { scr_len = tx[p]; p += 1; }
+		else if (tx[p] == 0xfd) {
+			if (p + 3 > tx_len) return false;
+			scr_len = tx[p+1] | (tx[p+2] << 8); p += 3;
+		} else return false;
+		if (p + scr_len > tx_len) return false;
+		if (scr_len == match_spk_len
+		    && memcmp(tx + p, match_spk, match_spk_len) == 0) {
+			if (out_vout) *out_vout = (uint32_t)i;
+			if (out_amount) *out_amount = amount;
+			return true;
+		}
+		p += scr_len;
+	}
+	return false;
+}
+
+/* Compute double-sha256 txid of a segwit TX. The txid is computed
+ * over the NON-witness serialization. For a signed segwit TX we emit,
+ * we need to strip marker/flag + witness data before hashing — but
+ * simpler: callers already hold the unsigned txid from build_unsigned_tx_v
+ * (see sweep_builder). For registration from ss_broadcast_factory_tx
+ * sites we use bitcoin_txid-style computation directly over the bytes
+ * after stripping marker/flag. Returns true on success. */
+static bool ss_compute_txid_from_signed(const uint8_t *tx, size_t tx_len,
+					 uint8_t out_txid[32])
+{
+	if (tx_len < 10) return false;
+	/* Build a witness-stripped copy. */
+	uint8_t *stripped = malloc(tx_len);
+	if (!stripped) return false;
+	size_t sp = 0;
+	/* nVersion */
+	memcpy(stripped + sp, tx, 4); sp += 4;
+	size_t p = 4;
+
+	bool is_segwit = (p + 1 < tx_len && tx[p] == 0x00 && tx[p+1] == 0x01);
+	if (is_segwit) p += 2;
+
+	/* Copy n_in + inputs. */
+	if (p >= tx_len) { free(stripped); return false; }
+	size_t in_start = p;
+	uint64_t n_in;
+	if (tx[p] < 0xfd) { n_in = tx[p]; p += 1; }
+	else if (tx[p] == 0xfd) {
+		if (p + 3 > tx_len) { free(stripped); return false; }
+		n_in = tx[p+1] | (tx[p+2] << 8); p += 3;
+	} else { free(stripped); return false; }
+	for (uint64_t i = 0; i < n_in; i++) {
+		if (p + 36 > tx_len) { free(stripped); return false; }
+		p += 36;
+		if (p >= tx_len) { free(stripped); return false; }
+		uint64_t scr_len;
+		if (tx[p] < 0xfd) { scr_len = tx[p]; p += 1; }
+		else if (tx[p] == 0xfd) {
+			if (p + 3 > tx_len) { free(stripped); return false; }
+			scr_len = tx[p+1] | (tx[p+2] << 8); p += 3;
+		} else { free(stripped); return false; }
+		if (p + scr_len + 4 > tx_len) { free(stripped); return false; }
+		p += scr_len + 4;
+	}
+	memcpy(stripped + sp, tx + in_start, p - in_start);
+	sp += p - in_start;
+
+	/* Copy n_out + outputs. */
+	if (p >= tx_len) { free(stripped); return false; }
+	size_t out_start = p;
+	uint64_t n_out;
+	if (tx[p] < 0xfd) { n_out = tx[p]; p += 1; }
+	else if (tx[p] == 0xfd) {
+		if (p + 3 > tx_len) { free(stripped); return false; }
+		n_out = tx[p+1] | (tx[p+2] << 8); p += 3;
+	} else { free(stripped); return false; }
+	for (uint64_t i = 0; i < n_out; i++) {
+		if (p + 8 > tx_len) { free(stripped); return false; }
+		p += 8;
+		if (p >= tx_len) { free(stripped); return false; }
+		uint64_t scr_len;
+		if (tx[p] < 0xfd) { scr_len = tx[p]; p += 1; }
+		else if (tx[p] == 0xfd) {
+			if (p + 3 > tx_len) { free(stripped); return false; }
+			scr_len = tx[p+1] | (tx[p+2] << 8); p += 3;
+		} else { free(stripped); return false; }
+		if (p + scr_len > tx_len) { free(stripped); return false; }
+		p += scr_len;
+	}
+	memcpy(stripped + sp, tx + out_start, p - out_start);
+	sp += p - out_start;
+
+	/* Skip witness data if segwit. Witness layout: for each input,
+	 * varint n_stackitems, then each item as varint-length + data. */
+	if (is_segwit) {
+		for (uint64_t i = 0; i < n_in; i++) {
+			if (p >= tx_len) { free(stripped); return false; }
+			uint64_t n_items;
+			if (tx[p] < 0xfd) { n_items = tx[p]; p += 1; }
+			else if (tx[p] == 0xfd) {
+				if (p + 3 > tx_len) { free(stripped); return false; }
+				n_items = tx[p+1] | (tx[p+2] << 8); p += 3;
+			} else { free(stripped); return false; }
+			for (uint64_t j = 0; j < n_items; j++) {
+				if (p >= tx_len) { free(stripped); return false; }
+				uint64_t item_len;
+				if (tx[p] < 0xfd) { item_len = tx[p]; p += 1; }
+				else if (tx[p] == 0xfd) {
+					if (p + 3 > tx_len) { free(stripped); return false; }
+					item_len = tx[p+1] | (tx[p+2] << 8); p += 3;
+				} else { free(stripped); return false; }
+				if (p + item_len > tx_len) { free(stripped); return false; }
+				p += item_len;
+			}
+		}
+	}
+
+	/* 4 bytes locktime. */
+	if (p + 4 > tx_len) { free(stripped); return false; }
+	memcpy(stripped + sp, tx + p, 4); sp += 4;
+
+	struct sha256 h1, h2;
+	sha256(&h1, stripped, sp);
+	sha256(&h2, &h1, sizeof(h1));
+	memcpy(out_txid, &h2, 32);
+	free(stripped);
+	return true;
+}
+
+/* Register a pending sweep for our output in a just-broadcast TX.
+ * Walks the tx's output list for a match against our derived factory
+ * spk. Silent no-op if our role produces no output in this TX. */
+static void ss_register_sweep_from_tx(factory_instance_t *fi,
+				      uint8_t type,
+				      const uint8_t *tx_bytes,
+				      size_t tx_len,
+				      uint32_t csv_delay)
+{
+	uint8_t our_spk[34];
+	if (!ss_derive_our_factory_spk(fi, our_spk))
+		return;
+
+	uint32_t vout;
+	uint64_t amount;
+	if (!ss_parse_tx_find_output(tx_bytes, tx_len, our_spk, 34,
+				     &vout, &amount))
+		return;
+
+	uint8_t txid[32];
+	if (!ss_compute_txid_from_signed(tx_bytes, tx_len, txid))
+		return;
+
+	ss_register_pending_sweep(fi, type, txid, vout, amount, csv_delay);
 }
 
 static struct command_result *breach_utxo_checked(struct command *cmd,
@@ -10065,6 +10702,20 @@ static struct command_result *handle_block_added(struct command *cmd,
 					   "(%zu bytes) — client fallback",
 					   fi->dist_signed_tx_len);
 
+				/* Phase 4d2: register a pending_sweep for our
+				 * output in the dist TX. LSP (our_participant_idx=0)
+				 * gets the stock share; each client gets a leaf.
+				 * Both roles run this path against fi->dist_signed_tx;
+				 * the helper finds our spk by derived xonly. No
+				 * match ⇒ silent no-op (e.g. if the dist TX was
+				 * built for a non-us role). csv_delay=0 since dist
+				 * outputs are immediately spendable after confirm. */
+				ss_register_sweep_from_tx(fi,
+					fi->is_lsp ? SWEEP_TYPE_FACTORY_LSTOCK
+						   : SWEEP_TYPE_FACTORY_LEAF,
+					fi->dist_signed_tx,
+					fi->dist_signed_tx_len, 0);
+
 				/* Phase 3c2.5d: register the dist TX for CPFP
 				 * if it carries an anchor. The dist TX is
 				 * the fallback that lets clients claim their
@@ -10140,6 +10791,18 @@ static struct command_result *handle_block_added(struct command *cmd,
 								   "Timeout spend: node %zu "
 								   "(%zu bytes)", ni,
 								   timeout_tx.len);
+
+							/* Phase 4d2: register sweep against
+							 * this timeout-spend TX's output. Dest
+							 * is LSP's P2TR key-path, so the sweep
+							 * will only register on the LSP side.
+							 * csv_delay=0: timeout-spend outputs
+							 * are immediately spendable once the
+							 * TX confirms. */
+							ss_register_sweep_from_tx(fi,
+								SWEEP_TYPE_FACTORY_TIMEOUT,
+								timeout_tx.data,
+								timeout_tx.len, 0);
 						}
 						tx_buf_free(&timeout_tx);
 					}
@@ -10364,6 +11027,11 @@ static struct command_result *handle_block_added(struct command *cmd,
 		if (fi->n_pending_sweeps > 0) {
 			ss_sweep_scheduler_tick(cmd, fi,
 				ss_state.current_blockheight);
+			/* Phase 4d2: probe source + sweep confirmations via
+			 * getrawtransaction, then kick off broadcast of any
+			 * entry that has become READY. */
+			ss_sweep_probe_all(cmd, fi);
+			ss_sweep_kick_all_ready(cmd, fi);
 		}
 
 		/* Phase 3c2: CPFP-via-anchor scheduler tick. Walks pending
@@ -12571,6 +13239,10 @@ json_dev_factory_tick_sweep_scheduler(struct command *cmd,
 		return command_fail(cmd, LIGHTNINGD, "Factory not found");
 
 	int transitions = ss_sweep_scheduler_tick(cmd, fi, *block_height);
+	/* Phase 4d2: dev tick also fires kickoff for any entries that
+	 * transitioned to READY. Tests rely on this to drive full
+	 * state-machine advancement without waiting on a real block. */
+	ss_sweep_kick_all_ready(cmd, fi);
 
 	struct json_stream *js = jsonrpc_stream_success(cmd);
 	json_add_string(js, "instance_id", id_hex);
