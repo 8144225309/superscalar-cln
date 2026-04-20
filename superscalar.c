@@ -8361,23 +8361,27 @@ static int ss_cpfp_scheduler_tick(struct command *cmd,
  * for scaffolding simplicity.
  * ============================================================ */
 
-/* Caller-provided done callback signature. On success, done_cb fires
- * once with the picked UTXO's details. spk_hex is the scriptpubkey
- * as a lowercase hex string (CLN's listfunds format). */
-typedef void (*utxo_pick_done_cb)(struct command *cmd,
-				  void *arg,
-				  const char *txid_hex,
-				  uint32_t vout,
-				  uint64_t amount_sat,
-				  const char *spk_hex,
-				  const char *address);
+/* Caller-provided done callback signature. Return the command_result
+ * the caller wants propagated (typically command_finished from a
+ * json_stream). Must NOT keep references to txid_hex/spk_hex/address
+ * beyond the call — they're tal'd on tmpctx and will be freed. */
+typedef struct command_result *
+(*utxo_pick_done_cb)(struct command *cmd,
+		     void *arg,
+		     const char *txid_hex,
+		     uint32_t vout,
+		     uint64_t amount_sat,
+		     const char *spk_hex,
+		     const char *address);
 
-/* Caller-provided failure callback. Reason is a short, stable identifier
- * (e.g. "no_confirmed_utxo", "rpc_error", "parse_error") — safe to
- * switch on in tests. */
-typedef void (*utxo_pick_fail_cb)(struct command *cmd,
-				  void *arg,
-				  const char *reason);
+/* Caller-provided failure callback. Return the command_result the
+ * caller wants propagated. Reason is stable for tests to switch on:
+ * "no_confirmed_utxo", "rpc_error", "listfunds_parse",
+ * "listfunds_field_missing", "listfunds_vout_parse". */
+typedef struct command_result *
+(*utxo_pick_fail_cb)(struct command *cmd,
+		     void *arg,
+		     const char *reason);
 
 struct utxo_pick_ctx {
 	uint64_t min_amount_sat;
@@ -8397,10 +8401,8 @@ utxo_pick_listfunds_reply(struct command *cmd,
 
 	const jsmntok_t *outputs =
 		json_get_member(buf, result, "outputs");
-	if (!outputs || outputs->type != JSMN_ARRAY) {
-		ctx->fail_cb(cmd, ctx->arg, "listfunds_parse");
-		return command_still_pending(cmd);
-	}
+	if (!outputs || outputs->type != JSMN_ARRAY)
+		return ctx->fail_cb(cmd, ctx->arg, "listfunds_parse");
 
 	/* Iterate, track smallest-viable. Fields we care about:
 	 *   txid, output (= vout), amount_msat, scriptpubkey, address,
@@ -8443,33 +8445,27 @@ utxo_pick_listfunds_reply(struct command *cmd,
 		}
 	}
 
-	if (!best) {
-		ctx->fail_cb(cmd, ctx->arg, "no_confirmed_utxo");
-		return command_still_pending(cmd);
-	}
+	if (!best)
+		return ctx->fail_cb(cmd, ctx->arg, "no_confirmed_utxo");
 
 	const jsmntok_t *txid_tok = json_get_member(buf, best, "txid");
 	const jsmntok_t *vout_tok = json_get_member(buf, best, "output");
 	const jsmntok_t *spk_tok =
 		json_get_member(buf, best, "scriptpubkey");
 	const jsmntok_t *addr_tok = json_get_member(buf, best, "address");
-	if (!txid_tok || !vout_tok || !spk_tok || !addr_tok) {
-		ctx->fail_cb(cmd, ctx->arg, "listfunds_field_missing");
-		return command_still_pending(cmd);
-	}
+	if (!txid_tok || !vout_tok || !spk_tok || !addr_tok)
+		return ctx->fail_cb(cmd, ctx->arg,
+				    "listfunds_field_missing");
 
 	char *txid_hex = json_strdup(tmpctx, buf, txid_tok);
 	char *spk_hex = json_strdup(tmpctx, buf, spk_tok);
 	char *addr = json_strdup(tmpctx, buf, addr_tok);
 	u32 vout_u32;
-	if (!json_to_u32(buf, vout_tok, &vout_u32)) {
-		ctx->fail_cb(cmd, ctx->arg, "listfunds_vout_parse");
-		return command_still_pending(cmd);
-	}
+	if (!json_to_u32(buf, vout_tok, &vout_u32))
+		return ctx->fail_cb(cmd, ctx->arg, "listfunds_vout_parse");
 
-	ctx->done_cb(cmd, ctx->arg, txid_hex, vout_u32, best_amount,
-		     spk_hex, addr);
-	return command_still_pending(cmd);
+	return ctx->done_cb(cmd, ctx->arg, txid_hex, vout_u32, best_amount,
+			    spk_hex, addr);
 }
 
 static struct command_result *
@@ -8480,8 +8476,7 @@ utxo_pick_listfunds_err(struct command *cmd,
 			void *arg)
 {
 	struct utxo_pick_ctx *ctx = (struct utxo_pick_ctx *)arg;
-	ctx->fail_cb(cmd, ctx->arg, "rpc_error");
-	return command_still_pending(cmd);
+	return ctx->fail_cb(cmd, ctx->arg, "rpc_error");
 }
 
 /* Kick off the listfunds → pick pipeline. done_cb fires on success with
@@ -8510,13 +8505,15 @@ static void ss_pick_wallet_utxo(struct command *cmd,
 
 /* === change-address helper === */
 
-typedef void (*change_addr_done_cb)(struct command *cmd,
-				    void *arg,
-				    const char *address);
+typedef struct command_result *
+(*change_addr_done_cb)(struct command *cmd,
+		       void *arg,
+		       const char *address);
 
-typedef void (*change_addr_fail_cb)(struct command *cmd,
-				    void *arg,
-				    const char *reason);
+typedef struct command_result *
+(*change_addr_fail_cb)(struct command *cmd,
+		       void *arg,
+		       const char *reason);
 
 struct change_addr_ctx {
 	change_addr_done_cb done_cb;
@@ -8533,13 +8530,10 @@ change_addr_newaddr_reply(struct command *cmd,
 {
 	struct change_addr_ctx *ctx = (struct change_addr_ctx *)arg;
 	const jsmntok_t *p2tr_tok = json_get_member(buf, result, "p2tr");
-	if (!p2tr_tok) {
-		ctx->fail_cb(cmd, ctx->arg, "newaddr_parse");
-		return command_still_pending(cmd);
-	}
+	if (!p2tr_tok)
+		return ctx->fail_cb(cmd, ctx->arg, "newaddr_parse");
 	char *addr = json_strdup(tmpctx, buf, p2tr_tok);
-	ctx->done_cb(cmd, ctx->arg, addr);
-	return command_still_pending(cmd);
+	return ctx->done_cb(cmd, ctx->arg, addr);
 }
 
 static struct command_result *
@@ -8550,8 +8544,7 @@ change_addr_newaddr_err(struct command *cmd,
 			void *arg)
 {
 	struct change_addr_ctx *ctx = (struct change_addr_ctx *)arg;
-	ctx->fail_cb(cmd, ctx->arg, "rpc_error");
-	return command_still_pending(cmd);
+	return ctx->fail_cb(cmd, ctx->arg, "rpc_error");
 }
 
 /* Request a fresh P2TR change address. CLN's newaddr p2tr returns a
@@ -10794,13 +10787,14 @@ struct test_utxo_pick_ctx {
 	struct command *orig_cmd;
 };
 
-static void test_utxo_pick_done(struct command *cmd UNUSED,
-				void *arg,
-				const char *txid_hex,
-				uint32_t vout,
-				uint64_t amount_sat,
-				const char *spk_hex,
-				const char *address)
+static struct command_result *
+test_utxo_pick_done(struct command *cmd UNUSED,
+		    void *arg,
+		    const char *txid_hex,
+		    uint32_t vout,
+		    uint64_t amount_sat,
+		    const char *spk_hex,
+		    const char *address)
 {
 	struct test_utxo_pick_ctx *ctx =
 		(struct test_utxo_pick_ctx *)arg;
@@ -10811,19 +10805,20 @@ static void test_utxo_pick_done(struct command *cmd UNUSED,
 	json_add_u64(js, "amount_sat", amount_sat);
 	json_add_string(js, "scriptpubkey", spk_hex);
 	json_add_string(js, "address", address);
-	command_finished(ctx->orig_cmd, js);
+	return command_finished(ctx->orig_cmd, js);
 }
 
-static void test_utxo_pick_fail(struct command *cmd UNUSED,
-				void *arg,
-				const char *reason)
+static struct command_result *
+test_utxo_pick_fail(struct command *cmd UNUSED,
+		    void *arg,
+		    const char *reason)
 {
 	struct test_utxo_pick_ctx *ctx =
 		(struct test_utxo_pick_ctx *)arg;
 	struct json_stream *js = jsonrpc_stream_success(ctx->orig_cmd);
 	json_add_string(js, "status", "fail");
 	json_add_string(js, "reason", reason);
-	command_finished(ctx->orig_cmd, js);
+	return command_finished(ctx->orig_cmd, js);
 }
 
 static struct command_result *
@@ -10854,28 +10849,30 @@ struct test_change_addr_ctx {
 	struct command *orig_cmd;
 };
 
-static void test_change_addr_done(struct command *cmd UNUSED,
-				  void *arg,
-				  const char *address)
+static struct command_result *
+test_change_addr_done(struct command *cmd UNUSED,
+		      void *arg,
+		      const char *address)
 {
 	struct test_change_addr_ctx *ctx =
 		(struct test_change_addr_ctx *)arg;
 	struct json_stream *js = jsonrpc_stream_success(ctx->orig_cmd);
 	json_add_string(js, "status", "ok");
 	json_add_string(js, "address", address);
-	command_finished(ctx->orig_cmd, js);
+	return command_finished(ctx->orig_cmd, js);
 }
 
-static void test_change_addr_fail(struct command *cmd UNUSED,
-				  void *arg,
-				  const char *reason)
+static struct command_result *
+test_change_addr_fail(struct command *cmd UNUSED,
+		      void *arg,
+		      const char *reason)
 {
 	struct test_change_addr_ctx *ctx =
 		(struct test_change_addr_ctx *)arg;
 	struct json_stream *js = jsonrpc_stream_success(ctx->orig_cmd);
 	json_add_string(js, "status", "fail");
 	json_add_string(js, "reason", reason);
-	command_finished(ctx->orig_cmd, js);
+	return command_finished(ctx->orig_cmd, js);
 }
 
 static struct command_result *
