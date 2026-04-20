@@ -8330,6 +8330,245 @@ static int ss_cpfp_scheduler_tick(struct command *cmd,
 }
 
 /* ============================================================
+ * Phase 3c2.5a: Wallet integration helpers.
+ *
+ * Async helpers for the CPFP-via-anchor pipeline. v1 provides the two
+ * wallet-facing primitives needed by Phase 3c2.5b (PSBT construction):
+ *
+ *   ss_pick_wallet_utxo  — listfunds → pick smallest confirmed UTXO
+ *                          whose amount >= min_amount_sat. Invokes the
+ *                          caller's done_cb with (txid, vout, amount,
+ *                          scriptpubkey_hex, address).
+ *   ss_get_change_p2tr   — newaddr p2tr → the returned bech32m
+ *                          address. Caller decodes to scriptPubKey in
+ *                          3c2.5b.
+ *
+ * Both helpers are caller-lifetime-safe: they chain jsonrpc_request_start
+ * on the cmd passed in. If caller is an RPC handler, that cmd lives
+ * through command_finished; done_cb calls command_finished on the
+ * ORIGINAL cmd. If caller is a scheduler/notification handler, caller
+ * is expected to aux_command-wrap BEFORE invoking and pass the aux cmd
+ * as both the helper parent and the done-cb's target.
+ *
+ * UTXO selection policy: smallest-viable. Picking the smallest UTXO
+ * >= min_amount minimizes wallet lock-up (we free the smallest coin
+ * that fits rather than e.g. our biggest). Matches typical wallet
+ * coin-selection heuristics.
+ *
+ * Race note: between listfunds and signpsbt there's a small window
+ * where another CLN operation could consume the chosen UTXO. Phase
+ * 3c2.5b will add reserveinputs to close this. v1 accepts the race
+ * for scaffolding simplicity.
+ * ============================================================ */
+
+/* Caller-provided done callback signature. Return the command_result
+ * the caller wants propagated (typically command_finished from a
+ * json_stream). Must NOT keep references to txid_hex/spk_hex/address
+ * beyond the call — they're tal'd on tmpctx and will be freed. */
+typedef struct command_result *
+(*utxo_pick_done_cb)(struct command *cmd,
+		     void *arg,
+		     const char *txid_hex,
+		     uint32_t vout,
+		     uint64_t amount_sat,
+		     const char *spk_hex,
+		     const char *address);
+
+/* Caller-provided failure callback. Return the command_result the
+ * caller wants propagated. Reason is stable for tests to switch on:
+ * "no_confirmed_utxo", "rpc_error", "listfunds_parse",
+ * "listfunds_field_missing", "listfunds_vout_parse". */
+typedef struct command_result *
+(*utxo_pick_fail_cb)(struct command *cmd,
+		     void *arg,
+		     const char *reason);
+
+struct utxo_pick_ctx {
+	uint64_t min_amount_sat;
+	utxo_pick_done_cb done_cb;
+	utxo_pick_fail_cb fail_cb;
+	void *arg;
+};
+
+static struct command_result *
+utxo_pick_listfunds_reply(struct command *cmd,
+			  const char *method UNUSED,
+			  const char *buf,
+			  const jsmntok_t *result,
+			  void *arg)
+{
+	struct utxo_pick_ctx *ctx = (struct utxo_pick_ctx *)arg;
+
+	const jsmntok_t *outputs =
+		json_get_member(buf, result, "outputs");
+	if (!outputs || outputs->type != JSMN_ARRAY)
+		return ctx->fail_cb(cmd, ctx->arg, "listfunds_parse");
+
+	/* Iterate, track smallest-viable. Fields we care about:
+	 *   txid, output (= vout), amount_msat, scriptpubkey, address,
+	 *   status (= "confirmed"), reserved (= false). */
+	const jsmntok_t *best = NULL;
+	uint64_t best_amount = UINT64_MAX;
+
+	const jsmntok_t *t;
+	size_t i;
+	json_for_each_arr(i, t, outputs) {
+		const jsmntok_t *status_tok =
+			json_get_member(buf, t, "status");
+		const jsmntok_t *reserved_tok =
+			json_get_member(buf, t, "reserved");
+		const jsmntok_t *amt_tok =
+			json_get_member(buf, t, "amount_msat");
+		if (!status_tok || !reserved_tok || !amt_tok) continue;
+
+		/* Reject non-confirmed. */
+		if (!json_tok_streq(buf, status_tok, "confirmed"))
+			continue;
+
+		/* Reject reserved. CLN emits true/false as JSON booleans. */
+		bool reserved_flag;
+		if (!json_to_bool(buf, reserved_tok, &reserved_flag))
+			continue;
+		if (reserved_flag)
+			continue;
+
+		u64 amt_msat;
+		if (!json_to_u64(buf, amt_tok, &amt_msat))
+			continue;
+		uint64_t amt_sat = amt_msat / 1000;
+		if (amt_sat < ctx->min_amount_sat)
+			continue;
+
+		if (amt_sat < best_amount) {
+			best_amount = amt_sat;
+			best = t;
+		}
+	}
+
+	if (!best)
+		return ctx->fail_cb(cmd, ctx->arg, "no_confirmed_utxo");
+
+	const jsmntok_t *txid_tok = json_get_member(buf, best, "txid");
+	const jsmntok_t *vout_tok = json_get_member(buf, best, "output");
+	const jsmntok_t *spk_tok =
+		json_get_member(buf, best, "scriptpubkey");
+	const jsmntok_t *addr_tok = json_get_member(buf, best, "address");
+	if (!txid_tok || !vout_tok || !spk_tok || !addr_tok)
+		return ctx->fail_cb(cmd, ctx->arg,
+				    "listfunds_field_missing");
+
+	char *txid_hex = json_strdup(tmpctx, buf, txid_tok);
+	char *spk_hex = json_strdup(tmpctx, buf, spk_tok);
+	char *addr = json_strdup(tmpctx, buf, addr_tok);
+	u32 vout_u32;
+	if (!json_to_u32(buf, vout_tok, &vout_u32))
+		return ctx->fail_cb(cmd, ctx->arg, "listfunds_vout_parse");
+
+	return ctx->done_cb(cmd, ctx->arg, txid_hex, vout_u32, best_amount,
+			    spk_hex, addr);
+}
+
+static struct command_result *
+utxo_pick_listfunds_err(struct command *cmd,
+			const char *method UNUSED,
+			const char *buf UNUSED,
+			const jsmntok_t *result UNUSED,
+			void *arg)
+{
+	struct utxo_pick_ctx *ctx = (struct utxo_pick_ctx *)arg;
+	return ctx->fail_cb(cmd, ctx->arg, "rpc_error");
+}
+
+/* Kick off the listfunds → pick pipeline. done_cb fires on success with
+ * the chosen UTXO's fields; fail_cb on any failure (RPC error, no viable
+ * UTXO, parse error). Exactly one of the two callbacks will fire. */
+static void ss_pick_wallet_utxo(struct command *cmd,
+				uint64_t min_amount_sat,
+				utxo_pick_done_cb done_cb,
+				utxo_pick_fail_cb fail_cb,
+				void *arg)
+{
+	struct utxo_pick_ctx *ctx = tal(cmd, struct utxo_pick_ctx);
+	ctx->min_amount_sat = min_amount_sat;
+	ctx->done_cb = done_cb;
+	ctx->fail_cb = fail_cb;
+	ctx->arg = arg;
+
+	struct out_req *req = jsonrpc_request_start(cmd, "listfunds",
+		utxo_pick_listfunds_reply,
+		utxo_pick_listfunds_err,
+		ctx);
+	/* listfunds has a "spent" boolean param (optional) — default
+	 * false, which excludes spent UTXOs. No other params we need. */
+	send_outreq(req);
+}
+
+/* === change-address helper === */
+
+typedef struct command_result *
+(*change_addr_done_cb)(struct command *cmd,
+		       void *arg,
+		       const char *address);
+
+typedef struct command_result *
+(*change_addr_fail_cb)(struct command *cmd,
+		       void *arg,
+		       const char *reason);
+
+struct change_addr_ctx {
+	change_addr_done_cb done_cb;
+	change_addr_fail_cb fail_cb;
+	void *arg;
+};
+
+static struct command_result *
+change_addr_newaddr_reply(struct command *cmd,
+			  const char *method UNUSED,
+			  const char *buf,
+			  const jsmntok_t *result,
+			  void *arg)
+{
+	struct change_addr_ctx *ctx = (struct change_addr_ctx *)arg;
+	const jsmntok_t *p2tr_tok = json_get_member(buf, result, "p2tr");
+	if (!p2tr_tok)
+		return ctx->fail_cb(cmd, ctx->arg, "newaddr_parse");
+	char *addr = json_strdup(tmpctx, buf, p2tr_tok);
+	return ctx->done_cb(cmd, ctx->arg, addr);
+}
+
+static struct command_result *
+change_addr_newaddr_err(struct command *cmd,
+			const char *method UNUSED,
+			const char *buf UNUSED,
+			const jsmntok_t *result UNUSED,
+			void *arg)
+{
+	struct change_addr_ctx *ctx = (struct change_addr_ctx *)arg;
+	return ctx->fail_cb(cmd, ctx->arg, "rpc_error");
+}
+
+/* Request a fresh P2TR change address. CLN's newaddr p2tr returns a
+ * bech32m address; Phase 3c2.5b will decode it to the 34-byte
+ * scriptPubKey (OP_1 OP_PUSHBYTES_32 <x-only>). */
+static void ss_get_change_p2tr(struct command *cmd,
+			       change_addr_done_cb done_cb,
+			       change_addr_fail_cb fail_cb,
+			       void *arg)
+{
+	struct change_addr_ctx *ctx = tal(cmd, struct change_addr_ctx);
+	ctx->done_cb = done_cb;
+	ctx->fail_cb = fail_cb;
+	ctx->arg = arg;
+
+	struct out_req *req = jsonrpc_request_start(cmd, "newaddr",
+		change_addr_newaddr_reply,
+		change_addr_newaddr_err,
+		ctx);
+	json_add_string(req->js, "addresstype", "p2tr");
+	send_outreq(req);
+}
+
+/* ============================================================
  * Phase 4d: CSV claim scheduler.
  *
  * Algorithm ported from upstream sweeper.c:sweeper_check (see
@@ -10539,6 +10778,120 @@ json_factory_abort_stuck(struct command *cmd,
 	return command_finished(cmd, js);
 }
 
+/* Phase 3c2.5a test RPCs — exercise the wallet helpers end-to-end
+ * without invoking the full CPFP pipeline. Used by pytest to verify
+ * the async RPC chains work + UTXO selection picks the right coin.
+ * Response shape is stable so tests can assert on specific fields. */
+
+struct test_utxo_pick_ctx {
+	struct command *orig_cmd;
+};
+
+static struct command_result *
+test_utxo_pick_done(struct command *cmd UNUSED,
+		    void *arg,
+		    const char *txid_hex,
+		    uint32_t vout,
+		    uint64_t amount_sat,
+		    const char *spk_hex,
+		    const char *address)
+{
+	struct test_utxo_pick_ctx *ctx =
+		(struct test_utxo_pick_ctx *)arg;
+	struct json_stream *js = jsonrpc_stream_success(ctx->orig_cmd);
+	json_add_string(js, "status", "ok");
+	json_add_string(js, "txid", txid_hex);
+	json_add_u32(js, "vout", vout);
+	json_add_u64(js, "amount_sat", amount_sat);
+	json_add_string(js, "scriptpubkey", spk_hex);
+	json_add_string(js, "address", address);
+	return command_finished(ctx->orig_cmd, js);
+}
+
+static struct command_result *
+test_utxo_pick_fail(struct command *cmd UNUSED,
+		    void *arg,
+		    const char *reason)
+{
+	struct test_utxo_pick_ctx *ctx =
+		(struct test_utxo_pick_ctx *)arg;
+	struct json_stream *js = jsonrpc_stream_success(ctx->orig_cmd);
+	json_add_string(js, "status", "fail");
+	json_add_string(js, "reason", reason);
+	return command_finished(ctx->orig_cmd, js);
+}
+
+static struct command_result *
+json_dev_factory_test_utxo_pick(struct command *cmd,
+				const char *buf,
+				const jsmntok_t *params)
+{
+	u64 *min_amount_sat;
+
+	if (!param(cmd, buf, params,
+		   p_opt_def("min_amount_sat", param_u64, &min_amount_sat,
+			     10000),
+		   NULL))
+		return command_param_failed();
+
+	struct test_utxo_pick_ctx *ctx =
+		tal(cmd, struct test_utxo_pick_ctx);
+	ctx->orig_cmd = cmd;
+
+	ss_pick_wallet_utxo(cmd, *min_amount_sat,
+			    test_utxo_pick_done,
+			    test_utxo_pick_fail,
+			    ctx);
+	return command_still_pending(cmd);
+}
+
+struct test_change_addr_ctx {
+	struct command *orig_cmd;
+};
+
+static struct command_result *
+test_change_addr_done(struct command *cmd UNUSED,
+		      void *arg,
+		      const char *address)
+{
+	struct test_change_addr_ctx *ctx =
+		(struct test_change_addr_ctx *)arg;
+	struct json_stream *js = jsonrpc_stream_success(ctx->orig_cmd);
+	json_add_string(js, "status", "ok");
+	json_add_string(js, "address", address);
+	return command_finished(ctx->orig_cmd, js);
+}
+
+static struct command_result *
+test_change_addr_fail(struct command *cmd UNUSED,
+		      void *arg,
+		      const char *reason)
+{
+	struct test_change_addr_ctx *ctx =
+		(struct test_change_addr_ctx *)arg;
+	struct json_stream *js = jsonrpc_stream_success(ctx->orig_cmd);
+	json_add_string(js, "status", "fail");
+	json_add_string(js, "reason", reason);
+	return command_finished(ctx->orig_cmd, js);
+}
+
+static struct command_result *
+json_dev_factory_test_change_addr(struct command *cmd,
+				  const char *buf,
+				  const jsmntok_t *params)
+{
+	if (!param(cmd, buf, params, NULL))
+		return command_param_failed();
+
+	struct test_change_addr_ctx *ctx =
+		tal(cmd, struct test_change_addr_ctx);
+	ctx->orig_cmd = cmd;
+
+	ss_get_change_p2tr(cmd, test_change_addr_done,
+			   test_change_addr_fail, ctx);
+	return command_still_pending(cmd);
+}
+
 /* dev-factory-inject-cpfp — test-only hook for Phase 3c2. Registers
  * a synthetic pending_cpfp_t so tests can drive the scheduler without
  * a real chain interaction. */
@@ -11171,6 +11524,14 @@ static const struct plugin_command commands[] = {
 	{
 		"factory-abort-stuck",
 		json_factory_abort_stuck,
+	},
+	{
+		"dev-factory-test-utxo-pick",
+		json_dev_factory_test_utxo_pick,
+	},
+	{
+		"dev-factory-test-change-addr",
+		json_dev_factory_test_change_addr,
 	},
 	{
 		"dev-factory-inject-cpfp",
