@@ -86,6 +86,18 @@ static int ss_rebuild_breach_burns(struct command *cmd,
 				   factory_instance_t *fi,
 				   uint32_t target_epoch);
 
+/* Phase 3c2.5d gap-fix: json_factory_force_close at line ~6630 calls
+ * these helpers which are defined later in the Phase 3c2.5d block.
+ * Forward-declare to make the static declarations match. */
+static int ss_find_p2a_vout(const uint8_t *tx, size_t len);
+static void ss_register_pending_cpfp(factory_instance_t *fi,
+				     uint8_t parent_kind,
+				     const uint8_t *parent_txid,
+				     uint32_t anchor_vout,
+				     uint64_t value_at_stake,
+				     uint32_t deadline_block,
+				     uint32_t current_block);
+
 /* Phase 4c: blocks an INIT factory must remain stuck before we log a
  * warning. ~1 day at 10-min blocks. Operator decides whether to abort. */
 #define FACTORY_INIT_STUCK_BLOCKS 144
