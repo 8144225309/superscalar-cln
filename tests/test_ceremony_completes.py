@@ -70,6 +70,66 @@ def test_factory_list_fields_after_ceremony(ss_node_factory):
     assert entry["max_epochs"] > 0
 
 
+def test_factory_force_close_drives_dying_and_registers_cpfps(
+        ss_node_factory):
+    """After ceremony, factory-force-close should:
+      1. Broadcast signed kickoff + state TXs (via ss_broadcast_factory_tx)
+      2. Flip lifecycle to DYING
+      3. Register pending_cpfp entries (Phase 3c2.5d production wire-up)
+
+    This is the single most valuable E2E test — proves the CPFP path's
+    production integration isn't dead code. The ss_find_p2a_vout scanner
+    + ss_register_pending_cpfp calls at the DYING cascade broadcast site
+    (handle_block_added) + breach_utxo_checked site should fire when
+    real tree nodes are broadcast here.
+
+    Accepts both 'dying' and any 'closed_*' lifecycle — once the root
+    UTXO is spent and the heartbeat fires, lifecycle may advance past
+    DYING via the Phase 3b classifier.
+
+    Note: pyln-testing regtest bitcoind is permissive about relay and
+    will accept our kickoff+state TXs even if feerate is unusual. In
+    production with congestion, the pending_cpfp entries we register
+    here would get their scheduler tick + CPFP child broadcast."""
+    import time
+    lsp, client, iid = _setup_factory(ss_node_factory)
+
+    # Drive force-close.
+    lsp.rpc.call("factory-force-close", {"instance_id": iid})
+
+    # Poll for lifecycle advancement AND pending_cpfps registration.
+    # Both should happen within ~30s (kickoff/state TXs broadcast via
+    # aux_command + DYING flip is synchronous on the force-close path).
+    deadline = time.time() + 30.0
+    final_lifecycle = None
+    final_n_cpfps = 0
+    while time.time() < deadline:
+        entry = next(f for f in lsp.rpc.call("factory-list")["factories"]
+                     if f["instance_id"] == iid)
+        final_lifecycle = entry["lifecycle"]
+        final_n_cpfps = len(entry.get("pending_cpfps", []))
+        if final_lifecycle != "active" and final_n_cpfps > 0:
+            break
+        time.sleep(0.5)
+
+    # Lifecycle should have advanced past active. Accept dying or
+    # any closed_* — classifier might refine further depending on
+    # what bitcoind confirmed.
+    assert final_lifecycle in {
+        "dying", "closed_externally", "closed_cooperative",
+        "closed_unilateral", "expired",
+    }, f"force-close didn't advance lifecycle; stuck at {final_lifecycle}"
+
+    # At least one pending_cpfp should have been registered by the
+    # production wire-up in Phase 3c2.5d. If zero, the vout scanner
+    # didn't find a P2A output OR registration isn't being invoked.
+    assert final_n_cpfps > 0, (
+        f"force-close broadcast TXs but no pending_cpfps registered. "
+        f"Either the tree nodes lack P2A anchors (factory fee config?) "
+        f"or Phase 3c2.5d registration isn't firing at this site."
+    )
+
+
 def test_factory_rotate_bumps_epoch(ss_node_factory):
     """After ceremony, factory-rotate advances the epoch counter.
     Validates that the rotation ceremony itself (NONCE re-exchange,
