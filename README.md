@@ -180,6 +180,16 @@ Fork changes needed by the plugin:
 
 Without the fork, the plugin cannot open factory channels with virtual funding outpoints or update them after rotation.
 
+## Protocol Details
+
+### Inverted Timeout Default (Tier 2.5)
+
+SuperScalar uses an *inverted timeout default*: if the factory expires and no cooperative close happens, **clients receive their funds automatically** — the LSP cannot withhold them. The plugin enforces this by persisting the co-signed distribution TX to CLN's datastore at ceremony time and auto-broadcasting it when `block_added` reaches `expiry_block`. The broadcast fires even after a restart because the TX is loaded back into memory on startup. Each party (LSP and client) runs the same path independently, so either side can trigger the fallback. Additionally, every DW tree node carries a CLTV timeout script path that lets participants unilaterally exit after expiry without requiring the LSP's cooperation.
+
+### Fee Model: Exogenous P2A CPFP (Tier 2.7)
+
+The plugin uses an **exogenous fee model**: transaction fees are not baked into the pre-signed DW tree outputs at ceremony time. Instead, every tree node TX carries a [Pay-to-Anchor (P2A)](https://bitcoinops.org/en/topics/anchor-outputs/) output. When a tree TX needs fee-bumping, the plugin builds and broadcasts a CPFP child that spends the anchor against a CLN wallet UTXO. This means the fee rate can be chosen at broadcast time rather than at signing time, and the factory tree never needs to be re-signed due to fee-rate changes. The default fee rate is `SS_DEFAULT_FEE_RATE_SAT_PER_KVB = 1000 sat/kvB`; the CPFP scheduler (`ss_cpfp_scheduler_tick`) monitors pending broadcasts and launches bump TXs as needed. An endogenous model (fees pre-signed into outputs) is not implemented and would require re-running the MuSig2 ceremony at each new fee rate.
+
 ## Related Projects
 
 | Project | Description |
