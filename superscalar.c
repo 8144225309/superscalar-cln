@@ -13741,6 +13741,66 @@ json_dev_factory_mark_sweep_broadcast(struct command *cmd,
 	return command_finished(cmd, js);
 }
 
+/* dev-factory-mark-sweep-failed — test-only. Sets a pending_sweep to
+ * FAILED with the caller-supplied broadcast_block. Simulates a failed
+ * broadcast without the real async kickoff chain. Used by
+ * test_sweep_retry.py to drive retry cycles deterministically. */
+static struct command_result *
+json_dev_factory_mark_sweep_failed(struct command *cmd,
+				   const char *buf,
+				   const jsmntok_t *params)
+{
+	const char *id_hex;
+	u32 *source_vout;
+	u32 *broadcast_block;
+
+	if (!param(cmd, buf, params,
+		   p_req("instance_id", param_string, &id_hex),
+		   p_req("source_vout", param_u32, &source_vout),
+		   p_req("broadcast_block", param_u32, &broadcast_block),
+		   NULL))
+		return command_param_failed();
+
+	if (strlen(id_hex) != 64)
+		return command_fail(cmd, LIGHTNINGD, "Bad instance_id");
+
+	uint8_t instance_id[32];
+	for (int j = 0; j < 32; j++) {
+		unsigned int b;
+		if (sscanf(id_hex + j*2, "%02x", &b) != 1)
+			return command_fail(cmd, LIGHTNINGD,
+					    "Bad instance_id hex");
+		instance_id[j] = (uint8_t)b;
+	}
+
+	factory_instance_t *fi = ss_factory_find(&ss_state, instance_id);
+	if (!fi)
+		return command_fail(cmd, LIGHTNINGD, "Factory not found");
+
+	pending_sweep_t *ps = NULL;
+	for (size_t i = 0; i < fi->n_pending_sweeps; i++) {
+		if (fi->pending_sweeps[i].source_vout == *source_vout) {
+			ps = &fi->pending_sweeps[i];
+			break;
+		}
+	}
+	if (!ps)
+		return command_fail(cmd, LIGHTNINGD,
+				    "No sweep for source_vout=%u",
+				    *source_vout);
+
+	ps->state = SWEEP_STATE_FAILED;
+	ps->broadcast_block = *broadcast_block;
+	ss_save_factory(cmd, fi);
+
+	struct json_stream *js = jsonrpc_stream_success(cmd);
+	json_add_string(js, "instance_id", id_hex);
+	json_add_u32(js, "source_vout", *source_vout);
+	json_add_string(js, "state", "failed");
+	json_add_u32(js, "broadcast_block", *broadcast_block);
+	return command_finished(cmd, js);
+}
+
 /* dev-factory-mark-sweep-confirmed — test-only. Stamps
  * sweep_confirmed_block so the scheduler's BROADCAST→CONFIRMED
  * transition can fire. */
@@ -13895,6 +13955,10 @@ static const struct plugin_command commands[] = {
 	{
 		"dev-factory-mark-sweep-broadcast",
 		json_dev_factory_mark_sweep_broadcast,
+	},
+	{
+		"dev-factory-mark-sweep-failed",
+		json_dev_factory_mark_sweep_failed,
 	},
 	{
 		"dev-factory-mark-sweep-confirmed",
