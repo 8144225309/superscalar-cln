@@ -556,6 +556,43 @@ static void derive_placeholder_seckey(unsigned char seckey[32],
 	if (seckey[0] == 0) seckey[0] = 0x01;
 }
 
+/* Gap 8: derive a deterministic instance_id from the HSM master key.
+ *
+ *   iid = SHA256(master_key || "ss-iid-v1" || block_le4 || counter_le4)
+ *
+ * Matches the pseudo-HMAC shape of derive_factory_seckey so all
+ * HSM-keyed derivations look alike. The counter is per-plugin-instance,
+ * incremented on every factory-create, persisted to the datastore. On
+ * datastore loss but HSM intact, operator recovers by enumerating
+ * counter 0..N for plausible block heights and matching against on-chain
+ * funding addresses. Two factories created in the same block get
+ * different iids because the counter ticks every call. */
+static void derive_instance_id_from_hsm(uint8_t iid_out[32],
+					uint32_t creation_block,
+					uint32_t counter)
+{
+	struct sha256 hash;
+	struct sha256_ctx sctx;
+	sha256_init(&sctx);
+	sha256_update(&sctx, ss_state.factory_master_key, 32);
+	static const char TAG[] = "ss-iid-v1";
+	sha256_update(&sctx, TAG, sizeof(TAG) - 1);
+	uint8_t block_le[4];
+	block_le[0] = creation_block & 0xFF;
+	block_le[1] = (creation_block >> 8) & 0xFF;
+	block_le[2] = (creation_block >> 16) & 0xFF;
+	block_le[3] = (creation_block >> 24) & 0xFF;
+	sha256_update(&sctx, block_le, 4);
+	uint8_t ctr_le[4];
+	ctr_le[0] = counter & 0xFF;
+	ctr_le[1] = (counter >> 8) & 0xFF;
+	ctr_le[2] = (counter >> 16) & 0xFF;
+	ctr_le[3] = (counter >> 24) & 0xFF;
+	sha256_update(&sctx, ctr_le, 4);
+	sha256_done(&sctx, &hash);
+	memcpy(iid_out, hash.u.u8, 32);
+}
+
 /* Derive N L-stock revocation secrets deterministically from the HSM master
  * key and instance_id. Previously used /dev/urandom which made recovery
  * impossible after datastore loss — secrets were never persisted.
@@ -1367,6 +1404,47 @@ static void ss_save_factory(struct command *cmd, factory_instance_t *fi)
 /* Load factories from CLN datastore on startup.
  * Reads factory-index key to discover instance IDs, then
  * loads each factory's meta and channel mappings. */
+/* Gap 8: persist the monotonic iid counter so restarts don't reuse
+ * counter values. Keyed "superscalar/iid_counter"; body is a 4-byte
+ * little-endian u32. create-or-replace semantics — never deleted. */
+static void ss_save_iid_counter(struct command *cmd)
+{
+	u8 buf[4];
+	buf[0] = ss_state.factory_counter & 0xFF;
+	buf[1] = (ss_state.factory_counter >> 8) & 0xFF;
+	buf[2] = (ss_state.factory_counter >> 16) & 0xFF;
+	buf[3] = (ss_state.factory_counter >> 24) & 0xFF;
+	jsonrpc_set_datastore_binary(cmd, "superscalar/iid_counter",
+		buf, 4, "create-or-replace",
+		rpc_done, rpc_err, NULL);
+}
+
+/* Load the iid counter at plugin init. If no prior value exists
+ * (fresh plugin or never-written), start from 0 and mark loaded so
+ * subsequent factory-creates save after increment. Called before
+ * ss_load_factories so the counter is ready for any early work. */
+static void ss_load_iid_counter(struct command *cmd)
+{
+	u8 *buf = NULL;
+	const char *err = rpc_scan_datastore_hex(tmpctx, cmd,
+		"superscalar/iid_counter",
+		JSON_SCAN_TAL(tmpctx, json_tok_bin_from_hex, &buf));
+	if (!err && buf && tal_bytelen(buf) >= 4) {
+		ss_state.factory_counter = buf[0]
+			| ((uint32_t)buf[1] << 8)
+			| ((uint32_t)buf[2] << 16)
+			| ((uint32_t)buf[3] << 24);
+		plugin_log(plugin_handle, LOG_INFORM,
+			   "Loaded iid counter from datastore: %u",
+			   ss_state.factory_counter);
+	} else {
+		ss_state.factory_counter = 0;
+		plugin_log(plugin_handle, LOG_INFORM,
+			   "No persisted iid counter — starting at 0");
+	}
+	ss_state.has_counter_loaded = true;
+}
+
 static void ss_load_factories(struct command *cmd)
 {
 	size_t loaded = 0;
@@ -5374,9 +5452,32 @@ static struct command_result *json_factory_create(struct command *cmd,
 		   NULL))
 		return command_param_failed();
 
-	/* Generate random instance_id */
-	for (int i = 0; i < 32; i++)
-		instance_id[i] = (uint8_t)(random() & 0xFF);
+	/* Gap 8: deterministic instance_id from HSM master key when
+	 * available. iid = SHA256(master_key || "ss-iid-v1" ||
+	 * current_block_le4 || counter_le4). Counter is persisted under
+	 * "superscalar/iid_counter" and increments on every call, so two
+	 * factory-creates in the same block still get distinct iids.
+	 *
+	 * Fallback to random() when no master key is loaded (e.g. a demo
+	 * build without HSM access — keeps existing behavior for that
+	 * path). */
+	if (ss_state.has_master_key) {
+		uint32_t creation_block = ss_state.current_blockheight;
+		uint32_t counter = ss_state.factory_counter;
+		derive_instance_id_from_hsm(instance_id, creation_block,
+					    counter);
+		/* Increment in memory and persist so a restart doesn't
+		 * reuse the counter. If the persist write fails (network,
+		 * datastore quota), we still advance in memory; the worst
+		 * case is that a later restart re-uses the same counter for
+		 * a never-persisted factory, which is fine because that
+		 * earlier factory wasn't persisted either. */
+		ss_state.factory_counter = counter + 1;
+		ss_save_iid_counter(cmd);
+	} else {
+		for (int i = 0; i < 32; i++)
+			instance_id[i] = (uint8_t)(random() & 0xFF);
+	}
 
 	fi = ss_factory_new(&ss_state, instance_id);
 	if (!fi)
@@ -11696,6 +11797,10 @@ static const char *init(struct command *init_cmd,
 	plugin_log(plugin_handle, LOG_INFORM,
 		   "Factory master key derived from HSM (active — real pubkey "
 		   "exchange enabled)");
+
+	/* Gap 8: load monotonic iid counter BEFORE factories so any
+	 * derivation we do during startup picks up the right value. */
+	ss_load_iid_counter(init_cmd);
 
 	/* Load persisted factories from datastore */
 	ss_load_factories(init_cmd);
