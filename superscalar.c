@@ -1135,6 +1135,15 @@ static void rotate_finish_and_notify(struct command *cmd,
 	fi->ceremony = CEREMONY_ROTATE_COMPLETE;
 	fi->rotation_in_progress = false;
 
+	/* Rotation done — release the cached ROTATE_PROPOSE payload used
+	 * for reconnect recovery. It would be misleading to leave it
+	 * around since the next rotation allocates a fresh one. */
+	if (fi->cached_rotate_propose_wire) {
+		free(fi->cached_rotate_propose_wire);
+		fi->cached_rotate_propose_wire = NULL;
+		fi->cached_rotate_propose_len = 0;
+	}
+
 	/* Send revocation secret for old epoch */
 	uint32_t old_ep = fi->epoch - 1;
 	unsigned char rev_secret[32];
@@ -6762,6 +6771,21 @@ static struct command_result *json_factory_rotate(struct command *cmd,
 	memcpy(payload + 8, nbuf, nlen);
 	size_t plen = 8 + nlen;
 
+	/* Cache the ROTATE_PROPOSE payload for reconnect recovery. If a
+	 * client drops after receiving ROTATE_PROPOSE but before replying
+	 * with ROTATE_NONCE, the peer_connected handler resends this blob
+	 * so rotation doesn't wedge. Freed when rotation completes. */
+	if (fi->cached_rotate_propose_wire) {
+		free(fi->cached_rotate_propose_wire);
+		fi->cached_rotate_propose_wire = NULL;
+		fi->cached_rotate_propose_len = 0;
+	}
+	fi->cached_rotate_propose_wire = malloc(plen);
+	if (fi->cached_rotate_propose_wire) {
+		memcpy(fi->cached_rotate_propose_wire, payload, plen);
+		fi->cached_rotate_propose_len = plen;
+	}
+
 	for (size_t ci = 0; ci < fi->n_clients; ci++) {
 		char client_hex[67];
 		for (int j = 0; j < 33; j++)
@@ -11445,7 +11469,14 @@ static struct command_result *handle_connect(struct command *cmd,
 		bool is_nonces  = (fi->ceremony == CEREMONY_NONCES_COLLECTED &&
 				   fi->cached_all_nonces_wire &&
 				   fi->cached_all_nonces_len > 0);
-		if (!is_propose && !is_nonces)
+		/* Rotation reconnect: if a client disconnects after receiving
+		 * ROTATE_PROPOSE but before sending ROTATE_NONCE, its
+		 * nonce_received flag stays false and the cached payload is
+		 * resent on reconnect. */
+		bool is_rotating = (fi->ceremony == CEREMONY_ROTATING &&
+				    fi->cached_rotate_propose_wire &&
+				    fi->cached_rotate_propose_len > 0);
+		if (!is_propose && !is_nonces && !is_rotating)
 			continue;
 
 		for (size_t ci = 0; ci < fi->n_clients; ci++) {
@@ -11532,6 +11563,23 @@ static struct command_result *handle_connect(struct command *cmd,
 				plugin_log(plugin_handle, LOG_INFORM,
 					   "Reconnect recovery: re-sent"
 					   " ALL_NONCES to client %zu", ci);
+			} else if (is_rotating && !fi->clients[ci].nonce_received) {
+				/* Rotation reconnect: client dropped after
+				 * receiving ROTATE_PROPOSE but before sending
+				 * ROTATE_NONCE. Resend the cached ROTATE_PROPOSE
+				 * payload so the rotation can finish. Idempotent
+				 * on the client side: duplicate ROTATE_PROPOSE
+				 * just rebuilds the same nonce bundle. */
+				send_factory_msg(cmd, peer_id,
+						 SS_SUBMSG_ROTATE_PROPOSE,
+						 fi->cached_rotate_propose_wire,
+						 fi->cached_rotate_propose_len);
+
+				plugin_log(plugin_handle, LOG_INFORM,
+					   "Reconnect recovery: re-sent"
+					   " ROTATE_PROPOSE to client %zu"
+					   " (rotation was stalled at"
+					   " CEREMONY_ROTATING)", ci);
 			}
 
 			break; /* peer occupies at most one slot per factory */
