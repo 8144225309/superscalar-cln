@@ -11013,48 +11013,47 @@ static struct command_result *handle_block_added(struct command *cmd,
 						 const char *buf,
 						 const jsmntok_t *params)
 {
-	const jsmntok_t *block_tok = json_get_member(buf, params, "block");
-	if (block_tok) {
-		const jsmntok_t *height_tok = json_get_member(buf, block_tok,
-							       "height");
-		if (height_tok) {
-			u32 height;
-			json_to_u32(buf, height_tok, &height);
+	/* CLN's block_added notification sends fields flat:
+	 *   {"hash": "...", "height": N}
+	 * not nested under a "block" key. */
+	const jsmntok_t *height_tok = json_get_member(buf, params, "height");
+	if (height_tok) {
+		u32 height;
+		json_to_u32(buf, height_tok, &height);
 
-			/* Phase 4e2: reorg auto-trigger. If the new tip is
-			 * at or below the last height we observed, something
-			 * reorganized. Invoke ss_penalty_reorg_check for
-			 * every factory with confirmed penalties — the async
-			 * getrawtransaction per confirmed burn will flip
-			 * reorg-ed penalties back to BROADCAST so the
-			 * scheduler rebroadcasts.
-			 *
-			 * Seed-skip: last_observed_blockheight == 0 means
-			 * this is our first block_added; don't misread it
-			 * as a regression. */
-			if (ss_state.last_observed_blockheight > 0
-			    && height <= ss_state.last_observed_blockheight) {
-				plugin_log(plugin_handle, LOG_UNUSUAL,
-					   "Phase 4e2: tip regression detected "
-					   "(%u → %u). Launching penalty "
-					   "reorg-check for all factories with "
-					   "confirmed penalties.",
-					   ss_state.last_observed_blockheight,
-					   height);
-				for (size_t i = 0;
-				     i < ss_state.n_factories; i++) {
-					factory_instance_t *cfi =
-						ss_state.factories[i];
-					if (!cfi) continue;
-					if (cfi->n_pending_penalties == 0)
-						continue;
-					ss_penalty_reorg_check(cmd, cfi);
-				}
+		/* Phase 4e2: reorg auto-trigger. If the new tip is
+		 * at or below the last height we observed, something
+		 * reorganized. Invoke ss_penalty_reorg_check for
+		 * every factory with confirmed penalties — the async
+		 * getrawtransaction per confirmed burn will flip
+		 * reorg-ed penalties back to BROADCAST so the
+		 * scheduler rebroadcasts.
+		 *
+		 * Seed-skip: last_observed_blockheight == 0 means
+		 * this is our first block_added; don't misread it
+		 * as a regression. */
+		if (ss_state.last_observed_blockheight > 0
+		    && height <= ss_state.last_observed_blockheight) {
+			plugin_log(plugin_handle, LOG_UNUSUAL,
+				   "Phase 4e2: tip regression detected "
+				   "(%u -> %u). Launching penalty "
+				   "reorg-check for all factories with "
+				   "confirmed penalties.",
+				   ss_state.last_observed_blockheight,
+				   height);
+			for (size_t i = 0;
+			     i < ss_state.n_factories; i++) {
+				factory_instance_t *cfi =
+					ss_state.factories[i];
+				if (!cfi) continue;
+				if (cfi->n_pending_penalties == 0)
+					continue;
+				ss_penalty_reorg_check(cmd, cfi);
 			}
-
-			ss_state.current_blockheight = height;
-			ss_state.last_observed_blockheight = height;
 		}
+
+		ss_state.current_blockheight = height;
+		ss_state.last_observed_blockheight = height;
 	}
 
 	/* Check factory lifecycle warnings */
