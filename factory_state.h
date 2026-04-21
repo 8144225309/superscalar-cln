@@ -598,6 +598,18 @@ typedef struct superscalar_state {
 
 	uint8_t factory_master_key[32];	/* HSM-derived master key for factories */
 	bool has_master_key;		/* Whether master key was derived */
+
+	/* Monotonic counter feeding deterministic instance_id derivation
+	 * (Gap 8). Each factory-create consumes the current value and
+	 * increments. Persisted to the datastore under
+	 * "superscalar/iid_counter"; reloaded on plugin startup so iids
+	 * stay unique across restarts. On datastore loss with HSM intact,
+	 * an operator recovers by deriving candidate iids for counter
+	 * values 0..N and matching them against on-chain funding
+	 * addresses. */
+	uint32_t factory_counter;
+	bool has_counter_loaded;	/* distinguishes "no counter yet" (fresh
+					 * plugin) from "counter is 0" after load */
 } superscalar_state_t;
 
 /* State management functions */
