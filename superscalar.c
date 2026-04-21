@@ -169,30 +169,57 @@ static void ss_register_pending_cpfp(factory_instance_t *fi,
 #define MAX_DIST_OUTPUTS		65	   /* Max outputs in distribution TX */
 #define MAX_WIRE_BUF			32768	   /* Wire message buffer size */
 
+/* Choose factory arity from total participant count (LSP + clients).
+ *
+ * ARITY_2 (2 clients per leaf) minimises tree depth and DW unwind time
+ * for factories with 3+ total participants. For exactly 2 participants
+ * (LSP + 1 client) ARITY_1 gives each party their own leaf, enabling
+ * independent 2-of-2 unilateral exit without needing the other party.
+ * Changing this policy requires updating all factory rebuild paths that
+ * must reproduce the same arity for an existing on-chain tree. */
+static factory_arity_t ss_choose_arity(size_t n_total)
+{
+	return n_total <= 2 ? FACTORY_ARITY_1 : FACTORY_ARITY_2;
+}
+
 /* Compute worst-case DW tree unwind time for HTLC safety.
- * This is the minimum early_warning_time: if an HTLC times out in
- * fewer blocks than this, we can't force-close the factory in time
- * to enforce it on-chain.
+ *
+ * n_clients: clients only (not counting LSP); n_total = n_clients + 1.
+ * arity:     the arity the factory was (or will be) built with — must
+ *            match ss_choose_arity(n_total) or a manually-set override.
  *
  * Formula: n_layers * step_blocks * (states_per_layer - 1)
  *          + n_layers * 6 (confirmation buffer per layer)
- *          + 36 (flat safety margin ~6 hours) */
-static uint16_t compute_early_warning_time(size_t n_clients)
+ *          + 36 (flat safety margin ~6 hours)
+ *
+ * Tree structure:
+ *   ARITY_2: leaves = ceil(n_total / 2);  2 clients share one leaf
+ *   ARITY_1: leaves = n_total;            each participant on own leaf
+ *   depth   = ceil(log2(leaves))          binary splits above leaves
+ *   n_layers = depth + 1                  one DW counter layer per level */
+static uint16_t compute_early_warning_time(size_t n_clients,
+					   factory_arity_t arity)
 {
-	/* DW tree depth: arity-1 for 2 participants, arity-2 for 3+ */
-	size_t n_layers;
-	if (n_clients <= 1)
-		n_layers = 1;
-	else {
-		/* ceil(log2(ceil(n_clients/2))) + 1 for arity-2 */
-		size_t leaves = (n_clients + 1) / 2;
-		n_layers = 1;
-		while ((1u << n_layers) < leaves)
-			n_layers++;
-		n_layers++; /* +1 for the root→state transition */
+	size_t n_total = n_clients + 1;
+
+	/* Leaf count under the chosen arity. */
+	size_t leaves = (arity == FACTORY_ARITY_2)
+		? (n_total + 1) / 2   /* ceil(n_total / 2) */
+		: n_total;            /* one leaf per participant */
+
+	/* Tree depth = ceil(log2(leaves)).
+	 * Walk up: each level halves the node count (ceiling). */
+	size_t depth = 0;
+	size_t lvl = leaves;
+	while (lvl > 1) {
+		lvl = (lvl + 1) / 2;
+		depth++;
 	}
-	uint32_t total = n_layers * DW_STEP_BLOCKS * (DW_STATES_PER_LAYER - 1)
-		       + n_layers * 6 + 36;
+	size_t n_layers = depth + 1;
+
+	uint32_t total = (uint32_t)n_layers * DW_STEP_BLOCKS
+				       * (DW_STATES_PER_LAYER - 1)
+		       + (uint32_t)n_layers * 6 + 36;
 	if (total > 65535) total = 65535;
 	return (uint16_t)total;
 }
@@ -1151,7 +1178,8 @@ static void open_factory_channels(struct command *cmd,
 		json_add_u64(req->js, "factory_early_warning_time",
 			     fi->early_warning_time > 0
 			     ? fi->early_warning_time
-			     : compute_early_warning_time(fi->n_clients));
+			     : compute_early_warning_time(fi->n_clients,
+				   ss_choose_arity(fi->n_clients + 1)));
 		send_outreq(req);
 
 		plugin_log(plugin_handle, LOG_INFORM,
@@ -1660,9 +1688,7 @@ static void ss_load_factories(struct command *cmd)
 							pks, n_total,
 							DW_STEP_BLOCKS, 16);
 						factory_set_arity(f,
-							n_total <= 2
-							? FACTORY_ARITY_1
-							: FACTORY_ARITY_2);
+							ss_choose_arity(n_total));
 						if (fi->funding_spk_len > 0) {
 							factory_set_funding(f,
 								fi->funding_txid,
@@ -1729,7 +1755,8 @@ static void ss_load_factories(struct command *cmd)
 								fi->early_warning_time =
 									compute_early_warning_time(
 										n_total > 1
-										? n_total - 1 : 1);
+										? n_total - 1 : 1,
+										ss_choose_arity(n_total));
 							plugin_log(plugin_handle,
 								LOG_INFORM,
 								"Rebuilt factory tree "
@@ -1862,8 +1889,7 @@ static void continue_after_funding(struct command *cmd,
 		factory_t *new_f = calloc(1, sizeof(factory_t));
 		factory_init_from_pubkeys(new_f, global_secp_ctx,
 			real_pks, n_total, DW_STEP_BLOCKS, 16);
-		factory_set_arity(new_f, n_total <= 2
-			? FACTORY_ARITY_1 : FACTORY_ARITY_2);
+		factory_set_arity(new_f, ss_choose_arity(n_total));
 		/* Restore L-stock secrets BEFORE build_tree so build_l_stock_spk
 		 * produces the same P2TR keys that went on-chain originally.
 		 * Without this, the rebuilt tree has no taptree on L-stock
@@ -2129,7 +2155,8 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 			fi->expiry_block = ss_state.current_blockheight + 4320 + 432;
 			fi->n_tree_nodes = nb->n_nodes > 0 ? nb->n_nodes : 2;
 			fi->early_warning_time = compute_early_warning_time(
-				fi->n_clients);
+				fi->n_clients,
+				ss_choose_arity(fi->n_clients + 1));
 
 			/* Store LSP peer_id as node_id */
 			if (strlen(peer_id) == 66) {
@@ -2182,10 +2209,8 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 			 * so client's view of tree TXs has matching anchor
 			 * outputs (keeps sighashes + txids in sync with LSP). */
 			ss_factory_wire_fee_estimator(fi, factory);
-			if (nb->n_participants <= 2)
-				factory_set_arity(factory, FACTORY_ARITY_1);
-			else
-				factory_set_arity(factory, FACTORY_ARITY_2);
+			factory_set_arity(factory,
+				ss_choose_arity(nb->n_participants));
 
 			uint8_t synth_txid[32], synth_spk[34];
 			for (int j = 0; j < 32; j++) synth_txid[j] = j + 1;
@@ -2650,8 +2675,7 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 							apks, nt,
 							DW_STEP_BLOCKS, 16);
 						factory_set_arity(tmp_f,
-							nt <= 2 ? FACTORY_ARITY_1
-								: FACTORY_ARITY_2);
+							ss_choose_arity(nt));
 						uint8_t ph_txid[32], ph_spk[34];
 						for (int j = 0; j < 32; j++)
 							ph_txid[j] = j + 1;
@@ -2863,8 +2887,7 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 							real_pks, n_total,
 							DW_STEP_BLOCKS, 16);
 						factory_set_arity(new_f,
-							n_total <= 2 ? FACTORY_ARITY_1
-								     : FACTORY_ARITY_2);
+							ss_choose_arity(n_total));
 						/* Use real funding if available, else synthetic */
 						if (fi->funding_spk_len > 0) {
 							factory_set_funding(new_f,
@@ -3103,8 +3126,7 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 						real_pks, anb->n_participants,
 						DW_STEP_BLOCKS, 16);
 					factory_set_arity(new_f,
-						anb->n_participants <= 2
-						? FACTORY_ARITY_1 : FACTORY_ARITY_2);
+						ss_choose_arity(anb->n_participants));
 					/* Use real funding from ALL_NONCES if available */
 					if (anb->funding_spk_len > 0) {
 						factory_set_funding(new_f,
@@ -5593,12 +5615,8 @@ static struct command_result *json_factory_create(struct command *cmd,
 		 * P2A anchors (activates Phase 3c2/3c2.5 CPFP). */
 		ss_factory_wire_fee_estimator(fi, factory);
 
-		/* Set arity: 1 client/leaf for 2 participants, 2 for more */
-		if (fi->n_clients <= 1) {
-			factory_set_arity(factory, FACTORY_ARITY_1);
-		} else {
-			factory_set_arity(factory, FACTORY_ARITY_2);
-		}
+		factory_set_arity(factory,
+			ss_choose_arity(fi->n_clients + 1));
 
 		/* Set funding — use a plausible P2TR scriptpubkey.
 		 * Real funding comes from the on-chain UTXO backing
@@ -5738,7 +5756,8 @@ static struct command_result *json_factory_create(struct command *cmd,
 		 * This is the minimum time needed to force-close the
 		 * factory before an HTLC times out. */
 		fi->early_warning_time = compute_early_warning_time(
-			fi->n_clients);
+			fi->n_clients,
+			ss_choose_arity(fi->n_clients + 1));
 
 		/* Initialize signing sessions */
 		rc = factory_sessions_init(factory);
