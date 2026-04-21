@@ -7341,6 +7341,16 @@ static void ss_classify_spending_tx(factory_instance_t *fi,
 						   "broadcast penalty TXs when "
 						   "the leaf state TXs confirm.",
 						   fi->breach_epoch, fi->epoch);
+					/* Phase 5c structured marker. */
+					char biid[65];
+					for (int b = 0; b < 32; b++)
+						sprintf(biid + b*2, "%02x",
+							fi->instance_id[b]);
+					biid[64] = '\0';
+					plugin_log(plugin_handle, LOG_INFORM,
+						   "SS_METRIC event=factory_breached "
+						   "iid=%s breach_epoch=%u current_epoch=%u",
+						   biid, fi->breach_epoch, fi->epoch);
 					return;
 				}
 			}
@@ -8200,6 +8210,18 @@ static void ss_register_pending_penalty(factory_instance_t *fi,
 		   "lstock=%"PRIu64" sats csv_unlock=%u vsize=%u",
 		   epoch, leaf_index, lstock_sats, csv_unlock_block,
 		   tx_vsize);
+
+	/* Phase 5c structured marker. Emitted once per (epoch, leaf)
+	 * pair on first broadcast registration (not on duplicate bumps —
+	 * the dedup branch above returns before reaching here). */
+	char iid_hex[65];
+	for (int b = 0; b < 32; b++)
+		sprintf(iid_hex + b*2, "%02x", fi->instance_id[b]);
+	iid_hex[64] = '\0';
+	plugin_log(plugin_handle, LOG_INFORM,
+		   "SS_METRIC event=breach_burn_broadcast iid=%s "
+		   "epoch=%u leaf=%d lstock_sats=%"PRIu64" block=%u",
+		   iid_hex, epoch, leaf_index, lstock_sats, current_block);
 }
 
 /* Phase 3c-redux: grace blocks past CSV after which we mark a
@@ -9862,6 +9884,15 @@ static void ss_scheduler_launch_cpfp(struct command *cmd,
  * upstream sweeper.c's 3-conf threshold. */
 #define SWEEP_CONFIRM_THRESHOLD 3
 
+/* Phase 4d3: FAILED → READY retry gate. After a broadcast rejection
+ * (bitcoind -25 missing inputs, mempool conflict, etc.) we cool down
+ * for a few blocks, then retry. Retry count is stored in
+ * pending_sweep_t.reserved[0] so persistence layout is unchanged.
+ * Three attempts before we give up and leave state FAILED for
+ * operator attention. */
+#define SS_SWEEP_RETRY_DELAY_BLOCKS 6
+#define SS_SWEEP_MAX_RETRIES 3
+
 /* Register a new pending sweep. Dedup by (source_txid, source_vout).
  * Called from the post-close paths (Phase 4d2 entry points) when we
  * identify an output that will mature after a CSV window. */
@@ -9981,6 +10012,46 @@ static int ss_sweep_scheduler_tick(struct command *cmd,
 				   "(sweep confirmed_at=%u, current=%u)",
 				   i, sweep_type_name(ps->type),
 				   ps->sweep_confirmed_block, current_block);
+			/* Phase 5c structured marker. */
+			char iid_hex[65];
+			for (int b = 0; b < 32; b++)
+				sprintf(iid_hex + b*2, "%02x",
+					fi->instance_id[b]);
+			iid_hex[64] = '\0';
+			plugin_log(plugin_handle, LOG_INFORM,
+				   "SS_METRIC event=sweep_confirmed iid=%s "
+				   "type=%s vout=%u block=%u",
+				   iid_hex, sweep_type_name(ps->type),
+				   ps->source_vout,
+				   ps->sweep_confirmed_block);
+			transitions++;
+			dirty = true;
+		}
+
+		/* Phase 4d3: FAILED → READY retry. A sweep that failed at
+		 * broadcast time gets up to SS_SWEEP_MAX_RETRIES attempts,
+		 * spaced SS_SWEEP_RETRY_DELAY_BLOCKS apart. retry_count
+		 * lives in reserved[0] so on-disk layout is unchanged;
+		 * broadcast_block marks when the failure was observed (set
+		 * eagerly at kickoff). */
+		if (ps->state == SWEEP_STATE_FAILED
+		    && ps->reserved[0] < SS_SWEEP_MAX_RETRIES
+		    && ps->broadcast_block > 0
+		    && current_block >= ps->broadcast_block
+		    + SS_SWEEP_RETRY_DELAY_BLOCKS) {
+			ps->reserved[0]++;
+			ps->state = SWEEP_STATE_READY;
+			memset(ps->sweep_txid, 0, 32);
+			/* Clear broadcast_block so the next failure starts a
+			 * fresh retry window, not retry cascades from the
+			 * same block. */
+			ps->broadcast_block = 0;
+			plugin_log(plugin_handle, LOG_UNUSUAL,
+				   "sweep: entry %zu type=%s RETRY %u/%u "
+				   "(FAILED → READY, next kickoff at block %u)",
+				   i, sweep_type_name(ps->type),
+				   ps->reserved[0], SS_SWEEP_MAX_RETRIES,
+				   current_block);
 			transitions++;
 			dirty = true;
 		}
@@ -10058,12 +10129,6 @@ ss_sweep_broadcast_reply(struct command *cmd,
 					      ctx->source_txid,
 					      ctx->source_vout, &fi);
 
-	/* Detect error reply (broadcast_reply_classified-style). */
-	const jsmntok_t *code_tok = result
-		? json_get_member(buf, result, "code")
-		: NULL;
-	bool is_error = code_tok != NULL;
-
 	if (!ps) {
 		plugin_log(plugin_handle, LOG_UNUSUAL,
 			   "sweep: broadcast reply for unknown entry — "
@@ -10071,12 +10136,30 @@ ss_sweep_broadcast_reply(struct command *cmd,
 		return aux_command_done(cmd);
 	}
 
-	if (is_error) {
+	/* CLN's bitcoin backend returns {"success": bool, "errmsg": "..."}
+	 * for sendrawtransaction — NOT a JSON-RPC error object. */
+	const jsmntok_t *succ_tok = result
+		? json_get_member(buf, result, "success")
+		: NULL;
+	bool success = false;
+	if (succ_tok) json_to_bool(buf, succ_tok, &success);
+
+	char iid_hex[65];
+	for (int b = 0; b < 32; b++)
+		sprintf(iid_hex + b*2, "%02x", fi->instance_id[b]);
+	iid_hex[64] = '\0';
+
+	if (!success) {
 		ps->state = SWEEP_STATE_FAILED;
 		plugin_log(plugin_handle, LOG_UNUSUAL,
 			   "sweep broadcast FAILED: type=%s vout=%u — "
 			   "state demoted to FAILED for operator review",
 			   sweep_type_name(ps->type), ps->source_vout);
+		plugin_log(plugin_handle, LOG_INFORM,
+			   "SS_METRIC event=sweep_failed iid=%s "
+			   "type=%s vout=%u retry=%u",
+			   iid_hex, sweep_type_name(ps->type),
+			   ps->source_vout, ps->reserved[0]);
 		ss_save_factory(cmd, fi);
 	} else {
 		ps->broadcast_block = ss_state.current_blockheight;
@@ -10085,6 +10168,12 @@ ss_sweep_broadcast_reply(struct command *cmd,
 			   "amount=%"PRIu64" at block %u",
 			   sweep_type_name(ps->type), ps->source_vout,
 			   ps->amount_sats, ps->broadcast_block);
+		plugin_log(plugin_handle, LOG_INFORM,
+			   "SS_METRIC event=sweep_broadcast iid=%s "
+			   "type=%s vout=%u amount=%"PRIu64" block=%u",
+			   iid_hex, sweep_type_name(ps->type),
+			   ps->source_vout, ps->amount_sats,
+			   ps->broadcast_block);
 		ss_save_factory(cmd, fi);
 	}
 	return aux_command_done(cmd);
@@ -10149,10 +10238,14 @@ ss_sweep_newaddr_reply(struct command *cmd,
 	}
 
 	/* Commit the eager state flip. The broadcast reply will demote
-	 * to FAILED if bitcoind rejects. */
+	 * to FAILED if bitcoind rejects. Stamp broadcast_block here (not
+	 * just in the success reply) so Phase 4d3's retry gate has a
+	 * meaningful "when did this fail?" reference even when bitcoind
+	 * rejects before the reply callback runs its normal path. */
 	memcpy(ps->sweep_txid, sweep_txid_out, 32);
 	memcpy(ctx->sweep_txid, sweep_txid_out, 32);
 	ps->state = SWEEP_STATE_BROADCAST;
+	ps->broadcast_block = ss_state.current_blockheight;
 	ss_save_factory(cmd, fi);
 
 	struct out_req *req = jsonrpc_request_start(cmd,
@@ -10920,48 +11013,47 @@ static struct command_result *handle_block_added(struct command *cmd,
 						 const char *buf,
 						 const jsmntok_t *params)
 {
-	const jsmntok_t *block_tok = json_get_member(buf, params, "block");
-	if (block_tok) {
-		const jsmntok_t *height_tok = json_get_member(buf, block_tok,
-							       "height");
-		if (height_tok) {
-			u32 height;
-			json_to_u32(buf, height_tok, &height);
+	/* CLN's block_added notification sends fields flat:
+	 *   {"hash": "...", "height": N}
+	 * not nested under a "block" key. */
+	const jsmntok_t *height_tok = json_get_member(buf, params, "height");
+	if (height_tok) {
+		u32 height;
+		json_to_u32(buf, height_tok, &height);
 
-			/* Phase 4e2: reorg auto-trigger. If the new tip is
-			 * at or below the last height we observed, something
-			 * reorganized. Invoke ss_penalty_reorg_check for
-			 * every factory with confirmed penalties — the async
-			 * getrawtransaction per confirmed burn will flip
-			 * reorg-ed penalties back to BROADCAST so the
-			 * scheduler rebroadcasts.
-			 *
-			 * Seed-skip: last_observed_blockheight == 0 means
-			 * this is our first block_added; don't misread it
-			 * as a regression. */
-			if (ss_state.last_observed_blockheight > 0
-			    && height <= ss_state.last_observed_blockheight) {
-				plugin_log(plugin_handle, LOG_UNUSUAL,
-					   "Phase 4e2: tip regression detected "
-					   "(%u → %u). Launching penalty "
-					   "reorg-check for all factories with "
-					   "confirmed penalties.",
-					   ss_state.last_observed_blockheight,
-					   height);
-				for (size_t i = 0;
-				     i < ss_state.n_factories; i++) {
-					factory_instance_t *cfi =
-						ss_state.factories[i];
-					if (!cfi) continue;
-					if (cfi->n_pending_penalties == 0)
-						continue;
-					ss_penalty_reorg_check(cmd, cfi);
-				}
+		/* Phase 4e2: reorg auto-trigger. If the new tip is
+		 * at or below the last height we observed, something
+		 * reorganized. Invoke ss_penalty_reorg_check for
+		 * every factory with confirmed penalties — the async
+		 * getrawtransaction per confirmed burn will flip
+		 * reorg-ed penalties back to BROADCAST so the
+		 * scheduler rebroadcasts.
+		 *
+		 * Seed-skip: last_observed_blockheight == 0 means
+		 * this is our first block_added; don't misread it
+		 * as a regression. */
+		if (ss_state.last_observed_blockheight > 0
+		    && height <= ss_state.last_observed_blockheight) {
+			plugin_log(plugin_handle, LOG_UNUSUAL,
+				   "Phase 4e2: tip regression detected "
+				   "(%u -> %u). Launching penalty "
+				   "reorg-check for all factories with "
+				   "confirmed penalties.",
+				   ss_state.last_observed_blockheight,
+				   height);
+			for (size_t i = 0;
+			     i < ss_state.n_factories; i++) {
+				factory_instance_t *cfi =
+					ss_state.factories[i];
+				if (!cfi) continue;
+				if (cfi->n_pending_penalties == 0)
+					continue;
+				ss_penalty_reorg_check(cmd, cfi);
 			}
-
-			ss_state.current_blockheight = height;
-			ss_state.last_observed_blockheight = height;
 		}
+
+		ss_state.current_blockheight = height;
+		ss_state.last_observed_blockheight = height;
 	}
 
 	/* Check factory lifecycle warnings */
@@ -13649,6 +13741,66 @@ json_dev_factory_mark_sweep_broadcast(struct command *cmd,
 	return command_finished(cmd, js);
 }
 
+/* dev-factory-mark-sweep-failed — test-only. Sets a pending_sweep to
+ * FAILED with the caller-supplied broadcast_block. Simulates a failed
+ * broadcast without the real async kickoff chain. Used by
+ * test_sweep_retry.py to drive retry cycles deterministically. */
+static struct command_result *
+json_dev_factory_mark_sweep_failed(struct command *cmd,
+				   const char *buf,
+				   const jsmntok_t *params)
+{
+	const char *id_hex;
+	u32 *source_vout;
+	u32 *broadcast_block;
+
+	if (!param(cmd, buf, params,
+		   p_req("instance_id", param_string, &id_hex),
+		   p_req("source_vout", param_u32, &source_vout),
+		   p_req("broadcast_block", param_u32, &broadcast_block),
+		   NULL))
+		return command_param_failed();
+
+	if (strlen(id_hex) != 64)
+		return command_fail(cmd, LIGHTNINGD, "Bad instance_id");
+
+	uint8_t instance_id[32];
+	for (int j = 0; j < 32; j++) {
+		unsigned int b;
+		if (sscanf(id_hex + j*2, "%02x", &b) != 1)
+			return command_fail(cmd, LIGHTNINGD,
+					    "Bad instance_id hex");
+		instance_id[j] = (uint8_t)b;
+	}
+
+	factory_instance_t *fi = ss_factory_find(&ss_state, instance_id);
+	if (!fi)
+		return command_fail(cmd, LIGHTNINGD, "Factory not found");
+
+	pending_sweep_t *ps = NULL;
+	for (size_t i = 0; i < fi->n_pending_sweeps; i++) {
+		if (fi->pending_sweeps[i].source_vout == *source_vout) {
+			ps = &fi->pending_sweeps[i];
+			break;
+		}
+	}
+	if (!ps)
+		return command_fail(cmd, LIGHTNINGD,
+				    "No sweep for source_vout=%u",
+				    *source_vout);
+
+	ps->state = SWEEP_STATE_FAILED;
+	ps->broadcast_block = *broadcast_block;
+	ss_save_factory(cmd, fi);
+
+	struct json_stream *js = jsonrpc_stream_success(cmd);
+	json_add_string(js, "instance_id", id_hex);
+	json_add_u32(js, "source_vout", *source_vout);
+	json_add_string(js, "state", "failed");
+	json_add_u32(js, "broadcast_block", *broadcast_block);
+	return command_finished(cmd, js);
+}
+
 /* dev-factory-mark-sweep-confirmed — test-only. Stamps
  * sweep_confirmed_block so the scheduler's BROADCAST→CONFIRMED
  * transition can fire. */
@@ -13803,6 +13955,10 @@ static const struct plugin_command commands[] = {
 	{
 		"dev-factory-mark-sweep-broadcast",
 		json_dev_factory_mark_sweep_broadcast,
+	},
+	{
+		"dev-factory-mark-sweep-failed",
+		json_dev_factory_mark_sweep_failed,
 	},
 	{
 		"dev-factory-mark-sweep-confirmed",
