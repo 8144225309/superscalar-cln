@@ -553,6 +553,17 @@ typedef struct factory_instance {
 	uint8_t *cached_all_nonces_wire;
 	size_t cached_all_nonces_len;
 
+	/* Cached serialized ROTATE_PROPOSE wire payload for rotation reconnect.
+	 * Populated at json_factory_rotate start; freed when rotation
+	 * completes (CEREMONY_ROTATE_COMPLETE transition). If a client drops
+	 * after receiving ROTATE_PROPOSE but before sending ROTATE_NONCE, the
+	 * peer_connected handler resends this payload so rotation doesn't
+	 * wedge. Same precedent as cached_all_nonces_wire — in-memory only,
+	 * not persisted; covers the common disconnect case without LSP
+	 * restart. */
+	uint8_t *cached_rotate_propose_wire;
+	size_t cached_rotate_propose_len;
+
 	/* MuSig2 nonce pool (heap-allocated, secnonces live inside) */
 	void *nonce_pool;
 	/* Per-entry: which pool index maps to which tree node */
