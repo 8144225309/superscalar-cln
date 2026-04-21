@@ -10129,12 +10129,6 @@ ss_sweep_broadcast_reply(struct command *cmd,
 					      ctx->source_txid,
 					      ctx->source_vout, &fi);
 
-	/* Detect error reply (broadcast_reply_classified-style). */
-	const jsmntok_t *code_tok = result
-		? json_get_member(buf, result, "code")
-		: NULL;
-	bool is_error = code_tok != NULL;
-
 	if (!ps) {
 		plugin_log(plugin_handle, LOG_UNUSUAL,
 			   "sweep: broadcast reply for unknown entry — "
@@ -10142,12 +10136,20 @@ ss_sweep_broadcast_reply(struct command *cmd,
 		return aux_command_done(cmd);
 	}
 
+	/* CLN's bitcoin backend returns {"success": bool, "errmsg": "..."}
+	 * for sendrawtransaction — NOT a JSON-RPC error object. */
+	const jsmntok_t *succ_tok = result
+		? json_get_member(buf, result, "success")
+		: NULL;
+	bool success = false;
+	if (succ_tok) json_to_bool(buf, succ_tok, &success);
+
 	char iid_hex[65];
 	for (int b = 0; b < 32; b++)
 		sprintf(iid_hex + b*2, "%02x", fi->instance_id[b]);
 	iid_hex[64] = '\0';
 
-	if (is_error) {
+	if (!success) {
 		ps->state = SWEEP_STATE_FAILED;
 		plugin_log(plugin_handle, LOG_UNUSUAL,
 			   "sweep broadcast FAILED: type=%s vout=%u — "
