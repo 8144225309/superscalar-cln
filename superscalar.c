@@ -7341,6 +7341,16 @@ static void ss_classify_spending_tx(factory_instance_t *fi,
 						   "broadcast penalty TXs when "
 						   "the leaf state TXs confirm.",
 						   fi->breach_epoch, fi->epoch);
+					/* Phase 5c structured marker. */
+					char biid[65];
+					for (int b = 0; b < 32; b++)
+						sprintf(biid + b*2, "%02x",
+							fi->instance_id[b]);
+					biid[64] = '\0';
+					plugin_log(plugin_handle, LOG_INFORM,
+						   "SS_METRIC event=factory_breached "
+						   "iid=%s breach_epoch=%u current_epoch=%u",
+						   biid, fi->breach_epoch, fi->epoch);
 					return;
 				}
 			}
@@ -8200,6 +8210,18 @@ static void ss_register_pending_penalty(factory_instance_t *fi,
 		   "lstock=%"PRIu64" sats csv_unlock=%u vsize=%u",
 		   epoch, leaf_index, lstock_sats, csv_unlock_block,
 		   tx_vsize);
+
+	/* Phase 5c structured marker. Emitted once per (epoch, leaf)
+	 * pair on first broadcast registration (not on duplicate bumps —
+	 * the dedup branch above returns before reaching here). */
+	char iid_hex[65];
+	for (int b = 0; b < 32; b++)
+		sprintf(iid_hex + b*2, "%02x", fi->instance_id[b]);
+	iid_hex[64] = '\0';
+	plugin_log(plugin_handle, LOG_INFORM,
+		   "SS_METRIC event=breach_burn_broadcast iid=%s "
+		   "epoch=%u leaf=%d lstock_sats=%"PRIu64" block=%u",
+		   iid_hex, epoch, leaf_index, lstock_sats, current_block);
 }
 
 /* Phase 3c-redux: grace blocks past CSV after which we mark a
@@ -9862,6 +9884,15 @@ static void ss_scheduler_launch_cpfp(struct command *cmd,
  * upstream sweeper.c's 3-conf threshold. */
 #define SWEEP_CONFIRM_THRESHOLD 3
 
+/* Phase 4d3: FAILED → READY retry gate. After a broadcast rejection
+ * (bitcoind -25 missing inputs, mempool conflict, etc.) we cool down
+ * for a few blocks, then retry. Retry count is stored in
+ * pending_sweep_t.reserved[0] so persistence layout is unchanged.
+ * Three attempts before we give up and leave state FAILED for
+ * operator attention. */
+#define SS_SWEEP_RETRY_DELAY_BLOCKS 6
+#define SS_SWEEP_MAX_RETRIES 3
+
 /* Register a new pending sweep. Dedup by (source_txid, source_vout).
  * Called from the post-close paths (Phase 4d2 entry points) when we
  * identify an output that will mature after a CSV window. */
@@ -9981,6 +10012,46 @@ static int ss_sweep_scheduler_tick(struct command *cmd,
 				   "(sweep confirmed_at=%u, current=%u)",
 				   i, sweep_type_name(ps->type),
 				   ps->sweep_confirmed_block, current_block);
+			/* Phase 5c structured marker. */
+			char iid_hex[65];
+			for (int b = 0; b < 32; b++)
+				sprintf(iid_hex + b*2, "%02x",
+					fi->instance_id[b]);
+			iid_hex[64] = '\0';
+			plugin_log(plugin_handle, LOG_INFORM,
+				   "SS_METRIC event=sweep_confirmed iid=%s "
+				   "type=%s vout=%u block=%u",
+				   iid_hex, sweep_type_name(ps->type),
+				   ps->source_vout,
+				   ps->sweep_confirmed_block);
+			transitions++;
+			dirty = true;
+		}
+
+		/* Phase 4d3: FAILED → READY retry. A sweep that failed at
+		 * broadcast time gets up to SS_SWEEP_MAX_RETRIES attempts,
+		 * spaced SS_SWEEP_RETRY_DELAY_BLOCKS apart. retry_count
+		 * lives in reserved[0] so on-disk layout is unchanged;
+		 * broadcast_block marks when the failure was observed (set
+		 * eagerly at kickoff). */
+		if (ps->state == SWEEP_STATE_FAILED
+		    && ps->reserved[0] < SS_SWEEP_MAX_RETRIES
+		    && ps->broadcast_block > 0
+		    && current_block >= ps->broadcast_block
+		    + SS_SWEEP_RETRY_DELAY_BLOCKS) {
+			ps->reserved[0]++;
+			ps->state = SWEEP_STATE_READY;
+			memset(ps->sweep_txid, 0, 32);
+			/* Clear broadcast_block so the next failure starts a
+			 * fresh retry window, not retry cascades from the
+			 * same block. */
+			ps->broadcast_block = 0;
+			plugin_log(plugin_handle, LOG_UNUSUAL,
+				   "sweep: entry %zu type=%s RETRY %u/%u "
+				   "(FAILED → READY, next kickoff at block %u)",
+				   i, sweep_type_name(ps->type),
+				   ps->reserved[0], SS_SWEEP_MAX_RETRIES,
+				   current_block);
 			transitions++;
 			dirty = true;
 		}
@@ -10071,12 +10142,22 @@ ss_sweep_broadcast_reply(struct command *cmd,
 		return aux_command_done(cmd);
 	}
 
+	char iid_hex[65];
+	for (int b = 0; b < 32; b++)
+		sprintf(iid_hex + b*2, "%02x", fi->instance_id[b]);
+	iid_hex[64] = '\0';
+
 	if (is_error) {
 		ps->state = SWEEP_STATE_FAILED;
 		plugin_log(plugin_handle, LOG_UNUSUAL,
 			   "sweep broadcast FAILED: type=%s vout=%u — "
 			   "state demoted to FAILED for operator review",
 			   sweep_type_name(ps->type), ps->source_vout);
+		plugin_log(plugin_handle, LOG_INFORM,
+			   "SS_METRIC event=sweep_failed iid=%s "
+			   "type=%s vout=%u retry=%u",
+			   iid_hex, sweep_type_name(ps->type),
+			   ps->source_vout, ps->reserved[0]);
 		ss_save_factory(cmd, fi);
 	} else {
 		ps->broadcast_block = ss_state.current_blockheight;
@@ -10085,6 +10166,12 @@ ss_sweep_broadcast_reply(struct command *cmd,
 			   "amount=%"PRIu64" at block %u",
 			   sweep_type_name(ps->type), ps->source_vout,
 			   ps->amount_sats, ps->broadcast_block);
+		plugin_log(plugin_handle, LOG_INFORM,
+			   "SS_METRIC event=sweep_broadcast iid=%s "
+			   "type=%s vout=%u amount=%"PRIu64" block=%u",
+			   iid_hex, sweep_type_name(ps->type),
+			   ps->source_vout, ps->amount_sats,
+			   ps->broadcast_block);
 		ss_save_factory(cmd, fi);
 	}
 	return aux_command_done(cmd);
@@ -10149,10 +10236,14 @@ ss_sweep_newaddr_reply(struct command *cmd,
 	}
 
 	/* Commit the eager state flip. The broadcast reply will demote
-	 * to FAILED if bitcoind rejects. */
+	 * to FAILED if bitcoind rejects. Stamp broadcast_block here (not
+	 * just in the success reply) so Phase 4d3's retry gate has a
+	 * meaningful "when did this fail?" reference even when bitcoind
+	 * rejects before the reply callback runs its normal path. */
 	memcpy(ps->sweep_txid, sweep_txid_out, 32);
 	memcpy(ctx->sweep_txid, sweep_txid_out, 32);
 	ps->state = SWEEP_STATE_BROADCAST;
+	ps->broadcast_block = ss_state.current_blockheight;
 	ss_save_factory(cmd, fi);
 
 	struct out_req *req = jsonrpc_request_start(cmd,
