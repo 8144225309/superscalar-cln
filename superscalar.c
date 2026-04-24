@@ -1055,6 +1055,81 @@ static bool ss_leaf_advance_done_parse(const uint8_t *data, size_t len,
 	return true;
 }
 
+/* --- Follow-up #4 impl: LEAF_REALLOC wire helpers ---
+ *
+ * LEAF_REALLOC_PROPOSE carries the new output amounts so the client can
+ * mirror factory_set_leaf_amounts locally before signing. Layout:
+ *   [32 iid | 4 leaf_side | 2 n_amounts | 8*n_amounts amounts_BE | 66 pubnonce]
+ *
+ * LEAF_REALLOC_PSIG and LEAF_REALLOC_DONE have the same wire shape as the
+ * corresponding LEAF_ADVANCE variants; only the submsg ID differs. Handlers
+ * can reuse ss_leaf_advance_psig_parse / ss_leaf_advance_done_parse for
+ * those two. */
+#define SS_LEAF_REALLOC_PROPOSE_MAX_OUTPUTS 8
+
+static size_t ss_leaf_realloc_propose_build(uint8_t *out, size_t cap,
+					    const uint8_t iid[32],
+					    uint32_t leaf_side,
+					    const uint64_t *amounts,
+					    size_t n_amounts,
+					    const uint8_t lsp_pubnonce66[66])
+{
+	if (n_amounts > SS_LEAF_REALLOC_PROPOSE_MAX_OUTPUTS) return 0;
+	size_t need = 32 + 4 + 2 + n_amounts * 8 + 66;
+	if (cap < need) return 0;
+	memcpy(out, iid, 32);
+	out[32] = (leaf_side >> 24) & 0xFF;
+	out[33] = (leaf_side >> 16) & 0xFF;
+	out[34] = (leaf_side >>  8) & 0xFF;
+	out[35] = leaf_side & 0xFF;
+	out[36] = (n_amounts >> 8) & 0xFF;
+	out[37] = n_amounts & 0xFF;
+	uint8_t *p = out + 38;
+	for (size_t i = 0; i < n_amounts; i++) {
+		uint64_t a = amounts[i];
+		p[0] = (a >> 56) & 0xFF; p[1] = (a >> 48) & 0xFF;
+		p[2] = (a >> 40) & 0xFF; p[3] = (a >> 32) & 0xFF;
+		p[4] = (a >> 24) & 0xFF; p[5] = (a >> 16) & 0xFF;
+		p[6] = (a >>  8) & 0xFF; p[7] = a & 0xFF;
+		p += 8;
+	}
+	memcpy(p, lsp_pubnonce66, 66);
+	return need;
+}
+
+static bool ss_leaf_realloc_propose_parse(const uint8_t *data, size_t len,
+					  uint8_t iid_out[32],
+					  uint32_t *leaf_side_out,
+					  uint64_t *amounts_out,
+					  size_t *n_amounts_out,
+					  size_t amounts_cap,
+					  uint8_t lsp_pubnonce66_out[66])
+{
+	if (len < 38) return false;
+	memcpy(iid_out, data, 32);
+	*leaf_side_out = ((uint32_t)data[32] << 24)
+		       | ((uint32_t)data[33] << 16)
+		       | ((uint32_t)data[34] <<  8)
+		       |  (uint32_t)data[35];
+	uint16_t n = ((uint16_t)data[36] << 8) | data[37];
+	if (n > SS_LEAF_REALLOC_PROPOSE_MAX_OUTPUTS || n > amounts_cap)
+		return false;
+	size_t need = 38 + (size_t)n * 8 + 66;
+	if (len < need) return false;
+	const uint8_t *p = data + 38;
+	for (uint16_t i = 0; i < n; i++) {
+		amounts_out[i] =
+			((uint64_t)p[0] << 56) | ((uint64_t)p[1] << 48) |
+			((uint64_t)p[2] << 40) | ((uint64_t)p[3] << 32) |
+			((uint64_t)p[4] << 24) | ((uint64_t)p[5] << 16) |
+			((uint64_t)p[6] <<  8) |  (uint64_t)p[7];
+		p += 8;
+	}
+	memcpy(lsp_pubnonce66_out, p, 66);
+	*n_amounts_out = n;
+	return true;
+}
+
 /* Blocks after which an in-flight PS advance is abandoned and state cleared.
  * 3 blocks ≈ 30 min on mainnet; plenty for async PSIG/DONE round trip even
  * across a reconnect. */
@@ -1112,6 +1187,7 @@ static void ss_clear_ps_pending(factory_instance_t *fi)
 	fi->ps_pending_leaf = -1;
 	fi->ps_pending_node_idx = 0;
 	fi->ps_pending_start_block = 0;
+	fi->ps_pending_is_realloc = 0;
 }
 
 /* Persist one PS leaf chain entry at its current (just-signed) state.
@@ -6073,6 +6149,298 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 			"SS_METRIC event=ps_advance_client_done leaf=%u "
 			"chain_pos=%d",
 			leaf_side, cf->nodes[nidx].ps_chain_len);
+		break;
+	}
+
+	/* --- Follow-up #4 impl: LEAF_REALLOC handlers (value transfer) --- */
+
+	case SS_SUBMSG_LEAF_REALLOC_PROPOSE: {
+		/* Client side: LSP proposed new output amounts on a leaf.
+		 * Apply factory_set_leaf_amounts locally so our unsigned TX
+		 * matches, then do the 2-of-2 signing half (no advance). */
+		uint8_t iid[32], lsp_pn[66];
+		uint32_t leaf_side;
+		uint64_t new_amts[SS_LEAF_REALLOC_PROPOSE_MAX_OUTPUTS];
+		size_t n_amts = 0;
+		if (!ss_leaf_realloc_propose_parse(data, len, iid, &leaf_side,
+			new_amts, &n_amts,
+			SS_LEAF_REALLOC_PROPOSE_MAX_OUTPUTS, lsp_pn)) {
+			plugin_log(plugin_handle, LOG_UNUSUAL,
+				"Bad LEAF_REALLOC_PROPOSE from %s (len=%zu)",
+				peer_id, len);
+			break;
+		}
+		factory_instance_t *fp = ss_factory_find(&ss_state, iid);
+		if (!fp || fp->is_lsp) break;
+		if (fp->ps_pending_leaf != -1) {
+			plugin_log(plugin_handle, LOG_UNUSUAL,
+				"LEAF_REALLOC_PROPOSE while another ceremony "
+				"pending on leaf %d — dropping",
+				fp->ps_pending_leaf);
+			break;
+		}
+		factory_t *cf = (factory_t *)fp->lib_factory;
+		if (!cf) break;
+		if ((int)leaf_side < 0 || (int)leaf_side >= cf->n_leaf_nodes) {
+			plugin_log(plugin_handle, LOG_UNUSUAL,
+				"LEAF_REALLOC_PROPOSE: leaf_side %u out of range",
+				leaf_side);
+			break;
+		}
+
+		/* Mirror the LSP's amount change on our local factory_t.
+		 * set_leaf_amounts enforces sum-conservation and rebuilds
+		 * the unsigned TX. */
+		if (!factory_set_leaf_amounts(cf, (int)leaf_side,
+					      new_amts, n_amts)) {
+			plugin_log(plugin_handle, LOG_UNUSUAL,
+				"LEAF_REALLOC_PROPOSE: factory_set_leaf_amounts "
+				"rejected (mismatched sum or dust?)");
+			break;
+		}
+
+		size_t nidx = cf->leaf_node_indices[leaf_side];
+		factory_node_t *nd = &cf->nodes[nidx];
+		if (!factory_session_init_node(cf, nidx)) break;
+		int my_slot = factory_find_signer_slot(cf, nidx,
+			(uint32_t)fp->our_participant_idx);
+		int lsp_slot = factory_find_signer_slot(cf, nidx, 0);
+		if (my_slot < 0 || lsp_slot < 0) break;
+
+		secp256k1_musig_pubnonce lsp_pn_obj;
+		if (!musig_pubnonce_parse(global_secp_ctx, &lsp_pn_obj, lsp_pn))
+			break;
+		if (!factory_session_set_nonce(cf, nidx, (size_t)lsp_slot,
+					       &lsp_pn_obj))
+			break;
+
+		/* Generate own nonce + partial sig, consume secnonce */
+		secp256k1_musig_secnonce *my_sn =
+			calloc(1, sizeof(secp256k1_musig_secnonce));
+		if (!my_sn) break;
+		secp256k1_musig_pubnonce my_pn;
+		secp256k1_pubkey my_pub;
+		if (!secp256k1_ec_pubkey_create(global_secp_ctx, &my_pub,
+						fp->our_seckey)) {
+			free(my_sn); break;
+		}
+		if (!musig_generate_nonce(global_secp_ctx, my_sn, &my_pn,
+					  fp->our_seckey, &my_pub,
+					  &nd->keyagg.cache)) {
+			free(my_sn); break;
+		}
+		if (!factory_session_set_nonce(cf, nidx, (size_t)my_slot,
+					       &my_pn)) {
+			free(my_sn); break;
+		}
+		if (!factory_session_finalize_node(cf, nidx)) {
+			free(my_sn); break;
+		}
+		secp256k1_keypair my_kp;
+		if (!secp256k1_keypair_create(global_secp_ctx, &my_kp,
+					      fp->our_seckey)) {
+			free(my_sn); break;
+		}
+		secp256k1_musig_partial_sig my_psig;
+		if (!musig_create_partial_sig(global_secp_ctx, &my_psig,
+					      my_sn, &my_kp,
+					      &nd->signing_session)) {
+			free(my_sn); break;
+		}
+		free(my_sn);
+		if (!factory_session_set_partial_sig(cf, nidx,
+						     (size_t)my_slot, &my_psig))
+			break;
+
+		/* Stash pending state — we need to remember we're awaiting
+		 * DONE with LSP's psig so we can complete locally. Mark
+		 * is_realloc so we know not to save as a new chain entry. */
+		fp->ps_pending_leaf = (int32_t)leaf_side;
+		fp->ps_pending_node_idx = (uint32_t)nidx;
+		fp->ps_pending_secnonce = NULL; /* already consumed */
+		fp->ps_pending_start_block = ss_state.current_blockheight;
+		fp->ps_pending_is_realloc = 1;
+
+		/* Send PSIG back (same wire shape as LEAF_ADVANCE_PSIG; the
+		 * distinct submsg ID is what routes to the realloc handler). */
+		uint8_t my_pn_ser[66];
+		musig_pubnonce_serialize(global_secp_ctx, my_pn_ser, &my_pn);
+		uint8_t my_psig_ser[32];
+		musig_partial_sig_serialize(global_secp_ctx,
+					    my_psig_ser, &my_psig);
+		uint8_t payload[134];
+		size_t plen = ss_leaf_advance_psig_build(payload, sizeof(payload),
+			fp->instance_id, leaf_side, my_pn_ser, my_psig_ser);
+		if (plen > 0) {
+			send_factory_msg(cmd, peer_id,
+				SS_SUBMSG_LEAF_REALLOC_PSIG, payload, plen);
+			plugin_log(plugin_handle, LOG_INFORM,
+				"SS_METRIC event=realloc_psig_sent leaf=%u",
+				leaf_side);
+		}
+		break;
+	}
+
+	case SS_SUBMSG_LEAF_REALLOC_PSIG: {
+		/* LSP side: client replied with pubnonce + psig. Complete the
+		 * signing session and send REALLOC_DONE. Logic is identical
+		 * to LEAF_ADVANCE_PSIG minus the chain-advance bookkeeping
+		 * (no ps_prev_* updates). */
+		uint8_t iid[32], cli_pn[66], cli_psig_ser[32];
+		uint32_t leaf_side;
+		if (!ss_leaf_advance_psig_parse(data, len, iid, &leaf_side,
+						cli_pn, cli_psig_ser)) {
+			plugin_log(plugin_handle, LOG_UNUSUAL,
+				"Bad LEAF_REALLOC_PSIG (len=%zu)", len);
+			break;
+		}
+		factory_instance_t *fp = ss_factory_find(&ss_state, iid);
+		if (!fp || !fp->is_lsp) break;
+		if (!fp->ps_pending_is_realloc ||
+		    fp->ps_pending_leaf != (int32_t)leaf_side) {
+			plugin_log(plugin_handle, LOG_UNUSUAL,
+				"LEAF_REALLOC_PSIG mismatch (pending leaf=%d "
+				"is_realloc=%u got=%u)",
+				fp->ps_pending_leaf, fp->ps_pending_is_realloc,
+				leaf_side);
+			break;
+		}
+		factory_t *lf = (factory_t *)fp->lib_factory;
+		if (!lf || !fp->ps_pending_secnonce) {
+			ss_clear_ps_pending(fp);
+			break;
+		}
+		size_t nidx = fp->ps_pending_node_idx;
+		factory_node_t *nd = &lf->nodes[nidx];
+		int my_slot = factory_find_signer_slot(lf, nidx, 0);
+		int cli_slot = factory_find_signer_slot(lf, nidx,
+			(uint32_t)(leaf_side + 1));
+		if (my_slot < 0 || cli_slot < 0) {
+			ss_clear_ps_pending(fp); break;
+		}
+		secp256k1_musig_pubnonce cli_pn_obj;
+		secp256k1_musig_partial_sig cli_psig_obj;
+		if (!musig_pubnonce_parse(global_secp_ctx, &cli_pn_obj, cli_pn)
+		    || !musig_partial_sig_parse(global_secp_ctx, &cli_psig_obj,
+					        cli_psig_ser)) {
+			ss_clear_ps_pending(fp); break;
+		}
+		if (!factory_session_set_nonce(lf, nidx, (size_t)cli_slot,
+					       &cli_pn_obj)
+		    || !factory_session_finalize_node(lf, nidx)) {
+			ss_clear_ps_pending(fp); break;
+		}
+		secp256k1_keypair lsp_kp;
+		if (!secp256k1_keypair_create(global_secp_ctx, &lsp_kp,
+					      fp->our_seckey)) {
+			ss_clear_ps_pending(fp); break;
+		}
+		secp256k1_musig_partial_sig lsp_psig;
+		if (!musig_create_partial_sig(global_secp_ctx, &lsp_psig,
+			(secp256k1_musig_secnonce *)fp->ps_pending_secnonce,
+			&lsp_kp, &nd->signing_session)) {
+			ss_clear_ps_pending(fp); break;
+		}
+		free(fp->ps_pending_secnonce);
+		fp->ps_pending_secnonce = NULL;
+
+		if (!factory_session_set_partial_sig(lf, nidx,
+			(size_t)my_slot, &lsp_psig)
+		    || !factory_session_set_partial_sig(lf, nidx,
+			(size_t)cli_slot, &cli_psig_obj)
+		    || !factory_session_complete_node(lf, nidx)) {
+			ss_clear_ps_pending(fp); break;
+		}
+
+		/* For PS chain[0] reallocs, the stored chain[0] entry's
+		 * signed_tx has changed; refresh the datastore entry. */
+		if (nd->is_ps_leaf)
+			ss_save_ps_chain_entry(cmd, fp, (uint32_t)nidx);
+		/* Also refresh the full signed_txs blob so a legacy replay
+		 * picks up the new amounts on this leaf. */
+		ss_save_factory(cmd, fp);
+
+		int32_t done_leaf = fp->ps_pending_leaf;
+		ss_clear_ps_pending(fp);
+
+		/* Send REALLOC_DONE to all clients (same wire shape as
+		 * LEAF_ADVANCE_DONE). */
+		uint8_t lsp_psig_ser[32];
+		musig_partial_sig_serialize(global_secp_ctx,
+					    lsp_psig_ser, &lsp_psig);
+		uint8_t payload[68];
+		size_t plen = ss_leaf_advance_done_build(payload,
+			sizeof(payload), fp->instance_id,
+			(uint32_t)done_leaf, lsp_psig_ser);
+		if (plen > 0) {
+			for (size_t ci = 0; ci < fp->n_clients; ci++) {
+				char ch[67];
+				for (int j = 0; j < 33; j++)
+					sprintf(ch + j*2, "%02x",
+						fp->clients[ci].node_id[j]);
+				ch[66] = '\0';
+				send_factory_msg(cmd, ch,
+					SS_SUBMSG_LEAF_REALLOC_DONE,
+					payload, plen);
+			}
+		}
+
+		char iid_hex[65];
+		for (int j = 0; j < 32; j++)
+			sprintf(iid_hex + j*2, "%02x", fp->instance_id[j]);
+		iid_hex[64] = '\0';
+		plugin_log(plugin_handle, LOG_INFORM,
+			"SS_METRIC event=realloc_complete iid=%s leaf=%d",
+			iid_hex, done_leaf);
+		break;
+	}
+
+	case SS_SUBMSG_LEAF_REALLOC_DONE: {
+		/* Client side: LSP's partial sig arrived; complete our copy
+		 * so we have the re-signed leaf TX locally. */
+		uint8_t iid[32], lsp_psig_ser[32];
+		uint32_t leaf_side;
+		if (!ss_leaf_advance_done_parse(data, len, iid, &leaf_side,
+						lsp_psig_ser)) {
+			plugin_log(plugin_handle, LOG_UNUSUAL,
+				"Bad LEAF_REALLOC_DONE (len=%zu)", len);
+			break;
+		}
+		factory_instance_t *fp = ss_factory_find(&ss_state, iid);
+		if (!fp || fp->is_lsp) break;
+		if (!fp->ps_pending_is_realloc ||
+		    fp->ps_pending_leaf != (int32_t)leaf_side) {
+			plugin_log(plugin_handle, LOG_DBG,
+				"LEAF_REALLOC_DONE leaf=%u notification "
+				"(we weren't the signer)", leaf_side);
+			break;
+		}
+		factory_t *cf = (factory_t *)fp->lib_factory;
+		if (!cf) { ss_clear_ps_pending(fp); break; }
+		size_t nidx = fp->ps_pending_node_idx;
+		int lsp_slot = factory_find_signer_slot(cf, nidx, 0);
+		if (lsp_slot < 0) { ss_clear_ps_pending(fp); break; }
+
+		secp256k1_musig_partial_sig lsp_psig_obj;
+		if (!musig_partial_sig_parse(global_secp_ctx, &lsp_psig_obj,
+					     lsp_psig_ser)) {
+			ss_clear_ps_pending(fp); break;
+		}
+		if (!factory_session_set_partial_sig(cf, nidx,
+			(size_t)lsp_slot, &lsp_psig_obj)
+		    || !factory_session_complete_node(cf, nidx)) {
+			ss_clear_ps_pending(fp); break;
+		}
+
+		/* Persist the re-signed leaf on the client too. */
+		if (cf->nodes[nidx].is_ps_leaf)
+			ss_save_ps_chain_entry(cmd, fp, (uint32_t)nidx);
+		ss_save_factory(cmd, fp);
+
+		ss_clear_ps_pending(fp);
+		plugin_log(plugin_handle, LOG_INFORM,
+			"SS_METRIC event=realloc_client_done leaf=%u",
+			leaf_side);
 		break;
 	}
 
@@ -13422,6 +13790,19 @@ static struct command_result *json_factory_buy_liquidity(struct command *cmd,
 	new_amts[client_out] += *amount_sats;
 	new_amts[lstock_out] -= *amount_sats;
 
+	/* Save amounts for wire transmission BEFORE calling set_leaf_amounts,
+	 * since set_leaf_amounts writes into ln->outputs[] and we want the
+	 * same array order to send to the client. */
+	uint64_t tx_amts[SS_LEAF_REALLOC_PROPOSE_MAX_OUTPUTS];
+	size_t tx_n = n_out;
+	if (tx_n > SS_LEAF_REALLOC_PROPOSE_MAX_OUTPUTS) {
+		free(new_amts);
+		return command_fail(cmd, LIGHTNINGD,
+			"leaf has too many outputs (%zu > %d) for REALLOC wire",
+			n_out, SS_LEAF_REALLOC_PROPOSE_MAX_OUTPUTS);
+	}
+	memcpy(tx_amts, new_amts, n_out * sizeof(uint64_t));
+
 	int rc = factory_set_leaf_amounts(factory, leaf_side,
 					  new_amts, n_out);
 	free(new_amts);
@@ -13432,15 +13813,127 @@ static struct command_result *json_factory_buy_liquidity(struct command *cmd,
 
 	plugin_log(plugin_handle, LOG_INFORM,
 		   "Liquidity purchase: moved %"PRIu64" sats from L-stock "
-		   "to client %u on leaf %d",
+		   "to client %u on leaf %d — starting re-sign ceremony",
 		   *amount_sats, *client_idx, leaf_side);
 
-	/* TODO: trigger leaf re-signing ceremony (MuSig2 over new leaf TX).
-	 * For now, just update the tree state — the next rotation will
-	 * pick up the new amounts. */
+	/* Follow-up #4 impl: trigger LEAF_REALLOC ceremony to sign the
+	 * modified leaf state. Without this the reallocation is ceremonial
+	 * (in-memory) only — bitcoind wouldn't accept the on-chain TX. */
+
+	/* Concurrency guard: reuse the PS advance pending-state slot — a
+	 * realloc ceremony blocks simultaneous advances and vice versa. */
+	if (fi->ps_pending_leaf != -1)
+		return command_fail(cmd, LIGHTNINGD,
+			"another leaf ceremony in flight on leaf %d — retry later",
+			fi->ps_pending_leaf);
+	if (fi->rotation_in_progress)
+		return command_fail(cmd, LIGHTNINGD,
+			"factory rotation in progress — retry after completion");
+
+	/* The reallocation ceremony is a 2-of-2 between LSP and the client
+	 * on the affected leaf. For ARITY_2 (3-of-3) it would need a
+	 * different ceremony — not wired here. */
+	factory_arity_t eff = ss_effective_arity(fi);
+	if (eff == FACTORY_ARITY_2) {
+		return command_fail(cmd, LIGHTNINGD,
+			"factory-buy-liquidity re-sign not yet implemented for "
+			"ARITY_2 (3-of-3 ceremony) — use ARITY_1 or ARITY_PS");
+	}
+
+	/* PS-specific: only chain[0] has an L-stock output. After any PS
+	 * advance chain[N>=1] has only the channel output, so value transfer
+	 * is impossible at the chain layer. */
+	if (eff == FACTORY_ARITY_PS && ln->ps_chain_len > 0)
+		return command_fail(cmd, LIGHTNINGD,
+			"PS leaf %d already advanced past chain[0] — no L-stock "
+			"to draw from. Rotate the factory first.", leaf_side);
+
+	/* Init signing session for the modified leaf node. Must happen AFTER
+	 * factory_set_leaf_amounts because set_leaf_amounts rebuilds the
+	 * unsigned TX (via rebuild_node_tx) and clears is_signed. */
+	size_t node_idx = (size_t)leaf_node;
+	if (!factory_session_init_node(factory, node_idx))
+		return command_fail(cmd, LIGHTNINGD,
+			"session_init_node failed for leaf %d", leaf_side);
+
+	int lsp_slot = factory_find_signer_slot(factory, node_idx, 0);
+	if (lsp_slot < 0)
+		return command_fail(cmd, LIGHTNINGD,
+			"LSP not signer on leaf node %zu", node_idx);
+
+	/* Generate LSP secnonce + pubnonce */
+	secp256k1_musig_secnonce *lsp_secnonce =
+		calloc(1, sizeof(secp256k1_musig_secnonce));
+	if (!lsp_secnonce)
+		return command_fail(cmd, LIGHTNINGD, "OOM (secnonce)");
+
+	secp256k1_musig_pubnonce lsp_pubnonce;
+	secp256k1_pubkey lsp_pub;
+	if (!secp256k1_ec_pubkey_create(global_secp_ctx, &lsp_pub,
+					fi->our_seckey)) {
+		free(lsp_secnonce);
+		return command_fail(cmd, LIGHTNINGD, "LSP pubkey derive failed");
+	}
+	if (!musig_generate_nonce(global_secp_ctx, lsp_secnonce, &lsp_pubnonce,
+				  fi->our_seckey, &lsp_pub,
+				  &factory->nodes[node_idx].keyagg.cache)) {
+		free(lsp_secnonce);
+		return command_fail(cmd, LIGHTNINGD, "nonce gen failed");
+	}
+	if (!factory_session_set_nonce(factory, node_idx, (size_t)lsp_slot,
+				       &lsp_pubnonce)) {
+		free(lsp_secnonce);
+		return command_fail(cmd, LIGHTNINGD, "set_nonce failed");
+	}
+
+	uint8_t lsp_pubnonce_ser[66];
+	musig_pubnonce_serialize(global_secp_ctx, lsp_pubnonce_ser,
+				 &lsp_pubnonce);
+
+	/* Stash pending state — mark is_realloc so PSIG/DONE handlers skip
+	 * the chain-advance persistence path. */
+	fi->ps_pending_leaf = (int32_t)leaf_side;
+	fi->ps_pending_node_idx = (uint32_t)node_idx;
+	fi->ps_pending_secnonce = lsp_secnonce;
+	fi->ps_pending_start_block = ss_state.current_blockheight;
+	fi->ps_pending_is_realloc = 1;
+
+	/* Locate the client's peer_id. For ARITY_PS / ARITY_1 (1 client per
+	 * leaf), client[leaf_side] is the one on this leaf. */
+	if ((size_t)leaf_side >= fi->n_clients) {
+		ss_clear_ps_pending(fi);
+		return command_fail(cmd, LIGHTNINGD,
+			"leaf_side %d has no client mapping", leaf_side);
+	}
+	char client_hex[67];
+	for (int j = 0; j < 33; j++)
+		sprintf(client_hex + j*2, "%02x",
+			fi->clients[leaf_side].node_id[j]);
+	client_hex[66] = '\0';
+
+	uint8_t payload[32 + 4 + 2 + SS_LEAF_REALLOC_PROPOSE_MAX_OUTPUTS * 8 + 66];
+	size_t plen = ss_leaf_realloc_propose_build(payload, sizeof(payload),
+		fi->instance_id, (uint32_t)leaf_side,
+		tx_amts, tx_n, lsp_pubnonce_ser);
+	if (plen == 0) {
+		ss_clear_ps_pending(fi);
+		return command_fail(cmd, LIGHTNINGD,
+			"REALLOC_PROPOSE build failed");
+	}
+	send_factory_msg(cmd, client_hex, SS_SUBMSG_LEAF_REALLOC_PROPOSE,
+			 payload, plen);
+
+	char iid_hex[65];
+	for (int j = 0; j < 32; j++)
+		sprintf(iid_hex + j*2, "%02x", fi->instance_id[j]);
+	iid_hex[64] = '\0';
+	plugin_log(plugin_handle, LOG_INFORM,
+		"SS_METRIC event=realloc_propose iid=%s leaf=%d "
+		"client=%u amount=%"PRIu64,
+		iid_hex, leaf_side, *client_idx, *amount_sats);
 
 	struct json_stream *js = jsonrpc_stream_success(cmd);
-	json_add_string(js, "status", "liquidity_allocated");
+	json_add_string(js, "status", "realloc_proposed");
 	json_add_u64(js, "amount_sats", *amount_sats);
 	json_add_u32(js, "leaf_side", leaf_side);
 	json_add_u32(js, "client_idx", *client_idx);
