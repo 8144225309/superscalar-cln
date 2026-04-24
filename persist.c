@@ -961,6 +961,89 @@ void ss_persist_key_dist_tx(const factory_instance_t *fi, char *out, size_t len)
 	snprintf(out, len, "superscalar/factories/%s/dist_tx", id_hex);
 }
 
+/* --- Tier 2.6: PS leaf chain persistence --- */
+
+void ss_persist_key_ps_chain_entry(const factory_instance_t *fi,
+				   uint32_t leaf_node_idx,
+				   uint32_t chain_pos,
+				   char *out, size_t len)
+{
+	char id_hex[65];
+	hex32(fi->instance_id, id_hex);
+	snprintf(out, len, "superscalar/factories/%s/ps_chain/%u/%u",
+		 id_hex, leaf_node_idx, chain_pos);
+}
+
+void ss_persist_key_ps_chain_prefix(const factory_instance_t *fi,
+				    char *out, size_t len)
+{
+	char id_hex[65];
+	hex32(fi->instance_id, id_hex);
+	snprintf(out, len, "superscalar/factories/%s/ps_chain", id_hex);
+}
+
+size_t ss_persist_serialize_ps_chain_entry(const uint8_t txid32[32],
+					   uint64_t chan_amount_sats,
+					   const uint8_t *signed_tx,
+					   size_t signed_tx_len,
+					   uint8_t **out)
+{
+	uint8_t *buf = NULL;
+	size_t len = 0, cap = 0;
+
+	buf_append(&buf, &len, &cap, txid32, 32);
+	{
+		uint64_t a = chan_amount_sats;
+		uint8_t ab[8] = { (a >> 56) & 0xFF, (a >> 48) & 0xFF,
+				   (a >> 40) & 0xFF, (a >> 32) & 0xFF,
+				   (a >> 24) & 0xFF, (a >> 16) & 0xFF,
+				   (a >>  8) & 0xFF, a & 0xFF };
+		buf_append(&buf, &len, &cap, ab, 8);
+	}
+	buf_u32(&buf, &len, &cap, (uint32_t)signed_tx_len);
+	if (signed_tx_len > 0 && signed_tx)
+		buf_append(&buf, &len, &cap, signed_tx, signed_tx_len);
+
+	*out = buf;
+	return len;
+}
+
+bool ss_persist_deserialize_ps_chain_entry(const uint8_t *data, size_t len,
+					   uint8_t txid_out32[32],
+					   uint64_t *chan_amount_sats_out,
+					   uint8_t **signed_tx_out,
+					   size_t *signed_tx_len_out)
+{
+	const uint8_t *p = data;
+	size_t rem = len;
+
+	if (!read_bytes(&p, &rem, txid_out32, 32)) return false;
+	{
+		uint8_t ab[8];
+		if (!read_bytes(&p, &rem, ab, 8)) return false;
+		*chan_amount_sats_out =
+			((uint64_t)ab[0] << 56) | ((uint64_t)ab[1] << 48) |
+			((uint64_t)ab[2] << 40) | ((uint64_t)ab[3] << 32) |
+			((uint64_t)ab[4] << 24) | ((uint64_t)ab[5] << 16) |
+			((uint64_t)ab[6] <<  8) |  (uint64_t)ab[7];
+	}
+	uint32_t tx_len;
+	if (!read_u32(&p, &rem, &tx_len)) return false;
+	if (rem < tx_len) return false;
+
+	if (tx_len > 0) {
+		uint8_t *tx = malloc(tx_len);
+		if (!tx) return false;
+		memcpy(tx, p, tx_len);
+		*signed_tx_out = tx;
+		*signed_tx_len_out = tx_len;
+	} else {
+		*signed_tx_out = NULL;
+		*signed_tx_len_out = 0;
+	}
+	return true;
+}
+
 /* Serialize signed distribution TX.
  * Format: tx_len(u32) + tx_data(tx_len) */
 size_t ss_persist_serialize_dist_tx(const factory_instance_t *fi,

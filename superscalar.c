@@ -1068,6 +1068,57 @@ static void ss_clear_ps_pending(factory_instance_t *fi)
 	fi->ps_pending_node_idx = 0;
 }
 
+/* Persist one PS leaf chain entry at its current (just-signed) state.
+ * Keyed by leaf_node_idx + chain_pos so advances don't rewrite history.
+ * Called after factory_session_complete_node succeeds on a PS leaf. */
+static void ss_save_ps_chain_entry(struct command *cmd,
+				   factory_instance_t *fi,
+				   uint32_t leaf_node_idx)
+{
+	if (!fi || !fi->lib_factory) return;
+	factory_t *f = (factory_t *)fi->lib_factory;
+	if (leaf_node_idx >= f->n_nodes) return;
+	factory_node_t *node = &f->nodes[leaf_node_idx];
+	if (!node->is_ps_leaf) return;
+	if (!node->is_signed || !node->signed_tx.data ||
+	    node->signed_tx.len == 0)
+		return;
+
+	uint32_t chain_pos = (uint32_t)node->ps_chain_len;
+	char key[192];
+	ss_persist_key_ps_chain_entry(fi, leaf_node_idx, chain_pos,
+				      key, sizeof(key));
+
+	uint8_t *buf = NULL;
+	size_t len = ss_persist_serialize_ps_chain_entry(
+		node->txid,
+		node->outputs[0].amount_sats,
+		node->signed_tx.data, node->signed_tx.len,
+		&buf);
+	if (len > 0 && buf) {
+		jsonrpc_set_datastore_binary(cmd, key, buf, len,
+			"create-or-replace", rpc_done, rpc_err, fi);
+		free(buf);
+	}
+}
+
+/* Persist chain[0] for every PS leaf in the factory.  Called once after
+ * factory_sign_all completes during ceremony — chain[0] is the leaf's
+ * initial 2-output state (channel + L-stock) that subsequent advances
+ * chain atop. */
+static void ss_save_all_ps_chain0(struct command *cmd,
+				  factory_instance_t *fi)
+{
+	if (!fi || !fi->lib_factory) return;
+	factory_t *f = (factory_t *)fi->lib_factory;
+	for (int i = 0; i < f->n_leaf_nodes; i++) {
+		size_t nidx = f->leaf_node_indices[i];
+		if (nidx >= f->n_nodes) continue;
+		if (!f->nodes[nidx].is_ps_leaf) continue;
+		ss_save_ps_chain_entry(cmd, fi, (uint32_t)nidx);
+	}
+}
+
 /* Generic RPC callback — just log and ignore result */
 static struct command_result *rpc_done(struct command *cmd,
 				       const char *method,
@@ -1900,6 +1951,72 @@ static void ss_load_factories(struct command *cmd)
 									"Loaded signed "
 									"TXs (%zu bytes)",
 									stx_len);
+							}
+							}
+
+							/* Tier 2.6: replay PS leaf chain entries.
+							 * Iterate each PS leaf, try chain_pos 0,1,2,...
+							 * until key missing. Apply to factory_t node so
+							 * subsequent advances continue from the right
+							 * state and force-close has all chain TXs. */
+							{
+							for (int li = 0; li < f->n_leaf_nodes; li++) {
+								size_t nidx = f->leaf_node_indices[li];
+								if (nidx >= f->n_nodes) continue;
+								if (!f->nodes[nidx].is_ps_leaf) continue;
+								factory_node_t *nd = &f->nodes[nidx];
+								uint8_t last_txid[32] = {0};
+								uint64_t last_amt = 0;
+								int loaded = 0;
+								for (uint32_t cp = 0; cp < 1024; cp++) {
+									char ps_key[192];
+									ss_persist_key_ps_chain_entry(
+										fi, (uint32_t)nidx, cp,
+										ps_key, sizeof(ps_key));
+									u8 *pdata = NULL;
+									const char *perr =
+										rpc_scan_datastore_hex(
+											tmpctx, cmd, ps_key,
+											JSON_SCAN_TAL(tmpctx,
+												json_tok_bin_from_hex,
+												&pdata));
+									if (perr || !pdata) break;
+									size_t plen = tal_bytelen(pdata);
+									if (plen == 0) break;
+									uint8_t etxid[32];
+									uint64_t eamt;
+									uint8_t *etx = NULL;
+									size_t etx_len = 0;
+									if (!ss_persist_deserialize_ps_chain_entry(
+										pdata, plen, etxid, &eamt,
+										&etx, &etx_len))
+										break;
+									if (cp > 0) {
+										memcpy(nd->ps_prev_txid,
+										       last_txid, 32);
+										nd->ps_prev_chan_amount = last_amt;
+									}
+									nd->ps_chain_len = (int)cp;
+									if (nd->signed_tx.data)
+										free(nd->signed_tx.data);
+									nd->signed_tx.data = etx;
+									nd->signed_tx.len = etx_len;
+									nd->signed_tx.cap = etx_len;
+									nd->is_signed = 1;
+									memcpy(nd->txid, etxid, 32);
+									if (nd->n_outputs > 0)
+										nd->outputs[0].amount_sats = eamt;
+									memcpy(last_txid, etxid, 32);
+									last_amt = eamt;
+									loaded++;
+								}
+								if (loaded > 0)
+									plugin_log(plugin_handle, LOG_INFORM,
+										"Loaded %d PS chain entries for "
+										"leaf %d (node %zu), current "
+										"chain_len=%d",
+										loaded, li, nidx,
+										nd->ps_chain_len);
 							}
 							}
 
@@ -3563,6 +3680,10 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 				plugin_log(plugin_handle, LOG_INFORM,
 					   "LSP: FACTORY TREE SIGNED!");
 
+				/* Tier 2.6: capture chain[0] for every PS leaf
+				 * before any advance overwrites memory. */
+				ss_save_all_ps_chain0(cmd, fi);
+
 				/* Build distribution TX (nLockTime fallback).
 				 * This TX lets clients recover funds if LSP
 				 * vanishes — the core SuperScalar safety net. */
@@ -4606,6 +4727,11 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 					   "LSP: ROTATION TREE SIGNED! epoch=%u",
 					   fi->epoch);
 
+				/* Tier 2.6: rotation rebuilds the tree, so PS
+				 * leaves' chain state resets.  Capture the new
+				 * chain[0] for each PS leaf. */
+				ss_save_all_ps_chain0(cmd, fi);
+
 				/* Build new distribution TX for rotated tree */
 				fi->rotation_in_progress = true;
 				tx_output_t rot_dist_out[MAX_DIST_OUTPUTS];
@@ -5550,9 +5676,14 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 			break;
 		}
 
-		/* Chain[N] signed. Clear pending, send DONE to all clients
-		 * carrying our partial sig so the involved client can finish
-		 * their local copy. Others ignore the psig. */
+		/* Chain[N] signed. Persist this chain entry before anything
+		 * else — once ps_chain_len advances, this signed_tx is gone
+		 * from factory_t memory. */
+		ss_save_ps_chain_entry(cmd, fp, (uint32_t)nidx);
+
+		/* Clear pending, send DONE to all clients carrying our partial
+		 * sig so the involved client can finish their local copy.
+		 * Others ignore the psig. */
 		int32_t done_leaf = fp->ps_pending_leaf;
 		ss_clear_ps_pending(fp);
 
@@ -5630,6 +5761,9 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 			ss_clear_ps_pending(fp);
 			break;
 		}
+		/* Client persists their copy of chain[N] for unilateral exit
+		 * from cold storage without relying on the LSP's retention. */
+		ss_save_ps_chain_entry(cmd, fp, (uint32_t)nidx);
 		ss_clear_ps_pending(fp);
 		plugin_log(plugin_handle, LOG_INFORM,
 			"SS_METRIC event=ps_advance_client_done leaf=%u "
