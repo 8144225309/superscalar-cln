@@ -1490,6 +1490,26 @@ static void rotate_finish_and_notify(struct command *cmd,
 			   "%zu clients)", old_ep, fi->n_clients);
 	}
 
+	/* Follow-up #1 sub-PR 3C: ROTATE_COMPLETE carries the new epoch's
+	 * signed tree TXs as a backward-compatible trailer after the 32-byte
+	 * instance_id (same format as FACTORY_READY's trailer in sub-PR 3A).
+	 * Legacy clients that read only 32 bytes keep their old behavior;
+	 * new clients apply the signed tree to their factory_t so they have
+	 * trustless force-close for the rotated epoch. */
+	uint8_t *rc_blob = NULL;
+	size_t rc_blob_len = 0;
+	if (fi->lib_factory)
+		rc_blob_len = ss_persist_serialize_signed_txs(fi->lib_factory,
+							      &rc_blob);
+	size_t rc_payload_len = 32 + rc_blob_len;
+	uint8_t *rc_payload = malloc(rc_payload_len);
+	if (rc_payload) {
+		memcpy(rc_payload, fi->instance_id, 32);
+		if (rc_blob_len > 0 && rc_blob)
+			memcpy(rc_payload + 32, rc_blob, rc_blob_len);
+	}
+	free(rc_blob);
+
 	/* Send ROTATE_COMPLETE to clients */
 	for (size_t ci = 0; ci < fi->n_clients; ci++) {
 		char nid[67];
@@ -1497,10 +1517,20 @@ static void rotate_finish_and_notify(struct command *cmd,
 			sprintf(nid + j*2, "%02x",
 				fi->clients[ci].node_id[j]);
 		nid[66] = '\0';
-		send_factory_msg(cmd, nid,
-			SS_SUBMSG_ROTATE_COMPLETE,
-			fi->instance_id, 32);
+		if (rc_payload)
+			send_factory_msg(cmd, nid,
+				SS_SUBMSG_ROTATE_COMPLETE,
+				rc_payload, rc_payload_len);
+		else
+			send_factory_msg(cmd, nid,
+				SS_SUBMSG_ROTATE_COMPLETE,
+				fi->instance_id, 32);
 	}
+	plugin_log(plugin_handle, LOG_INFORM,
+		   "LSP: sent ROTATE_COMPLETE to %zu clients "
+		   "(%zu bytes incl signed-tree trailer)",
+		   fi->n_clients, rc_payload_len);
+	free(rc_payload);
 
 	/* Trigger factory-change on open channels */
 	if (fi->n_channels > 0) {
@@ -5037,7 +5067,43 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 			   "ROTATE_COMPLETE from %s (len=%zu)",
 			   peer_id, len);
 		if (fi) {
+			/* Follow-up #1 sub-PR 3C: if the LSP sent a signed-tree
+			 * trailer past the 32-byte instance_id, apply it so the
+			 * client has the rotated epoch's signed TXs for
+			 * trustless force-close. Mirrors FACTORY_READY's 3A
+			 * behavior for the rotation ceremony. */
+			if (len > 32 && fi->lib_factory) {
+				if (ss_persist_deserialize_signed_txs(
+					fi->lib_factory, data + 32, len - 32)) {
+					plugin_log(plugin_handle, LOG_INFORM,
+						"Client: applied %zu bytes of "
+						"signed tree TXs from "
+						"ROTATE_COMPLETE trailer",
+						len - 32);
+				} else {
+					plugin_log(plugin_handle, LOG_UNUSUAL,
+						"Client: failed to parse "
+						"ROTATE_COMPLETE signed-tree "
+						"trailer (%zu bytes)",
+						len - 32);
+				}
+			} else if (len == 32) {
+				plugin_log(plugin_handle, LOG_UNUSUAL,
+					"Client: ROTATE_COMPLETE has no "
+					"signed-tree trailer — legacy LSP, "
+					"no trustless client-side exit for "
+					"rotated epoch");
+			}
+
 			fi->ceremony = CEREMONY_ROTATE_COMPLETE;
+
+			/* Rotation rebuilt the tree, so PS leaves' chain state
+			 * was reset. Capture the new chain[0] for each PS leaf
+			 * now that they're signed client-side. */
+			ss_save_all_ps_chain0(cmd, fi);
+
+			ss_save_factory(cmd, fi);
+
 			plugin_log(plugin_handle, LOG_INFORM,
 				   "Client: rotation complete, epoch=%u",
 				   fi->epoch);
