@@ -3778,6 +3778,13 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 							(size_t)lsp_slot, &dpub);
 					if (fi->dist_session) free(fi->dist_session);
 					fi->dist_session = dsess;
+					/* Follow-up #1 3B: reset collected psig
+					 * state at the start of each dist ceremony
+					 * (initial + each rotation). */
+					memset(fi->dist_has_psig, 0,
+					       sizeof(fi->dist_has_psig));
+					memset(fi->dist_psigs, 0,
+					       sizeof(fi->dist_psigs));
 
 					/* For n>2 parties: cache all dist nonces
 					 * (LSP's first) so we can broadcast
@@ -4305,6 +4312,19 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 				free(pnb); break;
 			}
 
+			/* Follow-up #1 sub-PR 3B: stash this client's partial sig
+			 * so we can aggregate once all are in. Client side
+			 * serializes the 32-byte psig into the `pubnonce` field
+			 * of entry[0] (66-byte buffer; first 32 bytes are the
+			 * psig). signer_slot identifies which participant. */
+			if (pnb->n_entries > 0 &&
+			    pnb->entries[0].signer_slot < MAX_FACTORY_PARTICIPANTS) {
+				uint32_t pslot = pnb->entries[0].signer_slot;
+				memcpy(fi->dist_psigs[pslot],
+				       pnb->entries[0].pubnonce, 32);
+				fi->dist_has_psig[pslot] = 1;
+			}
+
 			/* Mark this client as responded */
 			if (strlen(peer_id) == 66) {
 				uint8_t pid[33];
@@ -4326,8 +4346,11 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 				free(pnb); break;
 			}
 
-			/* All client PSIGs received. Create LSP's own. */
+			/* All client PSIGs received. Create LSP's own and
+			 * stash it into fi->dist_psigs[0] so we can aggregate
+			 * all sigs into a single 64-byte Schnorr witness. */
 			bool lsp_signed = false;
+			secp256k1_musig_partial_sig lsp_psig;
 			musig_nonce_pool_t *dpool =
 				(musig_nonce_pool_t *)fi->nonce_pool;
 			if (dpool && fi->n_secnonces > 0) {
@@ -4338,10 +4361,13 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 				}
 				secp256k1_musig_secnonce *sn =
 					&dpool->nonces[0].secnonce;
-				secp256k1_musig_partial_sig lsp_psig;
 				if (musig_create_partial_sig(global_secp_ctx,
 					&lsp_psig, sn, &lsp_kp, dsess)) {
 					lsp_signed = true;
+					musig_partial_sig_serialize(
+						global_secp_ctx,
+						fi->dist_psigs[0], &lsp_psig);
+					fi->dist_has_psig[0] = 1;
 				} else {
 					plugin_log(plugin_handle, LOG_BROKEN,
 						   "LSP: dist partial_sig failed");
@@ -4354,25 +4380,116 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 					   "LSP: DISTRIBUTION TX SIGNED! "
 					   "(%zu clients + LSP)", fi->n_clients);
 
-				/* Store signed dist TX for timeout fallback.
-				 * After expiry, broadcast this to give clients
-				 * their funds without LSP cooperation. */
-				if (f->dist_unsigned_tx.data &&
+				/* Follow-up #1 sub-PR 3B: aggregate partial
+				 * sigs into the final 64-byte Schnorr witness
+				 * and apply via finalize_signed_tx.  Pre-3B
+				 * this block just memcpy'd the UNSIGNED bytes
+				 * into fi->dist_signed_tx — bitcoind would
+				 * reject on expiry auto-broadcast. */
+				size_t n_sigs = 1 + fi->n_clients; /* LSP + clients */
+				secp256k1_musig_partial_sig *sigs =
+					calloc(n_sigs, sizeof(*sigs));
+				bool all_parsed = sigs != NULL;
+				for (size_t s = 0; s < n_sigs && all_parsed; s++) {
+					if (!fi->dist_has_psig[s]) {
+						all_parsed = false;
+						break;
+					}
+					if (!musig_partial_sig_parse(
+						global_secp_ctx, &sigs[s],
+						fi->dist_psigs[s])) {
+						all_parsed = false;
+					}
+				}
+
+				if (all_parsed && f->dist_unsigned_tx.data &&
 				    f->dist_unsigned_tx.len > 0) {
-					free(fi->dist_signed_tx);
-					fi->dist_signed_tx = malloc(
+					unsigned char schnorr_sig[64];
+					if (musig_aggregate_partial_sigs(
+						global_secp_ctx, schnorr_sig,
+						dsess, sigs, n_sigs)) {
+						tx_buf_t out;
+						tx_buf_init(&out, f->dist_unsigned_tx.len + 80);
+						if (finalize_signed_tx(&out,
+							f->dist_unsigned_tx.data,
+							f->dist_unsigned_tx.len,
+							schnorr_sig) &&
+						    out.data && out.len > 0) {
+							free(fi->dist_signed_tx);
+							fi->dist_signed_tx =
+								malloc(out.len);
+							if (fi->dist_signed_tx) {
+								memcpy(fi->dist_signed_tx,
+								       out.data, out.len);
+								fi->dist_signed_tx_len =
+									out.len;
+								ss_compute_dist_signed_txid(fi);
+								plugin_log(plugin_handle,
+									LOG_INFORM,
+									"LSP: dist TX aggregated "
+									"+ witness applied "
+									"(%zu bytes)",
+									out.len);
+							}
+						} else {
+							plugin_log(plugin_handle,
+								LOG_BROKEN,
+								"LSP: finalize_signed_tx "
+								"failed on dist TX");
+						}
+						tx_buf_free(&out);
+					} else {
+						plugin_log(plugin_handle, LOG_BROKEN,
+							"LSP: musig_aggregate_partial_sigs "
+							"failed for dist TX");
+					}
+				} else {
+					plugin_log(plugin_handle, LOG_BROKEN,
+						"LSP: missing dist psigs — can't "
+						"aggregate (all_parsed=%d, "
+						"unsigned=%p, unsigned_len=%zu)",
+						all_parsed,
+						f->dist_unsigned_tx.data,
 						f->dist_unsigned_tx.len);
-					if (fi->dist_signed_tx) {
-						memcpy(fi->dist_signed_tx,
-						       f->dist_unsigned_tx.data,
-						       f->dist_unsigned_tx.len);
-						fi->dist_signed_tx_len =
-							f->dist_unsigned_tx.len;
-						/* Phase 2b: precompute the
-						 * coop-close txid so the
-						 * classifier can match a
-						 * published dist TX later. */
-						ss_compute_dist_signed_txid(fi);
+				}
+				free(sigs);
+
+				/* Broadcast real signed dist TX to every client
+				 * via DIST_READY so both sides end up with the
+				 * same bitcoind-acceptable bytes. */
+				if (fi->dist_signed_tx &&
+				    fi->dist_signed_tx_len > 0) {
+					size_t dr_len = 32 + 4 +
+						fi->dist_signed_tx_len;
+					uint8_t *dr = malloc(dr_len);
+					if (dr) {
+						memcpy(dr, fi->instance_id, 32);
+						uint32_t tl =
+							(uint32_t)fi->dist_signed_tx_len;
+						dr[32] = (tl >> 24) & 0xFF;
+						dr[33] = (tl >> 16) & 0xFF;
+						dr[34] = (tl >>  8) & 0xFF;
+						dr[35] = tl & 0xFF;
+						memcpy(dr + 36,
+						       fi->dist_signed_tx,
+						       fi->dist_signed_tx_len);
+						for (size_t ci = 0;
+						     ci < fi->n_clients; ci++) {
+							char nid[67];
+							for (int j = 0; j < 33; j++)
+								sprintf(nid + j*2, "%02x",
+									fi->clients[ci].node_id[j]);
+							nid[66] = '\0';
+							send_factory_msg(cmd, nid,
+								SS_SUBMSG_DIST_READY,
+								dr, dr_len);
+						}
+						free(dr);
+						plugin_log(plugin_handle, LOG_INFORM,
+							"LSP: sent DIST_READY to %zu "
+							"clients (%zu-byte signed dist TX)",
+							fi->n_clients,
+							fi->dist_signed_tx_len);
 					}
 				}
 			}
@@ -5513,6 +5630,41 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 					}
 				}
 				break;
+			}
+		}
+		break;
+
+	/* Follow-up #1 sub-PR 3B: client-side DIST_READY — LSP shipped
+	 * the aggregated signed distribution TX after the DIST_PSIG ceremony
+	 * completed. Store locally so expiry auto-broadcast has valid bytes
+	 * (prior to this, clients had no signed dist TX at all — same gap
+	 * that FACTORY_READY's tree trailer closes for the tree). */
+	case SS_SUBMSG_DIST_READY:
+		plugin_log(plugin_handle, LOG_INFORM,
+			   "DIST_READY from %s (len=%zu)", peer_id, len);
+		if (fi && !fi->is_lsp && len >= 36) {
+			uint32_t tx_len =
+				((uint32_t)data[32] << 24) |
+				((uint32_t)data[33] << 16) |
+				((uint32_t)data[34] <<  8) |
+				 (uint32_t)data[35];
+			if (tx_len == 0 || 36 + tx_len > len) {
+				plugin_log(plugin_handle, LOG_UNUSUAL,
+					"Bad DIST_READY: tx_len=%u, payload=%zu",
+					tx_len, len);
+				break;
+			}
+			free(fi->dist_signed_tx);
+			fi->dist_signed_tx = malloc(tx_len);
+			if (fi->dist_signed_tx) {
+				memcpy(fi->dist_signed_tx, data + 36, tx_len);
+				fi->dist_signed_tx_len = tx_len;
+				ss_compute_dist_signed_txid(fi);
+				plugin_log(plugin_handle, LOG_INFORM,
+					"Client: applied signed dist TX (%u bytes) "
+					"from DIST_READY — trustless expiry "
+					"auto-broadcast now works", tx_len);
+				ss_save_factory(cmd, fi);
 			}
 		}
 		break;

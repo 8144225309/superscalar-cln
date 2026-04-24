@@ -56,6 +56,11 @@
 #define SS_SUBMSG_DIST_NONCE		0x010E
 #define SS_SUBMSG_DIST_ALL_NONCES	0x010F	/* LSP broadcasts all dist nonces */
 #define SS_SUBMSG_DIST_PSIG		0x0115
+/* Follow-up #1 sub-PR 3B: LSP sends aggregated+signed dist TX to clients so
+ * both sides have a real bitcoind-acceptable signed TX in fi->dist_signed_tx
+ * for expiry auto-broadcast. Prior to this, LSP never aggregated — both
+ * sides' dist_signed_tx was the UNSIGNED bytes. */
+#define SS_SUBMSG_DIST_READY		0x0133
 
 /* Close ceremony */
 #define SS_SUBMSG_CLOSE_PROPOSE		0x0110
