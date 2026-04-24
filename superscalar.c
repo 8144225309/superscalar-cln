@@ -949,6 +949,125 @@ static void send_supported_protocols(struct command *cmd, const char *peer_id)
 
 /* Ceremony state is now per-factory in ss_state */
 
+/* --- Tier 2.6: LEAF_ADVANCE wire helpers (per-leaf advance ceremony) ---
+ *
+ * Three fixed-size payloads (no TLV, everything packed big-endian):
+ *   PROPOSE:  32 iid | 4 leaf_side | 66 lsp_pubnonce          = 102 bytes
+ *   PSIG:     32 iid | 4 leaf_side | 66 client_pubnonce |
+ *             32 client_psig                                  = 134 bytes
+ *   DONE:     32 iid | 4 leaf_side | 32 lsp_psig              =  68 bytes
+ *
+ * DONE carries LSP's partial sig (not the full aggregate) so the involved
+ * client can set_partial_sig + complete_node locally, ending up with a
+ * signed chain[N] TX identical to LSP's.  Non-involved clients receive
+ * DONE as a tree-state notification and ignore the psig payload. */
+static size_t ss_leaf_advance_propose_build(uint8_t *out, size_t cap,
+					    const uint8_t iid[32],
+					    uint32_t leaf_side,
+					    const uint8_t lsp_pubnonce66[66])
+{
+	if (cap < 102) return 0;
+	memcpy(out, iid, 32);
+	out[32] = (leaf_side >> 24) & 0xFF;
+	out[33] = (leaf_side >> 16) & 0xFF;
+	out[34] = (leaf_side >>  8) & 0xFF;
+	out[35] = leaf_side & 0xFF;
+	memcpy(out + 36, lsp_pubnonce66, 66);
+	return 102;
+}
+
+static bool ss_leaf_advance_propose_parse(const uint8_t *data, size_t len,
+					  uint8_t iid_out[32],
+					  uint32_t *leaf_side_out,
+					  uint8_t lsp_pubnonce66_out[66])
+{
+	if (len < 102) return false;
+	memcpy(iid_out, data, 32);
+	*leaf_side_out = ((uint32_t)data[32] << 24)
+		       | ((uint32_t)data[33] << 16)
+		       | ((uint32_t)data[34] <<  8)
+		       |  (uint32_t)data[35];
+	memcpy(lsp_pubnonce66_out, data + 36, 66);
+	return true;
+}
+
+static size_t ss_leaf_advance_psig_build(uint8_t *out, size_t cap,
+					 const uint8_t iid[32],
+					 uint32_t leaf_side,
+					 const uint8_t client_pubnonce66[66],
+					 const uint8_t client_psig32[32])
+{
+	if (cap < 134) return 0;
+	memcpy(out, iid, 32);
+	out[32] = (leaf_side >> 24) & 0xFF;
+	out[33] = (leaf_side >> 16) & 0xFF;
+	out[34] = (leaf_side >>  8) & 0xFF;
+	out[35] = leaf_side & 0xFF;
+	memcpy(out + 36, client_pubnonce66, 66);
+	memcpy(out + 102, client_psig32, 32);
+	return 134;
+}
+
+static bool ss_leaf_advance_psig_parse(const uint8_t *data, size_t len,
+				       uint8_t iid_out[32],
+				       uint32_t *leaf_side_out,
+				       uint8_t client_pubnonce66_out[66],
+				       uint8_t client_psig32_out[32])
+{
+	if (len < 134) return false;
+	memcpy(iid_out, data, 32);
+	*leaf_side_out = ((uint32_t)data[32] << 24)
+		       | ((uint32_t)data[33] << 16)
+		       | ((uint32_t)data[34] <<  8)
+		       |  (uint32_t)data[35];
+	memcpy(client_pubnonce66_out, data + 36, 66);
+	memcpy(client_psig32_out, data + 102, 32);
+	return true;
+}
+
+static size_t ss_leaf_advance_done_build(uint8_t *out, size_t cap,
+					 const uint8_t iid[32],
+					 uint32_t leaf_side,
+					 const uint8_t lsp_psig32[32])
+{
+	if (cap < 68) return 0;
+	memcpy(out, iid, 32);
+	out[32] = (leaf_side >> 24) & 0xFF;
+	out[33] = (leaf_side >> 16) & 0xFF;
+	out[34] = (leaf_side >>  8) & 0xFF;
+	out[35] = leaf_side & 0xFF;
+	memcpy(out + 36, lsp_psig32, 32);
+	return 68;
+}
+
+static bool ss_leaf_advance_done_parse(const uint8_t *data, size_t len,
+				       uint8_t iid_out[32],
+				       uint32_t *leaf_side_out,
+				       uint8_t lsp_psig32_out[32])
+{
+	if (len < 68) return false;
+	memcpy(iid_out, data, 32);
+	*leaf_side_out = ((uint32_t)data[32] << 24)
+		       | ((uint32_t)data[33] << 16)
+		       | ((uint32_t)data[34] <<  8)
+		       |  (uint32_t)data[35];
+	memcpy(lsp_psig32_out, data + 36, 32);
+	return true;
+}
+
+/* Clear in-flight PS advance state.  Frees the secnonce, resets pending
+ * leaf index.  Safe to call when nothing is pending. */
+static void ss_clear_ps_pending(factory_instance_t *fi)
+{
+	if (!fi) return;
+	if (fi->ps_pending_secnonce) {
+		free(fi->ps_pending_secnonce);
+		fi->ps_pending_secnonce = NULL;
+	}
+	fi->ps_pending_leaf = -1;
+	fi->ps_pending_node_idx = 0;
+}
+
 /* Generic RPC callback — just log and ignore result */
 static struct command_result *rpc_done(struct command *cmd,
 				       const char *method,
@@ -5194,6 +5313,331 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 			   peer_id);
 		break;
 
+	/* --- Tier 2.6: per-leaf advance ceremony (ARITY_PS chain append) --- */
+
+	case SS_SUBMSG_LEAF_ADVANCE_PROPOSE: {
+		/* Client side: LSP asks us to advance leaf N. Parse, advance
+		 * our own factory_t mirror, generate our nonce + partial sig,
+		 * reply with PSIG. */
+		uint8_t iid[32], lsp_pn[66];
+		uint32_t leaf_side;
+		if (!ss_leaf_advance_propose_parse(data, len, iid, &leaf_side,
+						   lsp_pn)) {
+			plugin_log(plugin_handle, LOG_UNUSUAL,
+				"Bad LEAF_ADVANCE_PROPOSE from %s (len=%zu)",
+				peer_id, len);
+			break;
+		}
+		factory_instance_t *fp = ss_factory_find(&ss_state, iid);
+		if (!fp || fp->is_lsp) {
+			plugin_log(plugin_handle, LOG_UNUSUAL,
+				"LEAF_ADVANCE_PROPOSE for unknown/LSP factory");
+			break;
+		}
+		if (fp->ps_pending_leaf != -1) {
+			plugin_log(plugin_handle, LOG_UNUSUAL,
+				"LEAF_ADVANCE_PROPOSE while another advance "
+				"pending on leaf %d — dropping",
+				fp->ps_pending_leaf);
+			break;
+		}
+		factory_t *cf = (factory_t *)fp->lib_factory;
+		if (!cf) break;
+		if ((int)leaf_side < 0 || (int)leaf_side >= cf->n_leaf_nodes) {
+			plugin_log(plugin_handle, LOG_UNUSUAL,
+				"LEAF_ADVANCE_PROPOSE: leaf_side %u out of "
+				"range", leaf_side);
+			break;
+		}
+		size_t nidx = cf->leaf_node_indices[leaf_side];
+		factory_node_t *nd = &cf->nodes[nidx];
+		if (!nd->is_ps_leaf) {
+			plugin_log(plugin_handle, LOG_UNUSUAL,
+				"LEAF_ADVANCE_PROPOSE: leaf %u not PS",
+				leaf_side);
+			break;
+		}
+		int rc = factory_advance_leaf_unsigned(cf, (int)leaf_side);
+		if (rc <= 0) {
+			plugin_log(plugin_handle, LOG_UNUSUAL,
+				"Client advance_leaf_unsigned rc=%d on leaf %u",
+				rc, leaf_side);
+			break;
+		}
+		if (!factory_session_init_node(cf, nidx)) break;
+		int my_slot = factory_find_signer_slot(cf, nidx,
+			(uint32_t)fp->our_participant_idx);
+		int lsp_slot = factory_find_signer_slot(cf, nidx, 0);
+		if (my_slot < 0 || lsp_slot < 0) break;
+
+		/* Parse LSP's pubnonce and set it on the session */
+		secp256k1_musig_pubnonce lsp_pubnonce_obj;
+		if (!musig_pubnonce_parse(global_secp_ctx, &lsp_pubnonce_obj,
+					  lsp_pn))
+			break;
+		if (!factory_session_set_nonce(cf, nidx, (size_t)lsp_slot,
+					       &lsp_pubnonce_obj))
+			break;
+
+		/* Generate our own secnonce + pubnonce */
+		secp256k1_musig_secnonce *my_sn =
+			calloc(1, sizeof(secp256k1_musig_secnonce));
+		if (!my_sn) break;
+		secp256k1_musig_pubnonce my_pn;
+		secp256k1_pubkey my_pub;
+		if (!secp256k1_ec_pubkey_create(global_secp_ctx, &my_pub,
+						fp->our_seckey)) {
+			free(my_sn);
+			break;
+		}
+		if (!musig_generate_nonce(global_secp_ctx, my_sn, &my_pn,
+					  fp->our_seckey, &my_pub,
+					  &nd->keyagg.cache)) {
+			free(my_sn);
+			break;
+		}
+		if (!factory_session_set_nonce(cf, nidx, (size_t)my_slot,
+					       &my_pn)) {
+			free(my_sn);
+			break;
+		}
+		if (!factory_session_finalize_node(cf, nidx)) {
+			free(my_sn);
+			break;
+		}
+
+		/* Create our partial sig (consumes secnonce) */
+		secp256k1_keypair my_kp;
+		if (!secp256k1_keypair_create(global_secp_ctx, &my_kp,
+					      fp->our_seckey)) {
+			free(my_sn);
+			break;
+		}
+		secp256k1_musig_partial_sig my_psig;
+		if (!musig_create_partial_sig(global_secp_ctx, &my_psig,
+					      my_sn, &my_kp,
+					      &nd->signing_session)) {
+			free(my_sn);
+			break;
+		}
+		free(my_sn); /* secnonce consumed */
+		if (!factory_session_set_partial_sig(cf, nidx,
+						     (size_t)my_slot, &my_psig))
+			break;
+
+		/* Stash pending state — we need to remember we're awaiting
+		 * DONE with LSP's psig so we can complete locally. */
+		fp->ps_pending_leaf = (int32_t)leaf_side;
+		fp->ps_pending_node_idx = (uint32_t)nidx;
+		fp->ps_pending_secnonce = NULL; /* already consumed */
+
+		/* Serialize + send PSIG */
+		uint8_t my_pn_ser[66];
+		musig_pubnonce_serialize(global_secp_ctx, my_pn_ser, &my_pn);
+		uint8_t my_psig_ser[32];
+		musig_partial_sig_serialize(global_secp_ctx,
+						      my_psig_ser, &my_psig);
+		uint8_t payload[134];
+		size_t plen = ss_leaf_advance_psig_build(payload,
+			sizeof(payload), fp->instance_id, leaf_side,
+			my_pn_ser, my_psig_ser);
+		if (plen > 0) {
+			send_factory_msg(cmd, peer_id,
+				SS_SUBMSG_LEAF_ADVANCE_PSIG, payload, plen);
+			plugin_log(plugin_handle, LOG_INFORM,
+				"SS_METRIC event=ps_advance_psig_sent "
+				"leaf=%u chain_pos=%d",
+				leaf_side, nd->ps_chain_len);
+		}
+		break;
+	}
+
+	case SS_SUBMSG_LEAF_ADVANCE_PSIG: {
+		/* LSP side: client replied with their pubnonce + partial sig.
+		 * Set on session, finalize, create LSP psig, complete, then
+		 * send DONE carrying LSP's partial sig so client can complete
+		 * locally. */
+		uint8_t iid[32], cli_pn[66], cli_psig_ser[32];
+		uint32_t leaf_side;
+		if (!ss_leaf_advance_psig_parse(data, len, iid, &leaf_side,
+						cli_pn, cli_psig_ser)) {
+			plugin_log(plugin_handle, LOG_UNUSUAL,
+				"Bad LEAF_ADVANCE_PSIG (len=%zu)", len);
+			break;
+		}
+		factory_instance_t *fp = ss_factory_find(&ss_state, iid);
+		if (!fp || !fp->is_lsp) {
+			plugin_log(plugin_handle, LOG_UNUSUAL,
+				"LEAF_ADVANCE_PSIG for unknown/client factory");
+			break;
+		}
+		if (fp->ps_pending_leaf != (int32_t)leaf_side) {
+			plugin_log(plugin_handle, LOG_UNUSUAL,
+				"LEAF_ADVANCE_PSIG leaf_side mismatch "
+				"(pending=%d got=%u)",
+				fp->ps_pending_leaf, leaf_side);
+			break;
+		}
+		factory_t *lf = (factory_t *)fp->lib_factory;
+		if (!lf || !fp->ps_pending_secnonce) {
+			ss_clear_ps_pending(fp);
+			break;
+		}
+		size_t nidx = fp->ps_pending_node_idx;
+		factory_node_t *nd = &lf->nodes[nidx];
+
+		int my_slot = factory_find_signer_slot(lf, nidx, 0); /* LSP=0 */
+		int cli_slot = factory_find_signer_slot(lf, nidx,
+			(uint32_t)(leaf_side + 1));
+		if (my_slot < 0 || cli_slot < 0) {
+			ss_clear_ps_pending(fp);
+			break;
+		}
+
+		/* Parse client inputs */
+		secp256k1_musig_pubnonce cli_pn_obj;
+		secp256k1_musig_partial_sig cli_psig_obj;
+		if (!musig_pubnonce_parse(global_secp_ctx, &cli_pn_obj,
+					  cli_pn)) {
+			ss_clear_ps_pending(fp);
+			break;
+		}
+		if (!musig_partial_sig_parse(global_secp_ctx,
+			&cli_psig_obj, cli_psig_ser)) {
+			ss_clear_ps_pending(fp);
+			break;
+		}
+		if (!factory_session_set_nonce(lf, nidx, (size_t)cli_slot,
+					       &cli_pn_obj)) {
+			ss_clear_ps_pending(fp);
+			break;
+		}
+		if (!factory_session_finalize_node(lf, nidx)) {
+			ss_clear_ps_pending(fp);
+			break;
+		}
+
+		/* Create LSP's own partial sig, consuming the stashed
+		 * secnonce. */
+		secp256k1_keypair lsp_kp;
+		if (!secp256k1_keypair_create(global_secp_ctx, &lsp_kp,
+					      fp->our_seckey)) {
+			ss_clear_ps_pending(fp);
+			break;
+		}
+		secp256k1_musig_partial_sig lsp_psig;
+		if (!musig_create_partial_sig(global_secp_ctx, &lsp_psig,
+			(secp256k1_musig_secnonce *)fp->ps_pending_secnonce,
+			&lsp_kp, &nd->signing_session)) {
+			ss_clear_ps_pending(fp);
+			break;
+		}
+		free(fp->ps_pending_secnonce);
+		fp->ps_pending_secnonce = NULL;
+
+		if (!factory_session_set_partial_sig(lf, nidx,
+			(size_t)my_slot, &lsp_psig)) {
+			ss_clear_ps_pending(fp);
+			break;
+		}
+		if (!factory_session_set_partial_sig(lf, nidx,
+			(size_t)cli_slot, &cli_psig_obj)) {
+			ss_clear_ps_pending(fp);
+			break;
+		}
+		if (!factory_session_complete_node(lf, nidx)) {
+			ss_clear_ps_pending(fp);
+			break;
+		}
+
+		/* Chain[N] signed. Clear pending, send DONE to all clients
+		 * carrying our partial sig so the involved client can finish
+		 * their local copy. Others ignore the psig. */
+		int32_t done_leaf = fp->ps_pending_leaf;
+		ss_clear_ps_pending(fp);
+
+		uint8_t lsp_psig_ser[32];
+		musig_partial_sig_serialize(global_secp_ctx,
+						      lsp_psig_ser, &lsp_psig);
+		uint8_t payload[68];
+		size_t plen = ss_leaf_advance_done_build(payload,
+			sizeof(payload), fp->instance_id,
+			(uint32_t)done_leaf, lsp_psig_ser);
+		if (plen > 0) {
+			for (size_t ci = 0; ci < fp->n_clients; ci++) {
+				char ch[67];
+				for (int j = 0; j < 33; j++)
+					sprintf(ch + j*2, "%02x",
+						fp->clients[ci].node_id[j]);
+				ch[66] = '\0';
+				send_factory_msg(cmd, ch,
+					SS_SUBMSG_LEAF_ADVANCE_DONE,
+					payload, plen);
+			}
+		}
+
+		char iid_hex[65];
+		for (int j = 0; j < 32; j++)
+			sprintf(iid_hex + j*2, "%02x", fp->instance_id[j]);
+		iid_hex[64] = '\0';
+		plugin_log(plugin_handle, LOG_INFORM,
+			"SS_METRIC event=ps_advance iid=%s leaf=%d "
+			"chain_pos=%d",
+			iid_hex, done_leaf, nd->ps_chain_len);
+		break;
+	}
+
+	case SS_SUBMSG_LEAF_ADVANCE_DONE: {
+		/* Client side: receive LSP's partial sig. If this is the leaf
+		 * whose ceremony we started, apply LSP's psig, complete node,
+		 * clear pending. Other clients just ignore — they don't have a
+		 * signing session for this leaf. */
+		uint8_t iid[32], lsp_psig_ser[32];
+		uint32_t leaf_side;
+		if (!ss_leaf_advance_done_parse(data, len, iid, &leaf_side,
+						lsp_psig_ser)) {
+			plugin_log(plugin_handle, LOG_UNUSUAL,
+				"Bad LEAF_ADVANCE_DONE (len=%zu)", len);
+			break;
+		}
+		factory_instance_t *fp = ss_factory_find(&ss_state, iid);
+		if (!fp || fp->is_lsp) break;
+		if (fp->ps_pending_leaf != (int32_t)leaf_side) {
+			/* Not our involved leaf — informational only. */
+			plugin_log(plugin_handle, LOG_DBG,
+				"LEAF_ADVANCE_DONE leaf=%u notification "
+				"(we weren't signer)", leaf_side);
+			break;
+		}
+		factory_t *cf = (factory_t *)fp->lib_factory;
+		if (!cf) { ss_clear_ps_pending(fp); break; }
+		size_t nidx = fp->ps_pending_node_idx;
+		int lsp_slot = factory_find_signer_slot(cf, nidx, 0);
+		if (lsp_slot < 0) { ss_clear_ps_pending(fp); break; }
+
+		secp256k1_musig_partial_sig lsp_psig_obj;
+		if (!musig_partial_sig_parse(global_secp_ctx,
+			&lsp_psig_obj, lsp_psig_ser)) {
+			ss_clear_ps_pending(fp);
+			break;
+		}
+		if (!factory_session_set_partial_sig(cf, nidx,
+			(size_t)lsp_slot, &lsp_psig_obj)) {
+			ss_clear_ps_pending(fp);
+			break;
+		}
+		if (!factory_session_complete_node(cf, nidx)) {
+			ss_clear_ps_pending(fp);
+			break;
+		}
+		ss_clear_ps_pending(fp);
+		plugin_log(plugin_handle, LOG_INFORM,
+			"SS_METRIC event=ps_advance_client_done leaf=%u "
+			"chain_pos=%d",
+			leaf_side, cf->nodes[nidx].ps_chain_len);
+		break;
+	}
+
 	default:
 		plugin_log(plugin_handle, LOG_DBG,
 			   "Unknown submsg 0x%04x from %s (len=%zu)",
@@ -7010,6 +7454,180 @@ static struct command_result *json_factory_rotate(struct command *cmd,
 	json_add_u32(js, "old_epoch", old_epoch);
 	json_add_u32(js, "new_epoch", fi->epoch);
 	json_add_string(js, "ceremony", "rotating");
+	return command_finished(cmd, js);
+}
+
+/* factory-ps-advance RPC — Tier 2.6: advance a PS leaf's chain by one TX.
+ *
+ * Kicks off a 2-of-2 MuSig2 ceremony between the LSP and the single client
+ * mapped to `leaf_side`. Mirrors upstream lsp_advance_leaf. Returns
+ * immediately with "proposed" status; completion happens asynchronously
+ * when LEAF_ADVANCE_PSIG arrives via custommsg.
+ *
+ * Only valid for factories with arity_mode=arity_ps (ARITY_PS leaves).
+ * DW-leaf advance (ARITY_1) uses the same wire format but isn't exposed
+ * via this RPC — the DW advance path is driven internally by rotation. */
+static struct command_result *json_factory_ps_advance(struct command *cmd,
+						      const char *buf,
+						      const jsmntok_t *params)
+{
+	const char *id_hex;
+	uint32_t *leaf_side_p;
+	if (!param(cmd, buf, params,
+		   p_req("instance_id", param_string, &id_hex),
+		   p_req("leaf_side", param_u32, &leaf_side_p),
+		   NULL))
+		return command_param_failed();
+
+	/* Parse instance_id hex */
+	uint8_t instance_id[32];
+	if (strlen(id_hex) != 64)
+		return command_fail(cmd, LIGHTNINGD,
+			"instance_id must be 64 hex chars");
+	for (int i = 0; i < 32; i++) {
+		unsigned int b;
+		if (sscanf(id_hex + i*2, "%02x", &b) != 1)
+			return command_fail(cmd, LIGHTNINGD,
+				"instance_id not hex");
+		instance_id[i] = (uint8_t)b;
+	}
+
+	factory_instance_t *fi = ss_factory_find(&ss_state, instance_id);
+	if (!fi)
+		return command_fail(cmd, LIGHTNINGD,
+			"factory %s not found", id_hex);
+	if (!fi->is_lsp)
+		return command_fail(cmd, LIGHTNINGD,
+			"factory-ps-advance is LSP-only");
+	if (fi->lifecycle != FACTORY_LIFECYCLE_ACTIVE)
+		return command_fail(cmd, LIGHTNINGD,
+			"factory not active (lifecycle=%d)", fi->lifecycle);
+	if (ss_effective_arity(fi) != FACTORY_ARITY_PS)
+		return command_fail(cmd, LIGHTNINGD,
+			"factory arity is not ARITY_PS (got %d)",
+			(int)ss_effective_arity(fi));
+	if (fi->ps_pending_leaf != -1)
+		return command_fail(cmd, LIGHTNINGD,
+			"another PS advance in flight on leaf %d",
+			fi->ps_pending_leaf);
+
+	factory_t *f = (factory_t *)fi->lib_factory;
+	if (!f)
+		return command_fail(cmd, LIGHTNINGD,
+			"factory_t not initialized (ceremony incomplete?)");
+
+	uint32_t leaf_side = *leaf_side_p;
+	if ((int)leaf_side < 0 || (int)leaf_side >= f->n_leaf_nodes)
+		return command_fail(cmd, LIGHTNINGD,
+			"leaf_side %u out of range [0,%d)",
+			leaf_side, f->n_leaf_nodes);
+
+	size_t node_idx = f->leaf_node_indices[leaf_side];
+	factory_node_t *node = &f->nodes[node_idx];
+	if (!node->is_ps_leaf)
+		return command_fail(cmd, LIGHTNINGD,
+			"leaf_side %u is not a PS leaf", leaf_side);
+
+	/* Step 1: Advance leaf state + rebuild unsigned TX.
+	 * Upstream caller contract (test_factory_ps_dust_limit): rc=0 means
+	 * the next chain TX's channel output would fall below the dust limit;
+	 * ps_chain_len is already incremented — caller MUST NOT persist or
+	 * broadcast. Surface as an error without touching state. */
+	int rc = factory_advance_leaf_unsigned(f, (int)leaf_side);
+	if (rc == 0) {
+		plugin_log(plugin_handle, LOG_INFORM,
+			"SS_METRIC event=ps_exhausted iid=%s leaf=%u "
+			"chain_len=%d reason=dust_limit",
+			id_hex, leaf_side, node->ps_chain_len);
+		return command_fail(cmd, LIGHTNINGD,
+			"PS leaf %u exhausted (dust limit); factory migration "
+			"required", leaf_side);
+	}
+	if (rc < 0)
+		return command_fail(cmd, LIGHTNINGD,
+			"factory_advance_leaf_unsigned failed (rc=%d)", rc);
+
+	/* Step 2: init signing session for this node */
+	if (!factory_session_init_node(f, node_idx))
+		return command_fail(cmd, LIGHTNINGD,
+			"session_init_node failed");
+
+	/* Step 3: find LSP's signer slot (participant 0) */
+	int lsp_slot = factory_find_signer_slot(f, node_idx, 0);
+	if (lsp_slot < 0)
+		return command_fail(cmd, LIGHTNINGD,
+			"LSP not a signer on node %zu", node_idx);
+
+	/* Step 4: generate LSP secnonce + pubnonce */
+	secp256k1_musig_secnonce *lsp_secnonce =
+		calloc(1, sizeof(secp256k1_musig_secnonce));
+	if (!lsp_secnonce)
+		return command_fail(cmd, LIGHTNINGD, "OOM (secnonce)");
+
+	secp256k1_musig_pubnonce lsp_pubnonce;
+	secp256k1_pubkey lsp_pub;
+	if (!secp256k1_ec_pubkey_create(global_secp_ctx, &lsp_pub,
+					fi->our_seckey)) {
+		free(lsp_secnonce);
+		return command_fail(cmd, LIGHTNINGD, "LSP pubkey derive failed");
+	}
+	if (!musig_generate_nonce(global_secp_ctx, lsp_secnonce, &lsp_pubnonce,
+				  fi->our_seckey, &lsp_pub,
+				  &node->keyagg.cache)) {
+		free(lsp_secnonce);
+		return command_fail(cmd, LIGHTNINGD, "nonce gen failed");
+	}
+	if (!factory_session_set_nonce(f, node_idx, (size_t)lsp_slot,
+				       &lsp_pubnonce)) {
+		free(lsp_secnonce);
+		return command_fail(cmd, LIGHTNINGD, "set_nonce failed");
+	}
+
+	/* Serialize LSP pubnonce for wire */
+	uint8_t lsp_pubnonce_ser[66];
+	musig_pubnonce_serialize(global_secp_ctx, lsp_pubnonce_ser,
+				 &lsp_pubnonce);
+
+	/* Stash pending state */
+	fi->ps_pending_leaf = (int32_t)leaf_side;
+	fi->ps_pending_node_idx = (uint32_t)node_idx;
+	fi->ps_pending_secnonce = lsp_secnonce;
+
+	/* Step 5: send PROPOSE to the affected client */
+	if ((size_t)leaf_side >= fi->n_clients) {
+		ss_clear_ps_pending(fi);
+		return command_fail(cmd, LIGHTNINGD,
+			"leaf_side %u has no client mapping", leaf_side);
+	}
+	char client_hex[67];
+	for (int j = 0; j < 33; j++)
+		sprintf(client_hex + j*2, "%02x",
+			fi->clients[leaf_side].node_id[j]);
+	client_hex[66] = '\0';
+
+	uint8_t payload[102];
+	size_t plen = ss_leaf_advance_propose_build(payload, sizeof(payload),
+						    fi->instance_id, leaf_side,
+						    lsp_pubnonce_ser);
+	if (plen == 0) {
+		ss_clear_ps_pending(fi);
+		return command_fail(cmd, LIGHTNINGD,
+			"PROPOSE build failed (buffer)");
+	}
+
+	send_factory_msg(cmd, client_hex, SS_SUBMSG_LEAF_ADVANCE_PROPOSE,
+			 payload, plen);
+
+	plugin_log(plugin_handle, LOG_INFORM,
+		"SS_METRIC event=ps_advance_propose iid=%s leaf=%u "
+		"chain_pos=%d",
+		id_hex, leaf_side, node->ps_chain_len);
+
+	struct json_stream *js = jsonrpc_stream_success(cmd);
+	json_add_string(js, "instance_id", id_hex);
+	json_add_u32(js, "leaf_side", leaf_side);
+	json_add_u32(js, "chain_pos", (uint32_t)node->ps_chain_len);
+	json_add_string(js, "status", "proposed");
 	return command_finished(cmd, js);
 }
 
@@ -14132,6 +14750,10 @@ static const struct plugin_command commands[] = {
 	{
 		"factory-force-close",
 		json_factory_force_close,
+	},
+	{
+		"factory-ps-advance",
+		json_factory_ps_advance,
 	},
 	{
 		"factory-check-breach",

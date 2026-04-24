@@ -333,17 +333,19 @@ typedef struct factory_instance {
 
 	/* Tier 2.6: in-flight per-leaf advance ceremony (ARITY_1 DW leaf or
 	 * ARITY_PS chain append). ps_pending_leaf != -1 means a PROPOSE has
-	 * been sent (LSP) or received (client), and we're awaiting the PSIG
-	 * round. Fields:
+	 * been sent (LSP) or received (client), and we're awaiting the next
+	 * round's wire message. Fields:
 	 *   ps_pending_leaf     — leaf_side (0..n_leaf_nodes-1) or -1 (idle)
 	 *   ps_pending_node_idx — cached factory_t node index for that leaf
-	 *   ps_pending_secnonce_slot — pool slot holding our secnonce
-	 *                              (UINT32_MAX if not using a pool entry)
+	 *   ps_pending_secnonce — heap-alloc'd secp256k1_musig_secnonce opaque
+	 *                         (LSP: generated at PROPOSE send, freed after
+	 *                         PSIG receive; client: generated at PROPOSE
+	 *                         receive, freed after PSIG send)
 	 * Memory-only; not persisted. On restart an in-flight advance is
 	 * abandoned and the LSP may retry. */
 	int32_t  ps_pending_leaf;
 	uint32_t ps_pending_node_idx;
-	uint32_t ps_pending_secnonce_slot;
+	void    *ps_pending_secnonce;
 
 	/* Lifecycle */
 	factory_lifecycle_t lifecycle;
