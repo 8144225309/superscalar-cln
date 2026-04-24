@@ -97,8 +97,14 @@ def test_buy_liquidity_rejects_after_ps_advance(ss_node_factory):
 
 def test_buy_liquidity_rejects_arity_2(ss_node_factory):
     """ARITY_2 needs a 3-of-3 ceremony that isn't implemented yet (task
-    #93). Expect a clean rejection with that message."""
-    lsp, client, iid = _setup_factory(ss_node_factory)  # default arity_2
+    #93). Expect a clean rejection with that message.
+
+    Note: a 2-party factory with auto-arity picks ARITY_1 (not ARITY_2)
+    because ss_choose_arity returns ARITY_1 for n_total <= 2. To force
+    ARITY_2 we must pass arity_mode="arity_2" explicitly — that override
+    bypasses ss_choose_arity regardless of participant count."""
+    lsp, client, iid = _setup_factory(ss_node_factory,
+                                      arity_mode="arity_2")
 
     with pytest.raises(RpcError, match="ARITY_2.*not yet implemented"):
         lsp.rpc.call("factory-buy-liquidity", {
