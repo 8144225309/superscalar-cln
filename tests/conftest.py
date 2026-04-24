@@ -194,6 +194,7 @@ def create_two_party_factory(
     client,
     funding_sats: int = 100_000,
     timeout: float = 120.0,
+    arity_mode: str | None = None,
 ) -> str:
     """Drive the happy-path two-party factory ceremony from LSP side.
     Returns the persisted ``instance_id``.
@@ -203,16 +204,20 @@ def create_two_party_factory(
       - LSP has ``funding_sats + fees`` confirmed on-chain.
       - At least one side has connected to the other.
 
+    arity_mode: optional, one of "auto" | "arity_1" | "arity_2" |
+    "arity_ps" (or the "ps" alias). When provided, threads through
+    factory-create so both sides build the matching tree shape.
+
     This wraps the async ceremony in a synchronous call by polling the
     datastore for the meta blob to appear. Suitable for happy-path tests;
     adversarial tests that need to interrupt mid-ceremony should call
     ``factory-create`` directly and drive the log matching themselves.
     """
     client_id = client.info["id"]
-    r = lsp.rpc.call(
-        "factory-create",
-        {"funding_sats": funding_sats, "clients": [client_id]},
-    )
+    payload = {"funding_sats": funding_sats, "clients": [client_id]}
+    if arity_mode is not None:
+        payload["arity_mode"] = arity_mode
+    r = lsp.rpc.call("factory-create", payload)
     iid = r["instance_id"]
     if not datastore_has(
         lsp, ["superscalar", "factories", iid], timeout=timeout
