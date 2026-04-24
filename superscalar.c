@@ -6097,11 +6097,15 @@ static struct command_result *json_factory_create(struct command *cmd,
 
 	const jsmntok_t *allocations_tok = NULL;
 	const char *arity_mode_str = NULL;
+	const char *placement_mode_str = NULL;
+	const jsmntok_t *tz_buckets_tok = NULL;
 	if (!param(cmd, buf, params,
 		   p_req("funding_sats", param_u64, &funding_sats),
 		   p_req("clients", param_array, &clients_tok),
 		   p_opt("allocations", param_array, &allocations_tok),
 		   p_opt("arity_mode", param_string, &arity_mode_str),
+		   p_opt("placement_mode", param_string, &placement_mode_str),
+		   p_opt("client_timezones", param_array, &tz_buckets_tok),
 		   NULL))
 		return command_param_failed();
 
@@ -6127,6 +6131,30 @@ static struct command_result *json_factory_create(struct command *cmd,
 				"arity_2, arity_ps (got %s)",
 				arity_mode_str);
 	}
+
+	/* Tier 2.8: optional client placement policy. Today only "sequential"
+	 * (default) and "timezone_cluster" are accepted. When timezone_cluster
+	 * is selected, client_timezones is required (u8 0-23 per client); we
+	 * sort the clients+allocations arrays by bucket so same-TZ clients
+	 * share a leaf. INWARD/OUTWARD modes require per-client
+	 * uptime/balance state that the plugin doesn't track yet. */
+	uint8_t parsed_placement = 0; /* sequential */
+	if (placement_mode_str) {
+		if (strcmp(placement_mode_str, "sequential") == 0)
+			parsed_placement = 0;
+		else if (strcmp(placement_mode_str, "timezone_cluster") == 0 ||
+			 strcmp(placement_mode_str, "tz_cluster") == 0)
+			parsed_placement = 3;
+		else
+			return command_fail(cmd, LIGHTNINGD,
+				"placement_mode must be one of: sequential, "
+				"timezone_cluster (got %s)",
+				placement_mode_str);
+	}
+	if (parsed_placement == 3 && !tz_buckets_tok)
+		return command_fail(cmd, LIGHTNINGD,
+			"placement_mode=timezone_cluster requires "
+			"client_timezones array");
 
 	/* Gap 8: deterministic instance_id from HSM master key when
 	 * available. iid = SHA256(master_key || "ss-iid-v1" ||
@@ -6164,8 +6192,10 @@ static struct command_result *json_factory_create(struct command *cmd,
 	fi->lifecycle = FACTORY_LIFECYCLE_INIT;
 	fi->ceremony = CEREMONY_IDLE;
 	fi->arity_mode = parsed_arity_mode;
+	fi->placement_mode = parsed_placement;
 
-	/* Parse client node IDs */
+	/* Parse client node IDs. Defer signer_slot assignment until after
+	 * any Tier 2.8 placement sort so slots reflect final tree order. */
 	const jsmntok_t *t;
 	size_t i;
 	json_for_each_arr(i, t, clients_tok) {
@@ -6179,7 +6209,6 @@ static struct command_result *json_factory_create(struct command *cmd,
 				sscanf(hex + j*2, "%02x", &byte);
 				c->node_id[j] = (uint8_t)byte;
 			}
-			c->signer_slot = fi->n_clients + 1; /* 0=LSP */
 			c->allocation_sats = 0; /* Default: even split */
 			c->pending_revoke_epoch = UINT32_MAX;
 			c->last_acked_epoch = UINT32_MAX;
@@ -6217,13 +6246,64 @@ static struct command_result *json_factory_create(struct command *cmd,
 			return command_fail(cmd, LIGHTNINGD,
 				"allocations sum %"PRIu64" exceeds 80%% of "
 				"funding_sats (%"PRIu64")", alloc_sum, cap);
-		/* Cache on fi for FACTORY_PROPOSE/ALL_NONCES serialization. */
 		fi->n_allocations = (uint8_t)fi->n_clients;
-		for (size_t i2 = 0; i2 < fi->n_clients; i2++)
-			fi->allocations[i2] = fi->clients[i2].allocation_sats;
 		plugin_log(plugin_handle, LOG_INFORM,
 			   "factory-create: custom allocations sum=%"PRIu64" sats",
 			   alloc_sum);
+	}
+
+	/* Tier 2.8: optional per-client timezone buckets (0-23). Parsed into
+	 * a local array aligned to the input `clients` order; applied below
+	 * as a sort key if placement_mode=timezone_cluster. */
+	uint8_t tz_buckets[MAX_FACTORY_PARTICIPANTS] = {0};
+	size_t tz_count = 0;
+	if (tz_buckets_tok) {
+		const jsmntok_t *tt;
+		size_t ti;
+		json_for_each_arr(ti, tt, tz_buckets_tok) {
+			if (tz_count >= MAX_FACTORY_PARTICIPANTS) break;
+			u32 v;
+			if (!json_to_u32(buf, tt, &v) || v > 23)
+				return command_fail(cmd, LIGHTNINGD,
+					"client_timezones[%zu] must be 0-23",
+					ti);
+			tz_buckets[tz_count++] = (uint8_t)v;
+		}
+		if (tz_count != fi->n_clients)
+			return command_fail(cmd, LIGHTNINGD,
+				"client_timezones length (%zu) != clients "
+				"length (%zu)", tz_count, fi->n_clients);
+	}
+
+	/* Tier 2.8: apply placement sort. For timezone_cluster, stable-sort
+	 * fi->clients[] by timezone bucket so adjacent entries share a TZ
+	 * and therefore land on the same leaf under arity_2 / sibling PS
+	 * leaves. Uses insertion sort (stable, O(n^2) fine for n<=64). */
+	if (fi->placement_mode == 3 && fi->n_clients > 1 && tz_count == fi->n_clients) {
+		for (size_t a = 1; a < fi->n_clients; a++) {
+			client_state_t key_c = fi->clients[a];
+			uint8_t key_tz = tz_buckets[a];
+			ssize_t b = (ssize_t)a - 1;
+			while (b >= 0 && tz_buckets[b] > key_tz) {
+				fi->clients[b + 1] = fi->clients[b];
+				tz_buckets[b + 1] = tz_buckets[b];
+				b--;
+			}
+			fi->clients[b + 1] = key_c;
+			tz_buckets[b + 1] = key_tz;
+		}
+		plugin_log(plugin_handle, LOG_INFORM,
+			   "factory-create: applied timezone_cluster "
+			   "placement (%zu clients)", fi->n_clients);
+	}
+
+	/* Assign final signer_slots + allocations index after placement sort.
+	 * signer_slot N maps to MuSig participant N (LSP=0, clients=1..N). */
+	for (size_t si = 0; si < fi->n_clients; si++)
+		fi->clients[si].signer_slot = (int)(si + 1);
+	if (fi->n_allocations > 0) {
+		for (size_t i2 = 0; i2 < fi->n_clients; i2++)
+			fi->allocations[i2] = fi->clients[i2].allocation_sats;
 	}
 
 	plugin_log(plugin_handle, LOG_INFORM,
@@ -6940,6 +7020,13 @@ static struct command_result *json_factory_list(struct command *cmd,
 			json_add_string(js, "arity_mode", mode);
 			json_add_string(js, "tree_mode",
 				eff == FACTORY_ARITY_PS ? "ps" : "dw");
+		}
+		/* Tier 2.8: surface placement mode. */
+		{
+			const char *pmode =
+				(fi->placement_mode == 3) ? "timezone_cluster"
+				                          : "sequential";
+			json_add_string(js, "placement_mode", pmode);
 		}
 		json_add_bool(js, "rotation_in_progress",
 			fi->rotation_in_progress);

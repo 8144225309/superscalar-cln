@@ -46,7 +46,7 @@ The plugin registers CLN hooks (`custommsg`, `openchannel`, `htlc_accepted`, `bl
 
 | Method | Parameters | Description |
 |--------|-----------|-------------|
-| `factory-create` | `funding_sats`, `clients[]`, `[allocations[]]`, `[arity_mode]` | Create a new factory: builds DW tree, generates MuSig2 nonces, sends `FACTORY_PROPOSE` to all clients. Optional `allocations` array specifies per-client sat amounts. Optional `arity_mode` selects leaf topology: `auto` (default), `arity_1`, `arity_2`, or `arity_ps` (pseudo-Spilman — see Protocol Details). |
+| `factory-create` | `funding_sats`, `clients[]`, `[allocations[]]`, `[arity_mode]`, `[placement_mode]`, `[client_timezones[]]` | Create a new factory: builds DW tree, generates MuSig2 nonces, sends `FACTORY_PROPOSE` to all clients. Optional `allocations` array specifies per-client sat amounts. Optional `arity_mode` selects leaf topology: `auto` (default), `arity_1`, `arity_2`, or `arity_ps` (pseudo-Spilman — see Protocol Details). Optional `placement_mode` (`sequential` default, or `timezone_cluster` — needs `client_timezones` array of 0-23 per client) sorts clients so same-TZ clients share a leaf (reduces wake-up cost for advances; Tier 2.8). |
 | `factory-list` | (none) | List all factories with full status (see response schema below) |
 | `factory-rotate` | `instance_id` | Advance the Decker-Wattenhofer epoch: STFU quiescence, re-sign tree, send `ROTATE_PROPOSE`, trigger `factory-change` on channels |
 | `factory-close` | `instance_id` | Initiate cooperative close: computes distribution outputs, sends `CLOSE_PROPOSE` |

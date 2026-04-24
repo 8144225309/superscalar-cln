@@ -331,6 +331,19 @@ typedef struct factory_instance {
 	 * (LSP), or received from FACTORY_PROPOSE / ALL_NONCES (client). */
 	uint8_t arity_mode;
 
+	/* Tier 2.8: client placement policy applied at factory-create time.
+	 * Values:
+	 *   0 = sequential (default — insertion order)
+	 *   3 = timezone_cluster (sort clients by timezone_bucket so same-TZ
+	 *       clients share a leaf; reduces wake-up cost for advances)
+	 * Other upstream values (INWARD=1, OUTWARD=2) require per-client
+	 * uptime/balance history and are not yet exposed.
+	 * Stored for factory-list display and persistence. The actual
+	 * reordering happens at factory-create param parsing time — after
+	 * that, fi->clients[] is in placement order and no further logic
+	 * is needed at ceremony time. */
+	uint8_t placement_mode;
+
 	/* Tier 2.6: in-flight per-leaf advance ceremony (ARITY_1 DW leaf or
 	 * ARITY_PS chain append). ps_pending_leaf != -1 means a PROPOSE has
 	 * been sent (LSP) or received (client), and we're awaiting the next
