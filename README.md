@@ -46,11 +46,12 @@ The plugin registers CLN hooks (`custommsg`, `openchannel`, `htlc_accepted`, `bl
 
 | Method | Parameters | Description |
 |--------|-----------|-------------|
-| `factory-create` | `funding_sats`, `clients[]`, `[allocations[]]` | Create a new factory: builds DW tree, generates MuSig2 nonces, sends `FACTORY_PROPOSE` to all clients. Optional `allocations` array specifies per-client sat amounts. |
+| `factory-create` | `funding_sats`, `clients[]`, `[allocations[]]`, `[arity_mode]` | Create a new factory: builds DW tree, generates MuSig2 nonces, sends `FACTORY_PROPOSE` to all clients. Optional `allocations` array specifies per-client sat amounts. Optional `arity_mode` selects leaf topology: `auto` (default), `arity_1`, `arity_2`, or `arity_ps` (pseudo-Spilman — see Protocol Details). |
 | `factory-list` | (none) | List all factories with full status (see response schema below) |
 | `factory-rotate` | `instance_id` | Advance the Decker-Wattenhofer epoch: STFU quiescence, re-sign tree, send `ROTATE_PROPOSE`, trigger `factory-change` on channels |
 | `factory-close` | `instance_id` | Initiate cooperative close: computes distribution outputs, sends `CLOSE_PROPOSE` |
 | `factory-force-close` | `instance_id` | Broadcast all signed DW tree transactions for unilateral exit |
+| `factory-ps-advance` | `instance_id`, `leaf_side` | Tier 2.6: append one chain TX to a PS leaf via 2-of-2 MuSig2 with that leaf's client. Only valid when the factory was created with `arity_mode=arity_ps`. Returns `"proposed"` immediately; the ceremony completes asynchronously via `LEAF_ADVANCE_PSIG` / `LEAF_ADVANCE_DONE` custommsgs. |
 | `factory-check-breach` | `instance_id`, `txid`, `vout`, `amount_sats`, `epoch` | Build and broadcast a penalty transaction for a detected breach |
 | `factory-open-channels` | `instance_id` | Open Lightning channels inside the factory via `fundchannel_start`/`fundchannel_complete` with factory funding override |
 | `factory-forget-channel` | `id`, `channel_id` | Drop a factory channel from CLN without broadcasting a commitment transaction |
@@ -76,6 +77,8 @@ The plugin registers CLN hooks (`custommsg`, `openchannel`, `htlc_accepted`, `bl
     "max_epochs": 16,
     "epochs_remaining": 16,
     "early_warning_time": 2202,
+    "arity_mode": "arity_2",
+    "tree_mode": "dw",
     "creation_block": 300000,
     "expiry_block": 304320,
     "rotation_in_progress": false,
@@ -96,7 +99,9 @@ The plugin registers CLN hooks (`custommsg`, `openchannel`, `htlc_accepted`, `bl
 ```
 
 Key fields:
-- `early_warning_time` — minimum CLTV headroom (in blocks) for HTLCs on this factory's channels. Derived from the DW tree depth. HTLCs with tighter timeouts are rejected by the `htlc_accepted` hook.
+- `early_warning_time` — minimum CLTV headroom (in blocks) for HTLCs on this factory's channels. Derived from the DW tree depth. HTLCs with tighter timeouts are rejected by the `htlc_accepted` hook. Factories using `arity_mode=arity_ps` get one DW layer subtracted (PS leaves use TX chaining, no nSequence).
+- `arity_mode` — effective arity: `arity_1`, `arity_2`, or `arity_ps`. Set by `factory-create` via the `arity_mode` param (or auto-picked from participant count when omitted).
+- `tree_mode` — `dw` for pure Decker-Wattenhofer trees, `ps` when any leaf is pseudo-Spilman. Derived from `arity_mode`.
 - `epochs_remaining` — rotations left before DW exhaustion triggers migration.
 - `lifecycle` — state string. Active factories are `active`; `dying` means a close was initiated; `closed_externally` means the watcher observed the factory root spent without a plugin-initiated close. `closed_unilateral` (populated by Phase 2a) indicates the scan matched our own kickoff TX. `closed_cooperative` / `closed_breached` are reserved for Phase 2b.
 - `closed_externally_at_block` — present only when `lifecycle == "closed_externally"`; the block height at which the root-spend was observed.
@@ -115,7 +120,7 @@ CLN handles channels. The plugin handles the factory.
 - **Outbound**: The plugin sends factory messages via `sendcustommsg` — no new BOLT peer wire message types needed
 - **Channel opening**: Factory channels are opened with `fundchannel_start`/`fundchannel_complete`, with `factory_funding_txid` override to reference the DW tree leaf outpoint
 - **State changes**: Factory rotation triggers STFU quiescence in channeld, then `factory-change` RPC updates the channel's funding outpoint with batch `commitment_signed` (signing against both old and new outpoints simultaneously)
-- **Persistence**: Factory state (metadata, channels, breach data, signed DW tree transactions) is serialized to CLN's datastore under `superscalar/factories/{instance_id}/`. Both LSP and client persist independently for trustless unilateral exit.
+- **Persistence**: Factory state (metadata, channels, breach data, signed DW tree transactions, per-leaf PS chain entries for `arity_mode=arity_ps`) is serialized to CLN's datastore under `superscalar/factories/{instance_id}/`. Both LSP and client persist independently for trustless unilateral exit.
 - **Tree reconstruction**: On restart, factory trees are rebuilt from persisted metadata + participant pubkeys. Signed transactions are loaded from datastore so `factory-force-close` works immediately after restart.
 - **HTLC safety**: The `htlc_accepted` hook rejects incoming HTLCs whose CLTV timeout doesn't leave enough headroom for the factory's DW tree to fully unwind via force-close.
 
@@ -189,6 +194,47 @@ SuperScalar uses an *inverted timeout default*: if the factory expires and no co
 ### Fee Model: Exogenous P2A CPFP (Tier 2.7)
 
 The upstream SuperScalar library uses an **exogenous fee model**: transaction fees are not baked into the pre-signed DW tree outputs at ceremony time. Instead, `factory_build_node_tx` conditionally appends a [Pay-to-Anchor (P2A)](https://bitcoinops.org/en/topics/anchor-outputs/) output to each tree node TX based on the wired `fee_estimator_t`. When a tree TX needs fee-bumping, the plugin builds and broadcasts a CPFP child that spends the anchor against a CLN wallet UTXO. This means the fee rate can be chosen at broadcast time rather than at signing time, and the factory tree never needs to be re-signed due to fee-rate changes. The plugin wires a `fee_estimator_static_t` at `SS_DEFAULT_FEE_RATE_SAT_PER_KVB = 1000 sat/kvB`; the CPFP scheduler (`ss_cpfp_scheduler_tick`) monitors pending broadcasts and launches bump TXs as needed. An endogenous model (fees pre-signed into outputs) is not supported by upstream without re-running the MuSig2 ceremony at each new fee rate.
+
+### Pseudo-Spilman Leaves (Tier 2.6, ARITY_PS)
+
+Optional leaf-level design variant ([ZmnSCPxj, Delving Bitcoin 2024](https://delvingbitcoin.org/t/superscalar-laddered-timeout-tree-structured-decker-wattenhofer-factories-with-pseudo-spilman-leaves/1242)). Replaces the leaf DW layer with a **chained TX sequence** (state N+1 spends state N's output) instead of decrementing nSequence. Upstream SuperScalar implements this as `FACTORY_ARITY_PS`.
+
+**Tradeoff**:
+
+| Property | Pure DW (ARITY_1 / ARITY_2) | Pseudo-Spilman (ARITY_PS) |
+|---|---|---|
+| Clients per leaf | 1 or 2 | 1 |
+| Leaf-layer CLTV cost | ~3 days of nSequence | 0 (no relative timelock) |
+| Force-close TX count per leaf | fixed (1 state TX) | O(K) for K liquidity updates |
+| Rebalance quorum | full leaf (1 or 2 clients + LSP) | just the single client + LSP |
+| Old-state protection | shachain hashlock burn (latest state) | structural chaining + chain[0] L-stock hashlock burn |
+
+**When to choose ARITY_PS**: clients need more of the BOLT CLTV budget for multi-hop routing, or the factory must support frequent per-client liquidity updates without waking the whole tree.
+
+**Enabling at factory creation**:
+
+```bash
+lightning-cli factory-create funding_sats=500000 \
+  clients='["02abc..."]' arity_mode=arity_ps
+```
+
+Accepted `arity_mode` values:
+- `auto` (default) — current `ss_choose_arity` heuristic (ARITY_1 for 2 participants, ARITY_2 for 3+)
+- `arity_1` — one client per leaf, full DW
+- `arity_2` — two clients per leaf, shallower DW
+- `arity_ps` (alias: `ps`) — pseudo-Spilman leaves
+
+Both LSP and client agree on the mode via the `arity_mode` byte transmitted in FACTORY_PROPOSE + ALL_NONCES; legacy senders that omit it default to `auto`.
+
+**Per-leaf advance ceremony** (`factory-ps-advance`): 3-message 2-of-2 MuSig2 between LSP and the single client on the affected leaf. Sequence:
+
+1. **`LEAF_ADVANCE_PROPOSE`** (LSP → client): leaf_side + LSP pubnonce
+2. **`LEAF_ADVANCE_PSIG`** (client → LSP): client pubnonce + client partial sig
+3. **`LEAF_ADVANCE_DONE`** (LSP → all clients): LSP partial sig (ignored by non-involved clients)
+
+Each advance appends one TX to the leaf's chain. Both parties persist the signed chain TX to their CLN datastore under `superscalar/factories/{iid}/ps_chain/{leaf_node_idx}/{chain_pos}`, so restart replays the full chain and force-close remains trustless.
+
+**Dust-limit exhaustion**: `factory-ps-advance` returns an error with `SS_METRIC event=ps_exhausted` when the next advance's channel output would fall below the dust limit (546 sats). Operator response: migrate the factory to reset the chain.
 
 ## Related Projects
 
