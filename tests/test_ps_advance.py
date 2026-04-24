@@ -115,3 +115,48 @@ def test_ps_advance_chain_pos_grows(ss_node_factory):
             lsp,
             rf"SS_METRIC event=ps_advance .* leaf=0 chain_pos={expected_pos}",
         )
+
+
+def test_ps_chain_persists_across_restart(ss_node_factory):
+    """Review item 4: advance a PS leaf, restart the LSP, verify the
+    plugin replays the persisted chain[0..N] from datastore so
+    factory-list reflects the right arity/tree_mode and future operations
+    can continue. We can't assert ps_chain_len directly via factory-list
+    (not exposed today), but we CAN assert the persisted datastore keys
+    survive the restart cycle."""
+    lsp, _client, iid = _setup_factory(ss_node_factory,
+                                       arity_mode="arity_ps")
+
+    # Two advances so chain has both chain[0] + chain[1] + chain[2].
+    for expected_pos in (1, 2):
+        lsp.rpc.call("factory-ps-advance",
+                     {"instance_id": iid, "leaf_side": 0})
+        _wait_metric(
+            lsp,
+            rf"SS_METRIC event=ps_advance .* leaf=0 chain_pos={expected_pos}",
+        )
+
+    # Confirm chain entries are in datastore before restart.
+    assert datastore_has(
+        lsp, ["superscalar", "factories", iid, "ps_chain"],
+        timeout=5.0,
+    )
+
+    lsp.restart()
+
+    # After restart, the factory should still be in factory-list with
+    # the right arity_mode + tree_mode (proves meta v14 round-trips) and
+    # the ps_chain datastore entries should still exist.
+    f = _factory(lsp, iid)
+    assert f["arity_mode"] == "arity_ps"
+    assert f["tree_mode"] == "ps"
+    assert datastore_has(
+        lsp, ["superscalar", "factories", iid, "ps_chain"],
+        timeout=5.0,
+    ), "PS chain datastore entries missing after restart"
+
+    # And the plugin should have logged that it replayed chain entries.
+    # ss_load_factories emits: "Loaded %d PS chain entries for leaf %d ..."
+    assert lsp.daemon.is_in_log(
+        r"Loaded \d+ PS chain entries for leaf 0"
+    ), "plugin did not log PS chain replay on startup"
