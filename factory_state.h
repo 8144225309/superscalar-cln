@@ -566,6 +566,15 @@ typedef struct factory_instance {
 	 * Separate from tree node sessions — uses root keyagg. */
 	void *dist_session;  /* musig_signing_session_t* */
 
+	/* Follow-up #1 sub-PR 3B: collected partial sigs for the dist TX
+	 * ceremony. Populated as each DIST_PSIG arrives on the LSP side,
+	 * plus LSP's own psig when all client psigs are in. Aggregated
+	 * via musig_aggregate_partial_sigs into the 64-byte Schnorr sig
+	 * that becomes the dist TX witness. Indexed by participant_idx
+	 * (0 = LSP, 1..N = clients). */
+	uint8_t dist_psigs[MAX_FACTORY_PARTICIPANTS][32];
+	uint8_t dist_has_psig[MAX_FACTORY_PARTICIPANTS];
+
 	/* Cached nonce entries for ALL_NONCES broadcast (multi-client).
 	 * Populated during FACTORY_PROPOSE (LSP's own nonces) and
 	 * NONCE_BUNDLE (each client's nonces). Sent as ALL_NONCES
