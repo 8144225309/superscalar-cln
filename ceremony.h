@@ -82,6 +82,17 @@
 #define SS_SUBMSG_LEAF_ADVANCE_PSIG	0x0131 /* client → LSP: client pubnonce + partial sig */
 #define SS_SUBMSG_LEAF_ADVANCE_DONE	0x0132 /* LSP → all clients: leaf_side notification */
 
+/* Follow-up #4 impl: per-leaf realloc ceremony (value transfer without chain
+ * advance). LSP sets new output amounts on a leaf (shift L-stock to client)
+ * and re-signs the current leaf state. Wire parallels LEAF_ADVANCE but
+ * PROPOSE carries the new amounts array so the client can mirror
+ * factory_set_leaf_amounts locally before signing. PSIG + DONE are shape-
+ * identical to the LEAF_ADVANCE variants — distinct submsg IDs keep the
+ * wire flow observable. */
+#define SS_SUBMSG_LEAF_REALLOC_PROPOSE	0x0134
+#define SS_SUBMSG_LEAF_REALLOC_PSIG	0x0135
+#define SS_SUBMSG_LEAF_REALLOC_DONE	0x0136
+
 /* Ceremony state */
 typedef enum {
 	CEREMONY_IDLE,

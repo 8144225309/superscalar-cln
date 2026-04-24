@@ -350,6 +350,10 @@ typedef struct factory_instance {
 					  * handle_block_added clears pending
 					  * state after PS_PENDING_TIMEOUT_BLOCKS
 					  * elapse without PSIG/DONE. */
+	uint8_t  ps_pending_is_realloc;  /* Follow-up #4: 1 if the in-flight
+					  * ceremony is a LEAF_REALLOC (new
+					  * amounts, no chain advance); 0 for
+					  * LEAF_ADVANCE. Memory-only. */
 
 	/* Lifecycle */
 	factory_lifecycle_t lifecycle;
