@@ -324,6 +324,27 @@ typedef struct factory_instance {
 	uint32_t epoch;			/* Current DW epoch */
 	uint32_t max_epochs;		/* Total states before exhaustion */
 
+	/* Tier 2.6: arity policy for this factory. Values match libsuperscalar's
+	 * factory_arity_t (1=ARITY_1, 2=ARITY_2, 3=ARITY_PS). The sentinel 0
+	 * means "auto" — ss_effective_arity() falls back to ss_choose_arity()
+	 * on n_clients+1. Set by factory-create's optional arity_mode param
+	 * (LSP), or received from FACTORY_PROPOSE / ALL_NONCES (client). */
+	uint8_t arity_mode;
+
+	/* Tier 2.6: in-flight per-leaf advance ceremony (ARITY_1 DW leaf or
+	 * ARITY_PS chain append). ps_pending_leaf != -1 means a PROPOSE has
+	 * been sent (LSP) or received (client), and we're awaiting the PSIG
+	 * round. Fields:
+	 *   ps_pending_leaf     — leaf_side (0..n_leaf_nodes-1) or -1 (idle)
+	 *   ps_pending_node_idx — cached factory_t node index for that leaf
+	 *   ps_pending_secnonce_slot — pool slot holding our secnonce
+	 *                              (UINT32_MAX if not using a pool entry)
+	 * Memory-only; not persisted. On restart an in-flight advance is
+	 * abandoned and the LSP may retry. */
+	int32_t  ps_pending_leaf;
+	uint32_t ps_pending_node_idx;
+	uint32_t ps_pending_secnonce_slot;
+
 	/* Lifecycle */
 	factory_lifecycle_t lifecycle;
 	uint32_t creation_block;	/* Block height at creation */

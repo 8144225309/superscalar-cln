@@ -69,6 +69,14 @@
 #define SS_SUBMSG_TURNOVER_KEY		0x0121
 #define SS_SUBMSG_TURNOVER_ACK		0x0122
 
+/* Tier 2.6: Per-leaf advance ceremony (ARITY_1 DW leaf or ARITY_PS chain).
+ * Small 2-of-2 MuSig2 ceremony between LSP and the single affected client.
+ * Mirrors upstream lsp_advance_leaf / MSG_LEAF_ADVANCE_* — same wire shape
+ * serves both DW-arity-1 leaf re-sign and PS chain append. */
+#define SS_SUBMSG_LEAF_ADVANCE_PROPOSE	0x0130 /* LSP → client: leaf_side + LSP pubnonce */
+#define SS_SUBMSG_LEAF_ADVANCE_PSIG	0x0131 /* client → LSP: client pubnonce + partial sig */
+#define SS_SUBMSG_LEAF_ADVANCE_DONE	0x0132 /* LSP → all clients: leaf_side notification */
+
 /* Ceremony state */
 typedef enum {
 	CEREMONY_IDLE,

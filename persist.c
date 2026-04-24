@@ -91,8 +91,9 @@ size_t ss_persist_serialize_meta(const factory_instance_t *fi, uint8_t **out)
 	 *  v11 adds pending_sweeps array for CSV claim scheduler
 	 *      (watcher Phase 4d)
 	 *  v12 adds aborted_at_block (watcher Phase 4c)
-	 *  v13 adds pending_cpfps array (watcher Phase 3c2) */
-	buf_u8(&buf, &len, &cap, 13);
+	 *  v13 adds pending_cpfps array (watcher Phase 3c2)
+	 *  v14 adds arity_mode (Tier 2.6: PS arity support) */
+	buf_u8(&buf, &len, &cap, 14);
 
 	/* Identity */
 	buf_append(&buf, &len, &cap, fi->instance_id, 32);
@@ -319,6 +320,9 @@ size_t ss_persist_serialize_meta(const factory_instance_t *fi, uint8_t **out)
 		buf_u32(&buf, &len, &cap, pc->parent_confirmed_block);
 	}
 
+	/* v14: Tier 2.6 arity_mode. 0 = auto; 1/2/3 = ARITY_1/2/PS. */
+	buf_u8(&buf, &len, &cap, fi->arity_mode);
+
 	*out = buf;
 	return len;
 }
@@ -332,7 +336,7 @@ bool ss_persist_deserialize_meta(factory_instance_t *fi,
 	uint8_t version, tmp8;
 	uint16_t tmp16;
 
-	if (!read_u8(&p, &rem, &version) || version < 1 || version > 9)
+	if (!read_u8(&p, &rem, &version) || version < 1 || version > 14)
 		return false;
 
 	if (!read_bytes(&p, &rem, fi->instance_id, 32)) return false;
@@ -715,6 +719,13 @@ bool ss_persist_deserialize_meta(factory_instance_t *fi,
 				return false;
 		}
 		fi->n_pending_cpfps = n_cp;
+	}
+
+	/* v14: Tier 2.6 arity_mode. Pre-v14 records default to 0 (auto). */
+	fi->arity_mode = 0;
+	if (version >= 14) {
+		if (!read_u8(&p, &rem, &fi->arity_mode))
+			return false;
 	}
 
 	return true;

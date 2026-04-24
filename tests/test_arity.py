@@ -40,10 +40,13 @@ def _ewt(n_layers: int) -> int:
     return n_layers * (DW_STEP_BLOCKS * (DW_STATES_PER_LAYER - 1) + 6) + 36
 
 
-def _create(lsp, n_clients: int, funding_sats: int = 500_000) -> dict:
+def _create(lsp, n_clients: int, funding_sats: int = 500_000,
+            arity_mode: str | None = None) -> dict:
     clients = FAKE_CLIENT_IDS[:n_clients]
-    r = lsp.rpc.call("factory-create",
-                     {"funding_sats": funding_sats, "clients": clients})
+    payload = {"funding_sats": funding_sats, "clients": clients}
+    if arity_mode is not None:
+        payload["arity_mode"] = arity_mode
+    r = lsp.rpc.call("factory-create", payload)
     iid = r["instance_id"]
     for f in lsp.rpc.call("factory-list")["factories"]:
         if f["instance_id"] == iid:
@@ -98,3 +101,62 @@ def test_ewt_eight_clients(ss_node_factory):
     f = _create(lsp, n_clients=8)
     assert f["early_warning_time"] == _ewt(4), (
         f"n_clients=8: expected ewt={_ewt(4)}, got {f['early_warning_time']}")
+
+
+# ------- Tier 2.6: arity_mode knob + ARITY_PS EWT savings -------
+
+def test_arity_mode_auto_matches_default(ss_node_factory):
+    """arity_mode="auto" behaves identically to omitting the param."""
+    lsp = ss_node_factory.get_node()
+    f1 = _create(lsp, n_clients=3)                       # omitted
+    f2 = _create(lsp, n_clients=3, arity_mode="auto")   # explicit auto
+    assert f1["early_warning_time"] == f2["early_warning_time"]
+    assert f1["arity_mode"] == f2["arity_mode"] == "arity_2"
+    assert f1["tree_mode"] == f2["tree_mode"] == "dw"
+
+
+def test_arity_mode_explicit_arity_1(ss_node_factory):
+    """arity_mode="arity_1" forces one-client-per-leaf even with 3 clients.
+    n_total=4, ARITY_1: leaves=4, depth=2, layers=3 → _ewt(3)=6534.
+    Default (arity_2) for n=3 would give _ewt(2)=4368."""
+    lsp = ss_node_factory.get_node()
+    f = _create(lsp, n_clients=3, arity_mode="arity_1")
+    assert f["arity_mode"] == "arity_1"
+    assert f["tree_mode"] == "dw"
+    assert f["early_warning_time"] == _ewt(3), (
+        f"arity_1 forced: expected ewt={_ewt(3)}, got {f['early_warning_time']}")
+
+
+def test_arity_mode_ps_saves_one_layer(ss_node_factory):
+    """arity_mode="arity_ps" uses PS leaves; EWT drops by one leaf-layer
+    (DW_STEP_BLOCKS*(DW_STATES_PER_LAYER-1) + 6 = 2166 blocks) vs arity_1.
+    n_clients=3 → leaves=4, depth=2, layers=3. PS EWT = 3*2166 + 36 - 2166
+                = 6534 - 2166 = 4368."""
+    lsp = ss_node_factory.get_node()
+    f = _create(lsp, n_clients=3, arity_mode="arity_ps")
+    assert f["arity_mode"] == "arity_ps"
+    assert f["tree_mode"] == "ps"
+    expected = _ewt(3) - (DW_STEP_BLOCKS * (DW_STATES_PER_LAYER - 1) + 6)
+    assert f["early_warning_time"] == expected, (
+        f"arity_ps: expected ewt={expected}, got {f['early_warning_time']}")
+
+
+def test_arity_mode_ps_alias(ss_node_factory):
+    """arity_mode="ps" is an accepted alias for "arity_ps"."""
+    lsp = ss_node_factory.get_node()
+    f = _create(lsp, n_clients=3, arity_mode="ps")
+    assert f["arity_mode"] == "arity_ps"
+
+
+def test_arity_mode_invalid_rejected(ss_node_factory):
+    """Unknown arity_mode strings are rejected cleanly by the RPC."""
+    import pytest
+    from pyln.client import RpcError
+    lsp = ss_node_factory.get_node()
+    clients = FAKE_CLIENT_IDS[:2]
+    with pytest.raises(RpcError):
+        lsp.rpc.call("factory-create", {
+            "funding_sats": 500_000,
+            "clients": clients,
+            "arity_mode": "bogus",
+        })

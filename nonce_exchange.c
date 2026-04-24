@@ -24,8 +24,11 @@ size_t nonce_bundle_serialize(const nonce_bundle_t *nb,
 	/* Per entry: node_idx(4) + signer_slot(4) + pubnonce(66) = 74 */
 	size_t funding_trailer = 1 + (nb->funding_spk_len > 0
 		? 32 + 4 + 8 + nb->funding_spk_len : 0);
+	/* arity_mode trailer: always 1 byte, written whether 0 (auto) or not.
+	 * Old readers stop at the funding trailer; new readers continue. */
+	size_t arity_trailer = 1;
 	size_t needed = 44 + nb->n_participants * 33
-		+ nb->n_entries * 74 + funding_trailer;
+		+ nb->n_entries * 74 + funding_trailer + arity_trailer;
 	if (out_max < needed)
 		return 0;
 
@@ -63,6 +66,9 @@ size_t nonce_bundle_serialize(const nonce_bundle_t *nb,
 		memcpy(p, nb->funding_spk, nb->funding_spk_len);
 		p += nb->funding_spk_len;
 	}
+
+	/* arity_mode trailer (one byte). 0 = auto; 1/2/3 = ARITY_1/2/PS. */
+	*p++ = nb->arity_mode;
 
 	return (size_t)(p - out);
 }
@@ -112,10 +118,18 @@ int nonce_bundle_deserialize(nonce_bundle_t *nb,
 				((uint64_t)p[6] <<  8) | p[7];
 			p += 8;
 			memcpy(nb->funding_spk, p, nb->funding_spk_len);
+			p += nb->funding_spk_len;
 		} else {
 			nb->funding_spk_len = 0;
 		}
 	}
+
+	/* Optional arity_mode trailer (backward-compatible: legacy senders
+	 * omit it, we default to 0 = auto). */
+	consumed = (size_t)(p - data);
+	nb->arity_mode = 0;
+	if (consumed < len)
+		nb->arity_mode = *p++;
 
 	return 1;
 }

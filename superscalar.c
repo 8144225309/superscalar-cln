@@ -182,11 +182,30 @@ static factory_arity_t ss_choose_arity(size_t n_total)
 	return n_total <= 2 ? FACTORY_ARITY_1 : FACTORY_ARITY_2;
 }
 
+/* Resolve the arity this factory should build with.
+ *
+ * fi->arity_mode is set either by factory-create's arity_mode param (LSP) or
+ * received from FACTORY_PROPOSE / ALL_NONCES (client). Value 0 means "auto";
+ * we fall back to ss_choose_arity so legacy behavior is preserved bit-for-bit
+ * when the knob isn't touched.
+ *
+ * Accepts NULL fi to tolerate receive-side paths where the factory instance
+ * hasn't been looked up yet — callers in that state pass n_total directly
+ * via ss_choose_arity. */
+static factory_arity_t ss_effective_arity(const factory_instance_t *fi)
+{
+	if (!fi)
+		return FACTORY_ARITY_2;
+	if (fi->arity_mode == 1 || fi->arity_mode == 2 ||
+	    fi->arity_mode == 3)
+		return (factory_arity_t)fi->arity_mode;
+	return ss_choose_arity(fi->n_clients + 1);
+}
+
 /* Compute worst-case DW tree unwind time for HTLC safety.
  *
  * n_clients: clients only (not counting LSP); n_total = n_clients + 1.
- * arity:     the arity the factory was (or will be) built with — must
- *            match ss_choose_arity(n_total) or a manually-set override.
+ * arity:     the arity the factory was (or will be) built with.
  *
  * Formula: n_layers * step_blocks * (states_per_layer - 1)
  *          + n_layers * 6 (confirmation buffer per layer)
@@ -195,6 +214,10 @@ static factory_arity_t ss_choose_arity(size_t n_total)
  * Tree structure:
  *   ARITY_2: leaves = ceil(n_total / 2);  2 clients share one leaf
  *   ARITY_1: leaves = n_total;            each participant on own leaf
+ *   ARITY_PS: same leaf count as ARITY_1, but the leaf DW layer is
+ *             replaced with a chained-TX sequence that has no nSequence,
+ *             so one leaf-layer's contribution is subtracted from total
+ *             (mirrors upstream factory_early_warning_time).
  *   depth   = ceil(log2(leaves))          binary splits above leaves
  *   n_layers = depth + 1                  one DW counter layer per level */
 static uint16_t compute_early_warning_time(size_t n_clients,
@@ -202,7 +225,8 @@ static uint16_t compute_early_warning_time(size_t n_clients,
 {
 	size_t n_total = n_clients + 1;
 
-	/* Leaf count under the chosen arity. */
+	/* ARITY_1 and ARITY_PS place one participant per leaf; ARITY_2
+	 * pairs two clients per leaf for a shallower tree. */
 	size_t leaves = (arity == FACTORY_ARITY_2)
 		? (n_total + 1) / 2   /* ceil(n_total / 2) */
 		: n_total;            /* one leaf per participant */
@@ -220,6 +244,17 @@ static uint16_t compute_early_warning_time(size_t n_clients,
 	uint32_t total = (uint32_t)n_layers * DW_STEP_BLOCKS
 				       * (DW_STATES_PER_LAYER - 1)
 		       + (uint32_t)n_layers * 6 + 36;
+
+	/* Tier 2.6: PS leaves contribute zero nSequence at the leaf layer —
+	 * TX chaining orders states without relative timelocks. Subtract the
+	 * leaf DW layer's contribution (step_blocks * (states_per_layer - 1)
+	 * plus its 6-block confirmation buffer). */
+	if (arity == FACTORY_ARITY_PS && n_layers > 0) {
+		uint32_t leaf_cost = (uint32_t)DW_STEP_BLOCKS
+				   * (DW_STATES_PER_LAYER - 1) + 6;
+		total = (total > leaf_cost) ? total - leaf_cost : 0;
+	}
+
 	if (total > 65535) total = 65535;
 	return (uint16_t)total;
 }
@@ -1179,7 +1214,7 @@ static void open_factory_channels(struct command *cmd,
 			     fi->early_warning_time > 0
 			     ? fi->early_warning_time
 			     : compute_early_warning_time(fi->n_clients,
-				   ss_choose_arity(fi->n_clients + 1)));
+				   ss_effective_arity(fi)));
 		send_outreq(req);
 
 		plugin_log(plugin_handle, LOG_INFORM,
@@ -1688,7 +1723,7 @@ static void ss_load_factories(struct command *cmd)
 							pks, n_total,
 							DW_STEP_BLOCKS, 16);
 						factory_set_arity(f,
-							ss_choose_arity(n_total));
+							ss_effective_arity(fi));
 						if (fi->funding_spk_len > 0) {
 							factory_set_funding(f,
 								fi->funding_txid,
@@ -1756,7 +1791,7 @@ static void ss_load_factories(struct command *cmd)
 									compute_early_warning_time(
 										n_total > 1
 										? n_total - 1 : 1,
-										ss_choose_arity(n_total));
+										ss_effective_arity(fi));
 							plugin_log(plugin_handle,
 								LOG_INFORM,
 								"Rebuilt factory tree "
@@ -1889,7 +1924,7 @@ static void continue_after_funding(struct command *cmd,
 		factory_t *new_f = calloc(1, sizeof(factory_t));
 		factory_init_from_pubkeys(new_f, global_secp_ctx,
 			real_pks, n_total, DW_STEP_BLOCKS, 16);
-		factory_set_arity(new_f, ss_choose_arity(n_total));
+		factory_set_arity(new_f, ss_effective_arity(fi));
 		/* Restore L-stock secrets BEFORE build_tree so build_l_stock_spk
 		 * produces the same P2TR keys that went on-chain originally.
 		 * Without this, the rebuilt tree has no taptree on L-stock
@@ -1948,6 +1983,10 @@ static void continue_after_funding(struct command *cmd,
 			memcpy(all_nb->instance_id, fi->instance_id, 32);
 			all_nb->n_participants = 1 + fi->n_clients;
 			all_nb->n_nodes = f->n_nodes;
+			/* Tier 2.6: propagate arity choice in ALL_NONCES as well
+			 * (also delivered in FACTORY_PROPOSE; duplicated so clients
+			 * that reconstruct from ALL_NONCES alone still see it). */
+			all_nb->arity_mode = fi->arity_mode;
 
 			/* Include real pubkeys */
 			size_t pk_out = 33;
@@ -2154,9 +2193,11 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 			fi->creation_block = ss_state.current_blockheight;
 			fi->expiry_block = ss_state.current_blockheight + 4320 + 432;
 			fi->n_tree_nodes = nb->n_nodes > 0 ? nb->n_nodes : 2;
+			/* Tier 2.6: adopt LSP's arity_mode choice. 0 = auto
+			 * (ss_effective_arity falls back to ss_choose_arity). */
+			fi->arity_mode = nb->arity_mode;
 			fi->early_warning_time = compute_early_warning_time(
-				fi->n_clients,
-				ss_choose_arity(fi->n_clients + 1));
+				fi->n_clients, ss_effective_arity(fi));
 
 			/* Store LSP peer_id as node_id */
 			if (strlen(peer_id) == 66) {
@@ -2209,8 +2250,7 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 			 * so client's view of tree TXs has matching anchor
 			 * outputs (keeps sighashes + txids in sync with LSP). */
 			ss_factory_wire_fee_estimator(fi, factory);
-			factory_set_arity(factory,
-				ss_choose_arity(nb->n_participants));
+			factory_set_arity(factory, ss_effective_arity(fi));
 
 			uint8_t synth_txid[32], synth_spk[34];
 			for (int j = 0; j < 32; j++) synth_txid[j] = j + 1;
@@ -2674,8 +2714,7 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 							global_secp_ctx,
 							apks, nt,
 							DW_STEP_BLOCKS, 16);
-						factory_set_arity(tmp_f,
-							ss_choose_arity(nt));
+						factory_set_arity(tmp_f, ss_effective_arity(fi));
 						uint8_t ph_txid[32], ph_spk[34];
 						for (int j = 0; j < 32; j++)
 							ph_txid[j] = j + 1;
@@ -2887,7 +2926,7 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 							real_pks, n_total,
 							DW_STEP_BLOCKS, 16);
 						factory_set_arity(new_f,
-							ss_choose_arity(n_total));
+							ss_effective_arity(fi));
 						/* Use real funding if available, else synthetic */
 						if (fi->funding_spk_len > 0) {
 							factory_set_funding(new_f,
@@ -3089,6 +3128,12 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 				free(anb);
 				break;
 			}
+			/* Tier 2.6: re-adopt LSP's arity_mode. Usually identical
+			 * to what FACTORY_PROPOSE delivered, but we trust the
+			 * most recent signal in case a legacy FACTORY_PROPOSE
+			 * lacked the trailer. */
+			if (anb->arity_mode != 0)
+				fi->arity_mode = anb->arity_mode;
 			factory_t *f = (factory_t *)fi->lib_factory;
 			if (!f) { free(anb); break; }
 			secp256k1_context *ctx = global_secp_ctx;
@@ -3125,8 +3170,7 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 					factory_init_from_pubkeys(new_f, ctx,
 						real_pks, anb->n_participants,
 						DW_STEP_BLOCKS, 16);
-					factory_set_arity(new_f,
-						ss_choose_arity(anb->n_participants));
+					factory_set_arity(new_f, ss_effective_arity(fi));
 					/* Use real funding from ALL_NONCES if available */
 					if (anb->funding_spk_len > 0) {
 						factory_set_funding(new_f,
@@ -5467,12 +5511,37 @@ static struct command_result *json_factory_create(struct command *cmd,
 	uint8_t instance_id[32];
 
 	const jsmntok_t *allocations_tok = NULL;
+	const char *arity_mode_str = NULL;
 	if (!param(cmd, buf, params,
 		   p_req("funding_sats", param_u64, &funding_sats),
 		   p_req("clients", param_array, &clients_tok),
 		   p_opt("allocations", param_array, &allocations_tok),
+		   p_opt("arity_mode", param_string, &arity_mode_str),
 		   NULL))
 		return command_param_failed();
+
+	/* Tier 2.6: optional arity selection. Default "auto" preserves
+	 * legacy ss_choose_arity behavior. "arity_ps" selects pseudo-Spilman
+	 * leaves (upstream FACTORY_ARITY_PS) — replaces the leaf DW layer
+	 * with a chained TX sequence, saving ~3 days of CLTV delta at the
+	 * cost of O(K) force-close. */
+	uint8_t parsed_arity_mode = 0; /* 0 = auto */
+	if (arity_mode_str) {
+		if (strcmp(arity_mode_str, "auto") == 0)
+			parsed_arity_mode = 0;
+		else if (strcmp(arity_mode_str, "arity_1") == 0)
+			parsed_arity_mode = 1;
+		else if (strcmp(arity_mode_str, "arity_2") == 0)
+			parsed_arity_mode = 2;
+		else if (strcmp(arity_mode_str, "arity_ps") == 0 ||
+			 strcmp(arity_mode_str, "ps") == 0)
+			parsed_arity_mode = 3;
+		else
+			return command_fail(cmd, LIGHTNINGD,
+				"arity_mode must be one of: auto, arity_1, "
+				"arity_2, arity_ps (got %s)",
+				arity_mode_str);
+	}
 
 	/* Gap 8: deterministic instance_id from HSM master key when
 	 * available. iid = SHA256(master_key || "ss-iid-v1" ||
@@ -5509,6 +5578,7 @@ static struct command_result *json_factory_create(struct command *cmd,
 	fi->is_lsp = true;
 	fi->lifecycle = FACTORY_LIFECYCLE_INIT;
 	fi->ceremony = CEREMONY_IDLE;
+	fi->arity_mode = parsed_arity_mode;
 
 	/* Parse client node IDs */
 	const jsmntok_t *t;
@@ -5615,8 +5685,7 @@ static struct command_result *json_factory_create(struct command *cmd,
 		 * P2A anchors (activates Phase 3c2/3c2.5 CPFP). */
 		ss_factory_wire_fee_estimator(fi, factory);
 
-		factory_set_arity(factory,
-			ss_choose_arity(fi->n_clients + 1));
+		factory_set_arity(factory, ss_effective_arity(fi));
 
 		/* Set funding — use a plausible P2TR scriptpubkey.
 		 * Real funding comes from the on-chain UTXO backing
@@ -5756,8 +5825,7 @@ static struct command_result *json_factory_create(struct command *cmd,
 		 * This is the minimum time needed to force-close the
 		 * factory before an HTLC times out. */
 		fi->early_warning_time = compute_early_warning_time(
-			fi->n_clients,
-			ss_choose_arity(fi->n_clients + 1));
+			fi->n_clients, ss_effective_arity(fi));
 
 		/* Initialize signing sessions */
 		rc = factory_sessions_init(factory);
@@ -5820,6 +5888,9 @@ static struct command_result *json_factory_create(struct command *cmd,
 			nb->n_participants = n_total;
 			nb->n_nodes = factory->n_nodes;
 			nb->n_entries = 0;
+			/* Tier 2.6: propagate our arity choice so the client
+			 * builds an identical tree. 0 = auto (legacy). */
+			nb->arity_mode = fi->arity_mode;
 
 			plugin_log(plugin_handle, LOG_INFORM,
 				   "factory-create: n_nodes=%zu lsp_node_count=%zu",
@@ -6274,6 +6345,17 @@ static struct command_result *json_factory_list(struct command *cmd,
 		json_add_u32(js, "creation_block", fi->creation_block);
 		json_add_u32(js, "expiry_block", fi->expiry_block);
 		json_add_u32(js, "early_warning_time", fi->early_warning_time);
+		/* Tier 2.6: surface the effective arity so operators can see
+		 * whether this factory is DW-only or uses PS leaves. */
+		{
+			factory_arity_t eff = ss_effective_arity(fi);
+			const char *mode = (eff == FACTORY_ARITY_PS) ? "arity_ps"
+					 : (eff == FACTORY_ARITY_1) ? "arity_1"
+					 : "arity_2";
+			json_add_string(js, "arity_mode", mode);
+			json_add_string(js, "tree_mode",
+				eff == FACTORY_ARITY_PS ? "ps" : "dw");
+		}
 		json_add_bool(js, "rotation_in_progress",
 			fi->rotation_in_progress);
 		json_add_u32(js, "n_breach_epochs", fi->n_breach_epochs);
