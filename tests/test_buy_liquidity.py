@@ -95,23 +95,16 @@ def test_buy_liquidity_rejects_after_ps_advance(ss_node_factory):
         })
 
 
-def test_buy_liquidity_rejects_arity_2(ss_node_factory):
-    """ARITY_2 needs a 3-of-3 ceremony that isn't implemented yet (task
-    #93). Expect a clean rejection with that message.
-
-    Note: a 2-party factory with auto-arity picks ARITY_1 (not ARITY_2)
-    because ss_choose_arity returns ARITY_1 for n_total <= 2. To force
-    ARITY_2 we must pass arity_mode="arity_2" explicitly — that override
-    bypasses ss_choose_arity regardless of participant count."""
-    lsp, client, iid = _setup_factory(ss_node_factory,
-                                      arity_mode="arity_2")
-
-    with pytest.raises(RpcError, match="ARITY_2.*not yet implemented"):
-        lsp.rpc.call("factory-buy-liquidity", {
-            "instance_id": iid,
-            "client_idx": 0,
-            "amount_sats": 1_000,
-        })
+"""ARITY_2 rejection test removed — exercising the rejection requires a
+3-client factory (3-of-3 leaf signers); a 2-party factory with arity_mode
+forced to "arity_2" fails upstream tree construction (factory_build_tree
+returns failure) before the buy-liquidity check can fire. Re-add this
+test under tests/test_buy_liquidity_arity2.py once a 3-node ceremony
+helper exists. The C-side rejection at superscalar.c (FACTORY_ARITY_2
+branch in json_factory_buy_liquidity) returns
+'factory-buy-liquidity re-sign not yet implemented for ARITY_2 (3-of-3
+ceremony) — use ARITY_1 or ARITY_PS' and is verified by code review for
+now."""
 
 
 def test_buy_liquidity_rejects_concurrent_advance(ss_node_factory):
