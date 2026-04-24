@@ -1060,6 +1060,46 @@ static bool ss_leaf_advance_done_parse(const uint8_t *data, size_t len,
  * across a reconnect. */
 #define PS_PENDING_TIMEOUT_BLOCKS 3
 
+/* Send FACTORY_READY to a single client, with signed-tree trailer.
+ *
+ * Wire format (backward-compatible):
+ *   [32 bytes: instance_id]        (legacy clients read only this)
+ *   [N bytes: signed-txs blob]     (same format as ss_persist_serialize_signed_txs:
+ *                                   u16 count + per-node u16 node_idx | u8[32] txid |
+ *                                   u32 tx_len | tx_bytes)
+ *
+ * Clients that predate this change ignore anything past byte 32 and keep
+ * their old behavior (no signed tree TXs). Clients that DO parse the
+ * trailer will end up with node->signed_tx populated for every node the
+ * LSP considered signed — enough to drive a trustless unilateral exit.
+ *
+ * Returns the size of the payload sent (for logging). */
+static size_t ss_send_factory_ready(struct command *cmd,
+				    factory_instance_t *fi,
+				    const char *peer_hex)
+{
+	uint8_t *blob = NULL;
+	size_t blob_len = 0;
+	if (fi->lib_factory)
+		blob_len = ss_persist_serialize_signed_txs(fi->lib_factory, &blob);
+
+	size_t payload_len = 32 + blob_len;
+	uint8_t *payload = malloc(payload_len);
+	if (!payload) {
+		free(blob);
+		return 0;
+	}
+	memcpy(payload, fi->instance_id, 32);
+	if (blob_len > 0 && blob)
+		memcpy(payload + 32, blob, blob_len);
+	free(blob);
+
+	send_factory_msg(cmd, peer_hex, SS_SUBMSG_FACTORY_READY,
+			 payload, payload_len);
+	free(payload);
+	return payload_len;
+}
+
 /* Clear in-flight PS advance state.  Frees the secnonce, resets pending
  * leaf index.  Safe to call when nothing is pending. */
 static void ss_clear_ps_pending(factory_instance_t *fi)
@@ -3825,18 +3865,20 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 					free(fi->cached_all_nonces_wire);
 					fi->cached_all_nonces_wire = NULL;
 					fi->cached_all_nonces_len = 0;
+					size_t ready_bytes = 0;
 					for (size_t ci = 0; ci < fi->n_clients; ci++) {
 						char nid[67];
 						for (int j = 0; j < 33; j++)
 							sprintf(nid + j*2, "%02x",
 								fi->clients[ci].node_id[j]);
 						nid[66] = '\0';
-						send_factory_msg(cmd, nid,
-							SS_SUBMSG_FACTORY_READY,
-							fi->instance_id, 32);
+						ready_bytes = ss_send_factory_ready(
+							cmd, fi, nid);
 					}
 					plugin_log(plugin_handle, LOG_INFORM,
-						   "LSP: sent FACTORY_READY (no dist TX)");
+						   "LSP: sent FACTORY_READY (no dist TX, "
+						   "%zu bytes incl signed-tree trailer)",
+						   ready_bytes);
 					ss_save_factory(cmd, fi);
 				}
 			}
@@ -3853,7 +3895,43 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 		 * open_channel with channel_in_factory TLV.
 		 * Our openchannel hook (handle_openchannel) maps it. */
 		if (fi) {
+			/* Follow-up #1 / sub-PR 3A: if the payload carries a
+			 * signed-tree trailer past the 32-byte instance_id, apply
+			 * it to our local factory_t so we have signed TXs for
+			 * trustless unilateral exit. Legacy LSPs omit the
+			 * trailer (len == 32), in which case the client keeps
+			 * the historical no-local-sigs behavior. */
+			if (len > 32 && fi->lib_factory) {
+				if (ss_persist_deserialize_signed_txs(
+					fi->lib_factory, data + 32, len - 32)) {
+					plugin_log(plugin_handle, LOG_INFORM,
+						   "Client: applied %zu bytes of "
+						   "signed tree TXs from "
+						   "FACTORY_READY trailer",
+						   len - 32);
+				} else {
+					plugin_log(plugin_handle, LOG_UNUSUAL,
+						   "Client: failed to parse "
+						   "FACTORY_READY signed-tree "
+						   "trailer (%zu bytes)",
+						   len - 32);
+				}
+			} else if (len == 32) {
+				plugin_log(plugin_handle, LOG_UNUSUAL,
+					   "Client: FACTORY_READY has no "
+					   "signed-tree trailer — LSP is "
+					   "pre-Follow-up-#1; no trustless "
+					   "client-side exit available");
+			}
+
 			fi->ceremony = CEREMONY_COMPLETE;
+
+			/* With signed TXs now on the client side, chain[0] of
+			 * every PS leaf has is_signed=1. Persist them. */
+			ss_save_all_ps_chain0(cmd, fi);
+
+			/* Save factory (includes signed_txs via ss_save_factory's
+			 * own call to ss_persist_serialize_signed_txs). */
 			ss_save_factory(cmd, fi);
 		}
 		break;
@@ -4308,20 +4386,21 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 				rotate_finish_and_notify(cmd, fi);
 			} else {
 				fi->ceremony = CEREMONY_COMPLETE;
+				size_t ready_bytes = 0;
 				for (size_t ci = 0; ci < fi->n_clients; ci++) {
 					char nid[67];
 					for (int j = 0; j < 33; j++)
 						sprintf(nid + j*2, "%02x",
 							fi->clients[ci].node_id[j]);
 					nid[66] = '\0';
-					send_factory_msg(cmd, nid,
-						SS_SUBMSG_FACTORY_READY,
-						fi->instance_id, 32);
+					ready_bytes = ss_send_factory_ready(
+						cmd, fi, nid);
 				}
 				plugin_log(plugin_handle, LOG_INFORM,
 					   "LSP: sent FACTORY_READY to %zu "
-					   "clients — call factory-open-channels",
-					   fi->n_clients);
+					   "clients (%zu bytes incl signed-tree) "
+					   "— call factory-open-channels",
+					   fi->n_clients, ready_bytes);
 				ss_save_factory(cmd, fi);
 			}
 
