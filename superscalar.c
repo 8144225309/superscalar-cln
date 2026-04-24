@@ -7633,9 +7633,22 @@ static struct command_result *json_factory_ps_advance(struct command *cmd,
 	if (!fi->is_lsp)
 		return command_fail(cmd, LIGHTNINGD,
 			"factory-ps-advance is LSP-only");
-	if (fi->lifecycle != FACTORY_LIFECYCLE_ACTIVE)
+	/* Gate on ceremony state, not lifecycle. A just-created factory
+	 * stays in lifecycle=INIT until its funding TX confirms; PS
+	 * advance is purely off-chain so it's valid as soon as the tree
+	 * is signed (ceremony=COMPLETE) and up until close starts. */
+	if (fi->ceremony != CEREMONY_COMPLETE &&
+	    fi->ceremony != CEREMONY_ROTATE_COMPLETE &&
+	    fi->ceremony != CEREMONY_REVOKED)
 		return command_fail(cmd, LIGHTNINGD,
-			"factory not active (lifecycle=%d)", fi->lifecycle);
+			"factory not in signed state (ceremony=%d)",
+			fi->ceremony);
+	if (factory_is_closed(fi->lifecycle))
+		return command_fail(cmd, LIGHTNINGD,
+			"factory is closed (lifecycle=%d)", fi->lifecycle);
+	if (fi->rotation_in_progress)
+		return command_fail(cmd, LIGHTNINGD,
+			"factory rotation in progress — retry after completion");
 	if (ss_effective_arity(fi) != FACTORY_ARITY_PS)
 		return command_fail(cmd, LIGHTNINGD,
 			"factory arity is not ARITY_PS (got %d)",
