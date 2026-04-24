@@ -58,6 +58,42 @@ bool ss_persist_deserialize_signed_txs(void *lib_factory,
 /* Datastore key for signed distribution TX */
 void ss_persist_key_dist_tx(const factory_instance_t *fi, char *out, size_t len);
 
+/* --- Tier 2.6: PS leaf chain persistence ---
+ *
+ * Each PS leaf advance appends one entry to the chain.  Chain[0] is the
+ * initial leaf state (captured after factory_sign_all); chain[1..K] are
+ * subsequent advances.  Each entry is its own datastore key so advances
+ * don't rewrite the whole chain.
+ *
+ * Key layout:
+ *   superscalar/factories/{iid_hex}/ps_chain/{leaf_node_idx}/{chain_pos}
+ *
+ * Entry value layout:
+ *   u8[32]          txid (internal byte order)
+ *   u64 BE          chan_amount_sats
+ *   u32 BE          signed_tx_len
+ *   u8[signed_tx_len] signed_tx_bytes
+ */
+void ss_persist_key_ps_chain_entry(const factory_instance_t *fi,
+				   uint32_t leaf_node_idx,
+				   uint32_t chain_pos,
+				   char *out, size_t len);
+
+void ss_persist_key_ps_chain_prefix(const factory_instance_t *fi,
+				    char *out, size_t len);
+
+size_t ss_persist_serialize_ps_chain_entry(const uint8_t txid32[32],
+					   uint64_t chan_amount_sats,
+					   const uint8_t *signed_tx,
+					   size_t signed_tx_len,
+					   uint8_t **out);
+
+bool ss_persist_deserialize_ps_chain_entry(const uint8_t *data, size_t len,
+					   uint8_t txid_out32[32],
+					   uint64_t *chan_amount_sats_out,
+					   uint8_t **signed_tx_out,
+					   size_t *signed_tx_len_out);
+
 /* Serialize signed distribution TX (raw bytes + length) */
 size_t ss_persist_serialize_dist_tx(const factory_instance_t *fi,
                                     uint8_t **out);

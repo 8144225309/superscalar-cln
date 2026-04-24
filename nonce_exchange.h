@@ -49,6 +49,12 @@ typedef struct {
 	uint64_t funding_amount_sats;
 	uint8_t  funding_spk[34];
 	uint8_t  funding_spk_len;
+
+	/* Tier 2.6: arity policy. 0 = auto (receiver uses ss_choose_arity on
+	 * n_participants). 1/2/3 map to libsuperscalar FACTORY_ARITY_1/2/PS.
+	 * Added as an optional trailer after the funding section for backward
+	 * compat — peers that don't send it effectively request "auto". */
+	uint8_t  arity_mode;
 } nonce_bundle_t;
 
 /* Serialize nonce bundle to binary */
