@@ -1055,6 +1055,11 @@ static bool ss_leaf_advance_done_parse(const uint8_t *data, size_t len,
 	return true;
 }
 
+/* Blocks after which an in-flight PS advance is abandoned and state cleared.
+ * 3 blocks ≈ 30 min on mainnet; plenty for async PSIG/DONE round trip even
+ * across a reconnect. */
+#define PS_PENDING_TIMEOUT_BLOCKS 3
+
 /* Clear in-flight PS advance state.  Frees the secnonce, resets pending
  * leaf index.  Safe to call when nothing is pending. */
 static void ss_clear_ps_pending(factory_instance_t *fi)
@@ -1066,6 +1071,7 @@ static void ss_clear_ps_pending(factory_instance_t *fi)
 	}
 	fi->ps_pending_leaf = -1;
 	fi->ps_pending_node_idx = 0;
+	fi->ps_pending_start_block = 0;
 }
 
 /* Persist one PS leaf chain entry at its current (just-signed) state.
@@ -5556,6 +5562,7 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 		fp->ps_pending_leaf = (int32_t)leaf_side;
 		fp->ps_pending_node_idx = (uint32_t)nidx;
 		fp->ps_pending_secnonce = NULL; /* already consumed */
+		fp->ps_pending_start_block = ss_state.current_blockheight;
 
 		/* Serialize + send PSIG */
 		uint8_t my_pn_ser[66];
@@ -7739,6 +7746,7 @@ static struct command_result *json_factory_ps_advance(struct command *cmd,
 	fi->ps_pending_leaf = (int32_t)leaf_side;
 	fi->ps_pending_node_idx = (uint32_t)node_idx;
 	fi->ps_pending_secnonce = lsp_secnonce;
+	fi->ps_pending_start_block = ss_state.current_blockheight;
 
 	/* Step 5: send PROPOSE to the affected client */
 	if ((size_t)leaf_side >= fi->n_clients) {
@@ -11983,6 +11991,23 @@ static struct command_result *handle_block_added(struct command *cmd,
 		if (fi->lifecycle == FACTORY_LIFECYCLE_EXPIRED
 		    || fi->lifecycle == FACTORY_LIFECYCLE_CLOSED_EXTERNALLY)
 			continue;
+
+		/* Tier 2.6: abandon stale in-flight PS advance ceremony.
+		 * If PROPOSE was sent and PSIG never arrived within
+		 * PS_PENDING_TIMEOUT_BLOCKS, clear state so the operator
+		 * can retry. Frees the stashed secnonce. */
+		if (fi->ps_pending_leaf != -1 &&
+		    fi->ps_pending_start_block > 0 &&
+		    ss_state.current_blockheight >
+			fi->ps_pending_start_block + PS_PENDING_TIMEOUT_BLOCKS) {
+			plugin_log(plugin_handle, LOG_UNUSUAL,
+				"SS_METRIC event=ps_advance_timeout "
+				"leaf=%d started_at=%u current=%u",
+				fi->ps_pending_leaf,
+				fi->ps_pending_start_block,
+				ss_state.current_blockheight);
+			ss_clear_ps_pending(fi);
+		}
 
 		/* Phase 3c3: lazy retrofit — catch factories whose lib_factory
 		 * was constructed without fee-estimator wiring (persistence

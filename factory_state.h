@@ -346,6 +346,10 @@ typedef struct factory_instance {
 	int32_t  ps_pending_leaf;
 	uint32_t ps_pending_node_idx;
 	void    *ps_pending_secnonce;
+	uint32_t ps_pending_start_block; /* block at PROPOSE send; 0 = idle.
+					  * handle_block_added clears pending
+					  * state after PS_PENDING_TIMEOUT_BLOCKS
+					  * elapse without PSIG/DONE. */
 
 	/* Lifecycle */
 	factory_lifecycle_t lifecycle;
