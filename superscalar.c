@@ -7808,6 +7808,57 @@ static struct command_result *json_factory_force_close(struct command *cmd,
 			continue;
 		}
 
+		/* Tier 2.6: for PS leaves, broadcast chain[0..N-1] from
+		 * datastore before the factory_t's current chain[N] signed_tx.
+		 * Each chain TX spends the previous one's channel output, so
+		 * ordering matters for mempool acceptance. */
+		if (factory->nodes[ni].is_ps_leaf &&
+		    factory->nodes[ni].ps_chain_len > 0) {
+			int current_pos = factory->nodes[ni].ps_chain_len;
+			for (int cp = 0; cp < current_pos; cp++) {
+				char ps_key[192];
+				ss_persist_key_ps_chain_entry(fi,
+					(uint32_t)ni, (uint32_t)cp,
+					ps_key, sizeof(ps_key));
+				u8 *pdata = NULL;
+				const char *perr = rpc_scan_datastore_hex(
+					tmpctx, cmd, ps_key,
+					JSON_SCAN_TAL(tmpctx,
+						json_tok_bin_from_hex,
+						&pdata));
+				if (perr || !pdata) {
+					plugin_log(plugin_handle, LOG_UNUSUAL,
+						"force-close: missing PS chain[%d] "
+						"for leaf node %zu — cannot "
+						"complete chain broadcast",
+						cp, ni);
+					continue;
+				}
+				size_t plen = tal_bytelen(pdata);
+				uint8_t etxid[32];
+				uint64_t eamt;
+				uint8_t *etx = NULL;
+				size_t etx_len = 0;
+				if (!ss_persist_deserialize_ps_chain_entry(
+					pdata, plen, etxid, &eamt,
+					&etx, &etx_len) || !etx || etx_len == 0) {
+					free(etx);
+					continue;
+				}
+				char *etx_hex = tal_arr(cmd, char, etx_len * 2 + 1);
+				for (size_t h = 0; h < etx_len; h++)
+					sprintf(etx_hex + h*2, "%02x", etx[h]);
+				plugin_log(plugin_handle, LOG_INFORM,
+					"force-close: PS chain[%d] for leaf "
+					"node %zu (%zu bytes)",
+					cp, ni, etx_len);
+				ss_broadcast_factory_tx(cmd, fi, etx_hex,
+							FACTORY_TX_STATE);
+				free(etx);
+				broadcast_count++;
+			}
+		}
+
 		tx_buf_t *stx = &factory->nodes[ni].signed_tx;
 		if (!stx->data || stx->len == 0)
 			continue;
