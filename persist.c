@@ -1083,3 +1083,41 @@ bool ss_persist_deserialize_dist_tx(factory_instance_t *fi,
 
 	return true;
 }
+
+/* --- Tier B: PS double-spend defense (client_ps_signed_inputs) --- */
+
+void ss_persist_key_ps_signed_input(const factory_instance_t *fi,
+				    const uint8_t parent_txid[32],
+				    char *out, size_t len)
+{
+	char id_hex[65];
+	hex32(fi->instance_id, id_hex);
+	char tx_hex[65];
+	hex32(parent_txid, tx_hex);
+	snprintf(out, len,
+		 "superscalar/factories/%s/ps_signed_inputs/%s",
+		 id_hex, tx_hex);
+}
+
+size_t ss_persist_serialize_ps_signed_input(uint32_t parent_vout,
+					    const uint8_t sighash[32],
+					    uint8_t **out)
+{
+	uint8_t *buf = NULL;
+	size_t len = 0, cap = 0;
+	buf_u32(&buf, &len, &cap, parent_vout);
+	buf_append(&buf, &len, &cap, sighash, 32);
+	*out = buf;
+	return len;
+}
+
+bool ss_persist_deserialize_ps_signed_input(const uint8_t *data, size_t len,
+					    uint32_t *parent_vout_out,
+					    uint8_t sighash_out[32])
+{
+	const uint8_t *p = data;
+	size_t rem = len;
+	if (!read_u32(&p, &rem, parent_vout_out)) return false;
+	if (!read_bytes(&p, &rem, sighash_out, 32)) return false;
+	return true;
+}

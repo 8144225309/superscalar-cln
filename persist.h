@@ -102,4 +102,33 @@ size_t ss_persist_serialize_dist_tx(const factory_instance_t *fi,
 bool ss_persist_deserialize_dist_tx(factory_instance_t *fi,
                                     const uint8_t *data, size_t len);
 
+/* --- Tier B: PS leaf double-spend defense ---
+ *
+ * Mirrors upstream's client_ps_signed_inputs persist table (SuperScalar
+ * persist.c schema v20, see /docs/pseudo-spilman.md). For every PS leaf
+ * advance the client co-signs, we record (parent_txid, vout) -> sighash
+ * so a second-sign attempt against the same parent UTXO with a DIFFERENT
+ * sighash is detected and refused. This is the SOLE security property
+ * protecting PS leaves — DW leaves use decrementing nSequence instead and
+ * don't need this.
+ *
+ * Key layout:
+ *   superscalar/factories/{iid_hex}/ps_signed_inputs/{parent_txid_hex}
+ *
+ * Entry value layout:
+ *   u32 BE          parent_vout
+ *   u8[32]          sighash (BIP-341 key-path, SIGHASH_DEFAULT)
+ */
+void ss_persist_key_ps_signed_input(const factory_instance_t *fi,
+				    const uint8_t parent_txid[32],
+				    char *out, size_t len);
+
+size_t ss_persist_serialize_ps_signed_input(uint32_t parent_vout,
+					    const uint8_t sighash[32],
+					    uint8_t **out);
+
+bool ss_persist_deserialize_ps_signed_input(const uint8_t *data, size_t len,
+					    uint32_t *parent_vout_out,
+					    uint8_t sighash_out[32]);
+
 #endif /* SUPERSCALAR_PERSIST_H */

@@ -35,6 +35,7 @@
 #include <superscalar/adaptor.h>
 #include <superscalar/htlc_fee_bump.h>
 #include <superscalar/fee_estimator.h>
+#include <superscalar/tx_builder.h>
 #include <common/bech32.h>
 
 /* Phase 3c3: static sanity — fee_estimator_storage on factory_instance_t
@@ -6079,6 +6080,41 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 				rc, leaf_side);
 			break;
 		}
+
+		/* Tier B: PS double-spend defense (mirrors upstream
+		 * client.c:2620-2638 / client_ps_signed_inputs schema v20).
+		 * After advance, nd->ps_prev_txid holds the parent UTXO txid
+		 * the new chain element will spend. If we've previously
+		 * co-signed a TX spending that same (parent_txid, 0) — whether
+		 * a network retry or a genuine double-spend attack — refuse:
+		 * MuSig2 nonce reuse risk makes replay-based idempotency
+		 * unsafe. DW leaves are protected by decrementing nSequence
+		 * and don't need this check; we only run it for PS leaves
+		 * with chain_len > 0 (chain[0] has no prior parent to defend
+		 * against). */
+		if (nd->is_ps_leaf && nd->ps_chain_len > 0) {
+			char psinp_key[256];
+			ss_persist_key_ps_signed_input(fp,
+				nd->ps_prev_txid, psinp_key, sizeof(psinp_key));
+			u8 *prior = NULL;
+			const char *err = rpc_scan_datastore_hex(tmpctx, cmd,
+				psinp_key,
+				JSON_SCAN_TAL(tmpctx,
+					json_tok_bin_from_hex, &prior));
+			if (!err && prior && tal_bytelen(prior) >= 36) {
+				char hex[65];
+				for (int i = 0; i < 32; i++)
+					sprintf(hex + 2*i, "%02x",
+						nd->ps_prev_txid[i]);
+				plugin_log(plugin_handle, LOG_BROKEN,
+					"REFUSING PS double-spend on leaf %u — "
+					"already co-signed a TX spending "
+					"(%s:0); not signing a second one.",
+					leaf_side, hex);
+				break;
+			}
+		}
+
 		if (!factory_session_init_node(cf, nidx)) break;
 		int my_slot = factory_find_signer_slot(cf, nidx,
 			(uint32_t)fp->our_participant_idx);
@@ -6153,6 +6189,42 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 		uint8_t my_psig_ser[32];
 		musig_partial_sig_serialize(global_secp_ctx,
 						      my_psig_ser, &my_psig);
+
+		/* Tier B: persist the PS signed-input row BEFORE wire send.
+		 * A crash between persist and send is safe — restart will see
+		 * the row and refuse to sign anew, leaving the LSP to retry
+		 * with the existing psig from a future reply. Persisting AFTER
+		 * the send risks a window where we've sent a psig that no
+		 * longer matches our local state machine. */
+		if (nd->is_ps_leaf && nd->ps_chain_len > 0) {
+			uint8_t sighash[32];
+			if (compute_taproot_sighash(sighash,
+					nd->unsigned_tx.data,
+					nd->unsigned_tx.len,
+					0,
+					nd->spending_spk,
+					nd->spending_spk_len,
+					nd->ps_prev_chan_amount,
+					nd->nsequence)) {
+				char psinp_key[256];
+				ss_persist_key_ps_signed_input(fp,
+					nd->ps_prev_txid,
+					psinp_key, sizeof(psinp_key));
+				uint8_t *psinp_buf = NULL;
+				size_t psinp_len =
+					ss_persist_serialize_ps_signed_input(
+						0, sighash, &psinp_buf);
+				if (psinp_len > 0 && psinp_buf) {
+					jsonrpc_set_datastore_binary(cmd,
+						psinp_key, psinp_buf,
+						psinp_len,
+						"create-or-replace",
+						rpc_done, rpc_err, fp);
+					free(psinp_buf);
+				}
+			}
+		}
+
 		uint8_t payload[134];
 		size_t plen = ss_leaf_advance_psig_build(payload,
 			sizeof(payload), fp->instance_id, leaf_side,
