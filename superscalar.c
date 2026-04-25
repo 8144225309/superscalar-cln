@@ -1888,6 +1888,23 @@ static void ss_load_factories(struct command *cmd)
 					continue;
 				}
 
+				/* Task #97: re-derive fi->our_seckey from
+				 * (instance_id, our_participant_idx). The
+				 * seckey is intentionally NOT persisted in
+				 * meta — it's regenerable from the HSM-
+				 * derived factory key + our slot. Pre-#97 it
+				 * stayed zero after restart, breaking any RPC
+				 * that called secp256k1_ec_pubkey_create on
+				 * fi->our_seckey (factory-buy-liquidity, the
+				 * coop close path, etc.). Discovered during
+				 * the Tier 2.6 signet deploy — all old
+				 * factories on the VPS were silently
+				 * unsignable until the next live ceremony
+				 * write set it again. */
+				derive_factory_seckey(fi->our_seckey,
+						      fi->instance_id,
+						      fi->our_participant_idx);
+
 				/* Load channel mappings */
 				char ch_path[128];
 				snprintf(ch_path, sizeof(ch_path),
