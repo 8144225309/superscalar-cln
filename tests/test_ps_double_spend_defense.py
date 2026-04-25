@@ -105,8 +105,21 @@ def test_replay_attempt_is_refused(ss_node_factory):
     chain[2] PROPOSE.
 
     Note: chain[2]'s parent IS chain[1].txid. We pre-populate that row
-    BEFORE running the second advance so the check fires."""
-    lsp, client, iid = _setup_arity_ps(ss_node_factory)
+    BEFORE running the second advance so the check fires.
+
+    The client node allows the LOG_BROKEN refusal line via broken_log;
+    that's the very signal we're testing for, so pyln-testing's default
+    "no broken messages" policy doesn't apply to it."""
+    lsp, client = ss_node_factory.get_nodes(
+        2,
+        opts=[{}, {"broken_log": "REFUSING PS double-spend"}])
+    lsp.fundwallet(10_000_000)
+    lsp.connect(client)
+    iid = create_two_party_factory(lsp, client,
+                                   funding_sats=200_000,
+                                   timeout=60.0,
+                                   arity_mode="arity_ps")
+    wait_for_ceremony_complete(lsp, iid, timeout=120.0)
     nidx = _leaf_node_idx(lsp, iid)
 
     # First advance: chain[0] -> chain[1]. Defense doesn't fire here
