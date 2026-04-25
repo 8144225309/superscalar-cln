@@ -6808,19 +6808,65 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 			break;
 		}
 		factory_instance_t *fp = ss_factory_find(&ss_state, iid);
-		if (!fp || fp->is_lsp || !fp->ps_pending_is_realloc ||
-		    fp->ps_pending_leaf != (int32_t)leaf_side ||
-		    !fp->ps_pending_secnonce)
+		if (!fp) {
+			plugin_log(plugin_handle, LOG_UNUSUAL,
+				"REALLOC_ALL_NONCES: factory not found");
 			break;
+		}
+		if (fp->is_lsp) {
+			plugin_log(plugin_handle, LOG_UNUSUAL,
+				"REALLOC_ALL_NONCES: dropped — we're the LSP");
+			break;
+		}
+		if (!fp->ps_pending_is_realloc) {
+			plugin_log(plugin_handle, LOG_UNUSUAL,
+				"REALLOC_ALL_NONCES: ps_pending_is_realloc=0 "
+				"(no PROPOSE was processed for this leaf)");
+			break;
+		}
+		if (fp->ps_pending_leaf != (int32_t)leaf_side) {
+			plugin_log(plugin_handle, LOG_UNUSUAL,
+				"REALLOC_ALL_NONCES: leaf mismatch — "
+				"pending=%d incoming=%u",
+				fp->ps_pending_leaf, leaf_side);
+			break;
+		}
+		if (!fp->ps_pending_secnonce) {
+			plugin_log(plugin_handle, LOG_UNUSUAL,
+				"REALLOC_ALL_NONCES: secnonce missing — "
+				"PROPOSE didn't stash one");
+			break;
+		}
 		factory_t *cf = (factory_t *)fp->lib_factory;
-		if (!cf) break;
+		if (!cf) {
+			plugin_log(plugin_handle, LOG_UNUSUAL,
+				"REALLOC_ALL_NONCES: lib_factory NULL");
+			break;
+		}
 		size_t nidx = fp->ps_pending_node_idx;
 		factory_node_t *nd = &cf->nodes[nidx];
-		if (nd->n_signers != 3) break;
+		if (nd->n_signers != 3) {
+			plugin_log(plugin_handle, LOG_UNUSUAL,
+				"REALLOC_ALL_NONCES: node %zu has n_signers=%zu, "
+				"expected 3",
+				nidx, nd->n_signers);
+			break;
+		}
 
 		int my_slot = factory_find_signer_slot(cf, nidx,
 			(uint32_t)fp->our_participant_idx);
-		if (my_slot < 0) break;
+		if (my_slot < 0) {
+			plugin_log(plugin_handle, LOG_UNUSUAL,
+				"REALLOC_ALL_NONCES: our pidx=%d not in node %zu's "
+				"signer set",
+				fp->our_participant_idx, nidx);
+			break;
+		}
+
+		plugin_log(plugin_handle, LOG_INFORM,
+			"SS_METRIC event=realloc_all_nonces_recv leaf=%u "
+			"my_slot=%d",
+			leaf_side, my_slot);
 
 		/* Set the OTHER signers' nonces; our own is already set from
 		 * the PROPOSE handler. We re-set defensively in case the
@@ -6829,12 +6875,27 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 			secp256k1_musig_pubnonce pn_obj;
 			if (!musig_pubnonce_parse(global_secp_ctx, &pn_obj,
 						  nonces[s])) {
+				plugin_log(plugin_handle, LOG_UNUSUAL,
+					"REALLOC_ALL_NONCES: pubnonce[%zu] "
+					"failed to parse",
+					s);
 				ss_clear_ps_pending(fp); goto realloc_all_nonces_done;
 			}
-			factory_session_set_nonce(cf, nidx, s, &pn_obj);
+			if (!factory_session_set_nonce(cf, nidx, s, &pn_obj)) {
+				plugin_log(plugin_handle, LOG_UNUSUAL,
+					"REALLOC_ALL_NONCES: set_nonce slot=%zu "
+					"rejected",
+					s);
+				ss_clear_ps_pending(fp);
+				goto realloc_all_nonces_done;
+			}
 		}
 
 		if (!factory_session_finalize_node(cf, nidx)) {
+			plugin_log(plugin_handle, LOG_UNUSUAL,
+				"REALLOC_ALL_NONCES: factory_session_finalize_node "
+				"failed (nidx=%zu)",
+				nidx);
 			ss_clear_ps_pending(fp); break;
 		}
 
@@ -6842,18 +6903,27 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 		secp256k1_keypair my_kp;
 		if (!secp256k1_keypair_create(global_secp_ctx, &my_kp,
 					      fp->our_seckey)) {
+			plugin_log(plugin_handle, LOG_UNUSUAL,
+				"REALLOC_ALL_NONCES: keypair_create failed");
 			ss_clear_ps_pending(fp); break;
 		}
 		secp256k1_musig_partial_sig my_psig;
 		if (!musig_create_partial_sig(global_secp_ctx, &my_psig,
 			(secp256k1_musig_secnonce *)fp->ps_pending_secnonce,
 			&my_kp, &nd->signing_session)) {
+			plugin_log(plugin_handle, LOG_UNUSUAL,
+				"REALLOC_ALL_NONCES: musig_create_partial_sig "
+				"failed");
 			ss_clear_ps_pending(fp); break;
 		}
 		free(fp->ps_pending_secnonce);
 		fp->ps_pending_secnonce = NULL;
 		if (!factory_session_set_partial_sig(cf, nidx,
 			(size_t)my_slot, &my_psig)) {
+			plugin_log(plugin_handle, LOG_UNUSUAL,
+				"REALLOC_ALL_NONCES: set_partial_sig slot=%d "
+				"rejected",
+				my_slot);
 			ss_clear_ps_pending(fp); break;
 		}
 
