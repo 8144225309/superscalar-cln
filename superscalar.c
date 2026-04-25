@@ -6963,11 +6963,12 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 			fp->realloc_psigs[my_slot], &my_psig);
 		fp->realloc_has_psig[my_slot] = 1;
 
-		/* Send PSIG_3 to LSP. */
+		/* Send PSIG_3 to LSP. fp->realloc_pubnonces[my_slot] already
+		 * holds our serialized pubnonce (stashed by the PROPOSE
+		 * handler), so just memcpy — calling musig_pubnonce_serialize
+		 * with a zeroed compound literal would crash inside
+		 * secp256k1_musig_pubnonce_load (no magic prefix). */
 		uint8_t my_pn_ser[66];
-		musig_pubnonce_serialize(global_secp_ctx, my_pn_ser,
-					 &(secp256k1_musig_pubnonce){0});
-		/* Re-use stashed pubnonce we set above. */
 		memcpy(my_pn_ser, fp->realloc_pubnonces[my_slot], 66);
 		uint8_t payload[134];
 		size_t plen = ss_leaf_realloc_psig3_build(
