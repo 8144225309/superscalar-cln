@@ -6792,6 +6792,23 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 		plugin_log(plugin_handle, LOG_INFORM,
 			"SS_METRIC event=realloc_all_nonces_sent leaf=%u",
 			leaf_side);
+
+		/* Finalize the LSP's session now that all 3 pubnonces are
+		 * pushed. factory_session_set_partial_sig (called in PSIG_3)
+		 * verifies psigs against the agg-nonce computed by finalize,
+		 * and musig_create_partial_sig (called when both client psigs
+		 * are in) reads the same finalized state. Without this call
+		 * both operations silently fail. The 2-of-2 path finalizes
+		 * inline in PSIG; we have to do it earlier here because
+		 * PSIG_3 is per-client and either client's psig may arrive
+		 * first. */
+		if (!factory_session_finalize_node(lf, nidx)) {
+			plugin_log(plugin_handle, LOG_UNUSUAL,
+				"REALLOC_NONCE: LSP finalize_node failed "
+				"(nidx=%zu) — clearing pending",
+				nidx);
+			ss_clear_ps_pending(fp);
+		}
 		break;
 	}
 
@@ -6868,9 +6885,22 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 			"my_slot=%d",
 			leaf_side, my_slot);
 
-		/* Set the OTHER signers' nonces; our own is already set from
-		 * the PROPOSE handler. We re-set defensively in case the
-		 * session state was lost somewhere. */
+		/* PROPOSE already pushed two nonces (LSP's + ours), so the
+		 * session's nonces_collected counter is at 2. set_pubnonce
+		 * unconditionally increments that counter, so re-setting all
+		 * 3 slots here would bring it to 5 and trip the strict
+		 * equality check inside musig_session_finalize_nonces.
+		 * factory_session_init_node memsets the session, restoring
+		 * nonces_collected=0; we then set all 3 to reach exactly 3.
+		 * Our stashed secnonce lives on fp->ps_pending_secnonce, not
+		 * on the session struct, so the re-init is safe. */
+		if (!factory_session_init_node(cf, nidx)) {
+			plugin_log(plugin_handle, LOG_UNUSUAL,
+				"REALLOC_ALL_NONCES: factory_session_init_node "
+				"failed (nidx=%zu)",
+				nidx);
+			ss_clear_ps_pending(fp); break;
+		}
 		for (size_t s = 0; s < 3; s++) {
 			secp256k1_musig_pubnonce pn_obj;
 			if (!musig_pubnonce_parse(global_secp_ctx, &pn_obj,
@@ -6993,11 +7023,21 @@ realloc_all_nonces_done:
 
 		secp256k1_musig_partial_sig their_psig_obj;
 		if (!musig_partial_sig_parse(global_secp_ctx, &their_psig_obj,
-					     cli_psig_ser))
+					     cli_psig_ser)) {
+			plugin_log(plugin_handle, LOG_UNUSUAL,
+				"REALLOC_PSIG_3: psig from slot=%d failed to parse",
+				their_slot);
 			break;
+		}
 		if (!factory_session_set_partial_sig(lf, nidx,
-			(size_t)their_slot, &their_psig_obj))
+			(size_t)their_slot, &their_psig_obj)) {
+			plugin_log(plugin_handle, LOG_UNUSUAL,
+				"REALLOC_PSIG_3: set_partial_sig slot=%d rejected "
+				"(usually means session not finalized or psig "
+				"verify failed)",
+				their_slot);
 			break;
+		}
 		memcpy(fp->realloc_psigs[their_slot], cli_psig_ser, 32);
 		fp->realloc_has_psig[their_slot] = 1;
 
@@ -7012,17 +7052,23 @@ realloc_all_nonces_done:
 		/* Both client psigs received. Create LSP own psig, set on
 		 * session, complete the node. */
 		if (!fp->ps_pending_secnonce) {
+			plugin_log(plugin_handle, LOG_UNUSUAL,
+				"REALLOC_PSIG_3: LSP secnonce missing");
 			ss_clear_ps_pending(fp); break;
 		}
 		secp256k1_keypair lsp_kp;
 		if (!secp256k1_keypair_create(global_secp_ctx, &lsp_kp,
 					      fp->our_seckey)) {
+			plugin_log(plugin_handle, LOG_UNUSUAL,
+				"REALLOC_PSIG_3: keypair_create failed");
 			ss_clear_ps_pending(fp); break;
 		}
 		secp256k1_musig_partial_sig lsp_psig;
 		if (!musig_create_partial_sig(global_secp_ctx, &lsp_psig,
 			(secp256k1_musig_secnonce *)fp->ps_pending_secnonce,
 			&lsp_kp, &nd->signing_session)) {
+			plugin_log(plugin_handle, LOG_UNUSUAL,
+				"REALLOC_PSIG_3: LSP create_partial_sig failed");
 			ss_clear_ps_pending(fp); break;
 		}
 		free(fp->ps_pending_secnonce);
@@ -7031,9 +7077,14 @@ realloc_all_nonces_done:
 			fp->realloc_psigs[0], &lsp_psig);
 		fp->realloc_has_psig[0] = 1;
 		if (!factory_session_set_partial_sig(lf, nidx, 0, &lsp_psig)) {
+			plugin_log(plugin_handle, LOG_UNUSUAL,
+				"REALLOC_PSIG_3: LSP set_partial_sig slot=0 rejected");
 			ss_clear_ps_pending(fp); break;
 		}
 		if (!factory_session_complete_node(lf, nidx)) {
+			plugin_log(plugin_handle, LOG_UNUSUAL,
+				"REALLOC_PSIG_3: complete_node failed (nidx=%zu)",
+				nidx);
 			ss_clear_ps_pending(fp); break;
 		}
 
