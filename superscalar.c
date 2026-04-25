@@ -6423,8 +6423,11 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 			musig_pubnonce_serialize(global_secp_ctx,
 				fp->realloc_pubnonces[my_slot], &my_pn);
 			fp->realloc_has_pubnonce[my_slot] = 1;
-			musig_pubnonce_serialize(global_secp_ctx,
-				fp->realloc_pubnonces[lsp_slot], lsp_pn);
+			/* lsp_pn is already serialized 66 bytes — memcpy, not
+			 * musig_pubnonce_serialize (which would reinterpret
+			 * the buffer as a parsed-pubnonce struct pointer and
+			 * crash inside secp256k1). */
+			memcpy(fp->realloc_pubnonces[lsp_slot], lsp_pn, 66);
 			fp->realloc_has_pubnonce[lsp_slot] = 1;
 
 			/* Send REALLOC_NONCE (own pubnonce) to LSP. */
