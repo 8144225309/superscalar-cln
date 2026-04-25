@@ -1,28 +1,33 @@
-"""Follow-up #4 impl (#92): factory-buy-liquidity re-sign ceremony.
+"""factory-buy-liquidity arity restriction (matches upstream).
 
-Before this change, factory-buy-liquidity updated leaf amounts in memory
-but the explicit TODO at superscalar.c:13207 left re-signing to "the next
-rotation." The leaf TX was therefore signed with the OLD amounts — clients
-couldn't unilaterally exit with the new balance until rotation picked it up.
+Per /root/SuperScalar/src/lsp_channels.c:1962, upstream's
+lsp_channels_buy_liquidity rejects every leaf_arity that isn't
+FACTORY_ARITY_2:
 
-The new LEAF_REALLOC ceremony (PROPOSE / PSIG / DONE via submsgs
-0x0134-0x0136) re-signs the leaf state with new amounts immediately:
-LSP shifts L-stock to client channel, sends new amounts to client, 2-of-2
-MuSig2 finishes. Both sides end up with a freshly signed leaf TX.
+    if (f->leaf_arity != FACTORY_ARITY_2) {
+        fprintf(stderr, "buy_liquidity: only supported for arity-2\n");
+        return 0;
+    }
 
-These tests exercise the happy path on an ARITY_PS factory (1 client per
-leaf = 2-of-2 signing). ARITY_2 requires a 3-of-3 ceremony (task #93).
+The plugin previously allowed buy-liquidity on ARITY_PS chain[0] (and
+implicitly ARITY_1) — design-divergent from upstream. ARITY_PS leaves
+have no chain-level invalidation for a chain[0] re-sign (TX chaining
+needs a unique parent_txid+vout, which a re-sign violates), and ARITY_1
+is a degenerate 1-client case upstream simply doesn't implement.
+
+These tests pin the new behavior: the RPC rejects ARITY_PS and ARITY_1
+factories with a clear error pointing at factory rotation as the
+recovery path. The ARITY_2 happy-path test lives at signet level until
+a 3-node ceremony helper exists in pyln-testing.
 """
 from __future__ import annotations
 
-import time
 import pytest
 from pyln.client import RpcError
 
 from conftest import (
     create_two_party_factory,
     wait_for_ceremony_complete,
-    datastore_has,
 )
 
 
@@ -39,105 +44,42 @@ def _setup_factory(ss_node_factory, arity_mode="arity_ps",
     return lsp, client, iid
 
 
-def _wait_metric(node, pattern, timeout=15.0):
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        if node.daemon.is_in_log(pattern):
-            return True
-        time.sleep(0.2)
-    raise AssertionError(f"log pattern {pattern!r} not seen within {timeout}s")
+def test_buy_liquidity_rejects_arity_ps(ss_node_factory):
+    """ARITY_PS factories should refuse buy-liquidity — TX chaining
+    cannot invalidate a chain[0] re-sign because both old and new
+    chain[0] would spend the same parent UTXO with the same nSequence."""
+    lsp, _client, iid = _setup_factory(ss_node_factory,
+                                       arity_mode="arity_ps")
 
-
-def test_buy_liquidity_ps_chain0_happy_path(ss_node_factory):
-    """Create ARITY_PS factory, call factory-buy-liquidity for client 0.
-    Assert the full REALLOC ceremony fires and amounts are re-signed."""
-    lsp, client, iid = _setup_factory(ss_node_factory,
-                                      arity_mode="arity_ps")
-
-    r = lsp.rpc.call("factory-buy-liquidity", {
-        "instance_id": iid,
-        "client_idx": 0,
-        "amount_sats": 10_000,
-    })
-    assert r["status"] == "realloc_proposed"
-    assert r["amount_sats"] == 10_000
-    assert r["leaf_side"] == 0
-    assert r["client_idx"] == 0
-
-    # LSP fires propose metric
-    _wait_metric(lsp,
-        r"SS_METRIC event=realloc_propose .* leaf=0 client=0 amount=10000")
-    # Client fires psig-sent metric
-    _wait_metric(client, r"SS_METRIC event=realloc_psig_sent leaf=0")
-    # LSP fires complete metric
-    _wait_metric(lsp, r"SS_METRIC event=realloc_complete .* leaf=0")
-    # Client fires client-done metric
-    _wait_metric(client, r"SS_METRIC event=realloc_client_done leaf=0")
-
-
-def test_buy_liquidity_rejects_after_ps_advance(ss_node_factory):
-    """After any PS chain advance, chain[N>=1] has only 1 output (no L-stock).
-    factory-buy-liquidity should reject with a clean error pointing at
-    factory rotation as the recovery path."""
-    lsp, client, iid = _setup_factory(ss_node_factory,
-                                      arity_mode="arity_ps")
-
-    # Advance once so chain_len goes 0 -> 1
-    lsp.rpc.call("factory-ps-advance",
-                 {"instance_id": iid, "leaf_side": 0})
-    _wait_metric(lsp, r"SS_METRIC event=ps_advance .* leaf=0 chain_pos=1")
-
-    with pytest.raises(RpcError, match="already advanced past chain"):
+    with pytest.raises(RpcError, match="only supported on ARITY_2"):
         lsp.rpc.call("factory-buy-liquidity", {
             "instance_id": iid,
             "client_idx": 0,
-            "amount_sats": 1_000,
+            "amount_sats": 10_000,
         })
 
 
-"""ARITY_2 rejection test removed — exercising the rejection requires a
-3-client factory (3-of-3 leaf signers); a 2-party factory with arity_mode
-forced to "arity_2" fails upstream tree construction (factory_build_tree
-returns failure) before the buy-liquidity check can fire. Re-add this
-test under tests/test_buy_liquidity_arity2.py once a 3-node ceremony
-helper exists. The C-side rejection at superscalar.c (FACTORY_ARITY_2
-branch in json_factory_buy_liquidity) returns
-'factory-buy-liquidity re-sign not yet implemented for ARITY_2 (3-of-3
-ceremony) — use ARITY_1 or ARITY_PS' and is verified by code review for
-now."""
+def test_buy_liquidity_rejects_arity_1(ss_node_factory):
+    """ARITY_1 (single-client per leaf, 2-of-2 DW) is also rejected by
+    upstream — "buying liquidity from yourself" on a leaf with one client
+    is degenerate. Operators wanting more inbound on an ARITY_1 leaf
+    should rotate the factory with new initial amounts."""
+    lsp, _client, iid = _setup_factory(ss_node_factory,
+                                       arity_mode="arity_1")
 
-
-def test_buy_liquidity_rejects_concurrent_advance(ss_node_factory):
-    """If a PS advance is already in flight on the same factory, buy-liquidity
-    should refuse cleanly rather than corrupt state."""
-    import subprocess  # noqa: F401  (placeholder — we don't actually race)
-    # Can't easily race two RPCs from here; this test documents the guard
-    # exists by triggering it via a synthetic back-to-back call. The second
-    # call races against the first's PROPOSE->PSIG round trip; if the first
-    # has already cleared pending state, the second succeeds (no error).
-    # So this is a loose assertion: we just confirm the error path is wired
-    # by exercising fi->ps_pending_leaf != -1 via ps-advance first.
-    lsp, client, iid = _setup_factory(ss_node_factory,
-                                      arity_mode="arity_ps")
-
-    # Kick off a PS advance but don't wait for it to complete. The pending
-    # state is set synchronously inside json_factory_ps_advance before
-    # the RPC returns.
-    lsp.rpc.call("factory-ps-advance",
-                 {"instance_id": iid, "leaf_side": 0})
-    # Immediately try buy-liquidity — race: may hit pending guard, may not,
-    # depending on how fast the ceremony completes. Either outcome is OK
-    # — we just exercise the code path without asserting the race
-    # outcome deterministically.
-    try:
+    with pytest.raises(RpcError, match="only supported on ARITY_2"):
         lsp.rpc.call("factory-buy-liquidity", {
             "instance_id": iid,
             "client_idx": 0,
-            "amount_sats": 1_000,
+            "amount_sats": 10_000,
         })
-    except RpcError as e:
-        # If we hit the guard, confirm the message is reasonable.
-        msg = str(e)
-        assert ("another leaf ceremony in flight" in msg or
-                "already advanced past chain" in msg), (
-            f"unexpected error: {msg}")
+
+
+# ARITY_2 happy-path verification lives at signet level — the upstream
+# tree builder rejects a 1-client+arity_2 factory before the RPC can
+# fire, and pyln-testing has no 3-node ceremony helper. The signet
+# evidence is recorded in the conversation around tasks #98/#99/#100,
+# end-to-end metrics:
+#   LSP:         realloc_propose → nonce_recv ×2 → all_nonces_sent →
+#                psig3_recv ×2 → realloc_complete
+#   each client: nonce_sent → all_nonces_recv → psig3_sent → client_done

@@ -6398,6 +6398,30 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 			break;
 		}
 
+		/* Mirror the LSP's DW state advance. The LSP called
+		 * factory_advance_leaf_unsigned in json_factory_buy_liquidity
+		 * before set_leaf_amounts; we have to do the same so both
+		 * sides' leaf nodes are at the same per-leaf DW counter and
+		 * therefore produce identical unsigned TX bytes (same
+		 * nSequence) — without this, the sighashes would diverge and
+		 * MuSig2 finalize would reject the LSP's nonce contribution.
+		 *
+		 * If the advance returns -1 (root layer also advanced), the
+		 * LSP's view requires a full factory re-sign — we can't
+		 * piggyback that on a leaf-realloc ceremony, so abort. */
+		{
+			int adv_rc = factory_advance_leaf_unsigned(
+				cf, (int)leaf_side);
+			if (adv_rc <= 0) {
+				plugin_log(plugin_handle, LOG_UNUSUAL,
+					"LEAF_REALLOC_PROPOSE: client "
+					"advance_leaf_unsigned rc=%d on leaf "
+					"%u — aborting realloc",
+					adv_rc, leaf_side);
+				break;
+			}
+		}
+
 		/* Mirror the LSP's amount change on our local factory_t.
 		 * set_leaf_amounts enforces sum-conservation and rebuilds
 		 * the unsigned TX. */
@@ -14484,6 +14508,26 @@ static struct command_result *json_factory_buy_liquidity(struct command *cmd,
 	if (!factory)
 		return command_fail(cmd, LIGHTNINGD, "No lib_factory");
 
+	/* Match upstream lsp_channels_buy_liquidity (lsp_channels.c:1962):
+	 * the operation is only defined for ARITY_2 (3-of-3 DW) leaves.
+	 *   - ARITY_PS: re-signing chain[0] with new amounts has no
+	 *     chain-level invalidation of the old chain[0] (TX chaining
+	 *     needs a unique parent_txid+vout, which a re-sign violates).
+	 *     PS users wanting more inbound capacity should rotate the
+	 *     factory.
+	 *   - ARITY_1: 2-of-2 single-client leaf, "buying liquidity from
+	 *     yourself" — degenerate; upstream doesn't implement it. */
+	factory_arity_t eff = ss_effective_arity(fi);
+	if (eff != FACTORY_ARITY_2)
+		return command_fail(cmd, LIGHTNINGD,
+			"factory-buy-liquidity is only supported on ARITY_2 "
+			"factories (got %s) — upstream lsp_channels_buy_liquidity "
+			"matches this restriction. Rotate the factory if you "
+			"need to redistribute liquidity on other arities.",
+			eff == FACTORY_ARITY_PS ? "arity_ps"
+			: eff == FACTORY_ARITY_1 ? "arity_1"
+			: "auto");
+
 	/* Find which leaf this client is on */
 	int leaf_node = factory_find_leaf_for_client(factory,
 						      *client_idx + 1);
@@ -14503,7 +14547,40 @@ static struct command_result *json_factory_buy_liquidity(struct command *cmd,
 	if (leaf_side < 0)
 		return command_fail(cmd, LIGHTNINGD, "Leaf side not found");
 
-	/* Read current amounts from the leaf node */
+	/* Concurrency guard — must run before factory_advance_leaf_unsigned
+	 * (which mutates DW state) so a failed concurrent ceremony doesn't
+	 * leave the per-leaf counter desynced from the client. */
+	if (fi->ps_pending_leaf != -1)
+		return command_fail(cmd, LIGHTNINGD,
+			"another leaf ceremony in flight on leaf %d — retry later",
+			fi->ps_pending_leaf);
+	if (fi->rotation_in_progress)
+		return command_fail(cmd, LIGHTNINGD,
+			"factory rotation in progress — retry after completion");
+
+	/* Step 1: advance the per-leaf DW counter. Mirrors upstream
+	 * lsp_realloc_leaf step 1 (lsp_channels.c:1722). The advance is
+	 * what makes the new state safer than the old: under DW the new
+	 * state has a smaller nSequence, so any broadcast race resolves
+	 * in favor of the newer state. Without this call, old + new leaf
+	 * TXs share the same nSequence and the LSP could rebroadcast the
+	 * old signed leaf to recover the moved sats. */
+	int adv_rc = factory_advance_leaf_unsigned(factory, leaf_side);
+	if (adv_rc == 0)
+		return command_fail(cmd, LIGHTNINGD,
+			"DW counter exhausted on leaf %d — rotate the factory "
+			"before further reallocations", leaf_side);
+	if (adv_rc == -1)
+		return command_fail(cmd, LIGHTNINGD,
+			"DW counter exhausted on leaf %d — root layer also "
+			"advanced; full factory re-sign required, rotate first",
+			leaf_side);
+
+	/* Read current amounts from the leaf node AFTER the advance —
+	 * factory_advance_leaf_unsigned calls update_l_stock_for_leaf which
+	 * may rewrite the L-stock output to reflect the new epoch's secret
+	 * commitments. We want to redistribute starting from the post-
+	 * advance amounts. */
 	factory_node_t *ln = &factory->nodes[leaf_node];
 	size_t n_out = ln->n_outputs;
 	uint64_t *new_amts = calloc(n_out, sizeof(uint64_t));
@@ -14562,32 +14639,9 @@ static struct command_result *json_factory_buy_liquidity(struct command *cmd,
 		   "to client %u on leaf %d — starting re-sign ceremony",
 		   *amount_sats, *client_idx, leaf_side);
 
-	/* Follow-up #4 impl: trigger LEAF_REALLOC ceremony to sign the
-	 * modified leaf state. Without this the reallocation is ceremonial
-	 * (in-memory) only — bitcoind wouldn't accept the on-chain TX. */
-
-	/* Concurrency guard: reuse the PS advance pending-state slot — a
-	 * realloc ceremony blocks simultaneous advances and vice versa. */
-	if (fi->ps_pending_leaf != -1)
-		return command_fail(cmd, LIGHTNINGD,
-			"another leaf ceremony in flight on leaf %d — retry later",
-			fi->ps_pending_leaf);
-	if (fi->rotation_in_progress)
-		return command_fail(cmd, LIGHTNINGD,
-			"factory rotation in progress — retry after completion");
-
-	/* Task #93: ARITY_2 leaves have 3 signers (LSP + 2 clients) and
-	 * require an extra nonce-relay round. The flow forks below;
-	 * ARITY_PS / ARITY_1 stay on the existing 2-of-2 path. */
-	factory_arity_t eff = ss_effective_arity(fi);
-
-	/* PS-specific: only chain[0] has an L-stock output. After any PS
-	 * advance chain[N>=1] has only the channel output, so value transfer
-	 * is impossible at the chain layer. */
-	if (eff == FACTORY_ARITY_PS && ln->ps_chain_len > 0)
-		return command_fail(cmd, LIGHTNINGD,
-			"PS leaf %d already advanced past chain[0] — no L-stock "
-			"to draw from. Rotate the factory first.", leaf_side);
+	/* Trigger LEAF_REALLOC ceremony to sign the modified leaf state.
+	 * Without this the reallocation is ceremonial (in-memory) only —
+	 * bitcoind wouldn't accept the on-chain TX. */
 
 	/* Init signing session for the modified leaf node. Must happen AFTER
 	 * factory_set_leaf_amounts because set_leaf_amounts rebuilds the
@@ -14639,24 +14693,22 @@ static struct command_result *json_factory_buy_liquidity(struct command *cmd,
 	fi->ps_pending_start_block = ss_state.current_blockheight;
 	fi->ps_pending_is_realloc = 1;
 
-	/* Task #93: for ARITY_2 (3-of-3), populate the realloc scratch space
-	 * so the NONCE / ALL_NONCES / PSIG_3 handlers can collect peer state. */
-	if (eff == FACTORY_ARITY_2) {
-		uint32_t two_clients[2];
-		size_t got = factory_get_subtree_clients(factory,
-			(int)node_idx, two_clients, 2);
-		if (got != 2) {
-			ss_clear_ps_pending(fi);
-			return command_fail(cmd, LIGHTNINGD,
-				"ARITY_2 leaf has %zu clients (expected 2)",
-				got);
-		}
-		fi->realloc_subtree_clients[0] = two_clients[0];
-		fi->realloc_subtree_clients[1] = two_clients[1];
-		/* Stash the LSP's own pubnonce in slot order. */
-		memcpy(fi->realloc_pubnonces[lsp_slot], lsp_pubnonce_ser, 66);
-		fi->realloc_has_pubnonce[lsp_slot] = 1;
+	/* Populate the realloc scratch space so the NONCE / ALL_NONCES /
+	 * PSIG_3 handlers can collect peer state. ARITY_2 is the only
+	 * arity allowed past the top-level guard. */
+	uint32_t two_clients[2];
+	size_t got = factory_get_subtree_clients(factory,
+		(int)node_idx, two_clients, 2);
+	if (got != 2) {
+		ss_clear_ps_pending(fi);
+		return command_fail(cmd, LIGHTNINGD,
+			"ARITY_2 leaf has %zu clients (expected 2)", got);
 	}
+	fi->realloc_subtree_clients[0] = two_clients[0];
+	fi->realloc_subtree_clients[1] = two_clients[1];
+	/* Stash the LSP's own pubnonce in slot order. */
+	memcpy(fi->realloc_pubnonces[lsp_slot], lsp_pubnonce_ser, 66);
+	fi->realloc_has_pubnonce[lsp_slot] = 1;
 
 	uint8_t payload[32 + 4 + 2 + SS_LEAF_REALLOC_PROPOSE_MAX_OUTPUTS * 8 + 66];
 	size_t plen = ss_leaf_realloc_propose_build(payload, sizeof(payload),
@@ -14668,58 +14720,36 @@ static struct command_result *json_factory_buy_liquidity(struct command *cmd,
 			"REALLOC_PROPOSE build failed");
 	}
 
-	/* Send PROPOSE to the right set of clients depending on arity. */
+	/* Send PROPOSE to both clients on this leaf. realloc_subtree_clients
+	 * holds factory-wide participant_idx values (1..N). fi->clients[]
+	 * is 0-indexed, so participant_idx i maps to fi->clients[i-1]. */
 	char iid_hex[65];
 	for (int j = 0; j < 32; j++)
 		sprintf(iid_hex + j*2, "%02x", fi->instance_id[j]);
 	iid_hex[64] = '\0';
 
-	if (eff == FACTORY_ARITY_2) {
-		/* 3-of-3: send to both clients on this leaf. realloc_subtree_clients
-		 * holds factory-wide participant_idx values (1..N). fi->clients[]
-		 * is 0-indexed, so participant_idx i maps to fi->clients[i-1]. */
-		for (int i = 0; i < 2; i++) {
-			uint32_t pi = fi->realloc_subtree_clients[i];
-			if (pi == 0 || pi - 1 >= fi->n_clients) continue;
-			char ch[67];
-			for (int j = 0; j < 33; j++)
-				sprintf(ch + j*2, "%02x",
-					fi->clients[pi - 1].node_id[j]);
-			ch[66] = '\0';
-			send_factory_msg(cmd, ch,
-				SS_SUBMSG_LEAF_REALLOC_PROPOSE, payload, plen);
-		}
-		plugin_log(plugin_handle, LOG_INFORM,
-			"SS_METRIC event=realloc_propose iid=%s leaf=%d "
-			"client=%u amount=%"PRIu64" arity=2",
-			iid_hex, leaf_side, *client_idx, *amount_sats);
-	} else {
-		/* 2-of-2: send to the single client on this leaf. */
-		if ((size_t)leaf_side >= fi->n_clients) {
-			ss_clear_ps_pending(fi);
-			return command_fail(cmd, LIGHTNINGD,
-				"leaf_side %d has no client mapping", leaf_side);
-		}
-		char client_hex[67];
+	for (int i = 0; i < 2; i++) {
+		uint32_t pi = fi->realloc_subtree_clients[i];
+		if (pi == 0 || pi - 1 >= fi->n_clients) continue;
+		char ch[67];
 		for (int j = 0; j < 33; j++)
-			sprintf(client_hex + j*2, "%02x",
-				fi->clients[leaf_side].node_id[j]);
-		client_hex[66] = '\0';
-		send_factory_msg(cmd, client_hex,
+			sprintf(ch + j*2, "%02x",
+				fi->clients[pi - 1].node_id[j]);
+		ch[66] = '\0';
+		send_factory_msg(cmd, ch,
 			SS_SUBMSG_LEAF_REALLOC_PROPOSE, payload, plen);
-		plugin_log(plugin_handle, LOG_INFORM,
-			"SS_METRIC event=realloc_propose iid=%s leaf=%d "
-			"client=%u amount=%"PRIu64,
-			iid_hex, leaf_side, *client_idx, *amount_sats);
 	}
+	plugin_log(plugin_handle, LOG_INFORM,
+		"SS_METRIC event=realloc_propose iid=%s leaf=%d "
+		"client=%u amount=%"PRIu64" arity=2",
+		iid_hex, leaf_side, *client_idx, *amount_sats);
 
 	struct json_stream *js = jsonrpc_stream_success(cmd);
 	json_add_string(js, "status", "realloc_proposed");
 	json_add_u64(js, "amount_sats", *amount_sats);
 	json_add_u32(js, "leaf_side", leaf_side);
 	json_add_u32(js, "client_idx", *client_idx);
-	json_add_string(js, "ceremony",
-		eff == FACTORY_ARITY_2 ? "3-of-3" : "2-of-2");
+	json_add_string(js, "ceremony", "3-of-3");
 	return command_finished(cmd, js);
 }
 
