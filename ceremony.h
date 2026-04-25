@@ -93,6 +93,27 @@
 #define SS_SUBMSG_LEAF_REALLOC_PSIG	0x0135
 #define SS_SUBMSG_LEAF_REALLOC_DONE	0x0136
 
+/* Task #93: ARITY_2 3-of-3 leaf realloc ceremony.  ARITY_2 leaves have
+ * 3 signers (LSP + 2 clients).  MuSig2 needs all pubnonces set before
+ * any signer can call session_finalize_nonces, so the 2-of-2 wire shape
+ * doesn't suffice — we need an extra round to relay each client's nonce
+ * to the other through the LSP.  Five-message wire (mirrors factory-create's
+ * NONCE_BUNDLE / ALL_NONCES / PSIG_BUNDLE shape):
+ *
+ *   1. LSP -> both clients:  REALLOC_PROPOSE       (amounts + LSP pubnonce)
+ *   2. each client -> LSP:   REALLOC_NONCE         (own pubnonce)
+ *   3. LSP -> both clients:  REALLOC_ALL_NONCES    (all 3 pubnonces in slot order)
+ *   4. each client -> LSP:   REALLOC_PSIG_3        (own pubnonce + own psig)
+ *   5. LSP -> all clients:   REALLOC_DONE_3        (LSP psig + both client psigs)
+ *
+ * REALLOC_PROPOSE (msg 1) reuses 0x0134 — same payload format as the 2-of-2
+ * path; the receiving client's branch decides between 2-of-2 and 3-of-3 based
+ * on the leaf's n_signers. */
+#define SS_SUBMSG_LEAF_REALLOC_NONCE		0x0137
+#define SS_SUBMSG_LEAF_REALLOC_ALL_NONCES	0x0138
+#define SS_SUBMSG_LEAF_REALLOC_PSIG_3		0x0139
+#define SS_SUBMSG_LEAF_REALLOC_DONE_3		0x013A
+
 /* Ceremony state */
 typedef enum {
 	CEREMONY_IDLE,

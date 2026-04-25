@@ -1135,6 +1135,147 @@ static bool ss_leaf_realloc_propose_parse(const uint8_t *data, size_t len,
  * across a reconnect. */
 #define PS_PENDING_TIMEOUT_BLOCKS 3
 
+/* --- Task #93: ARITY_2 3-of-3 LEAF_REALLOC wire helpers ---
+ *
+ * These parallel the 2-of-2 realloc helpers above. Layouts:
+ *
+ *   REALLOC_NONCE       [32 iid | 4 leaf_side | 66 pubnonce]              = 102 B
+ *   REALLOC_ALL_NONCES  [32 iid | 4 leaf_side | 3 * 66 pubnonces]         = 234 B
+ *                       (slot order: 0=LSP, 1=clientA, 2=clientB)
+ *   REALLOC_PSIG_3      [32 iid | 4 leaf_side | 66 pubnonce | 32 psig]    = 134 B
+ *                       (own pubnonce repeated for symmetry with 2-of-2 PSIG;
+ *                        the receiver already has it from ALL_NONCES, but
+ *                        having it on the wire keeps the parser uniform)
+ *   REALLOC_DONE_3      [32 iid | 4 leaf_side | 32 lsp_psig |
+ *                        32 clientA_psig | 32 clientB_psig]                = 132 B
+ *                       (broadcast to both clients; each ignores own slot)
+ */
+
+static size_t ss_leaf_realloc_nonce_build(uint8_t *out, size_t cap,
+					  const uint8_t iid[32],
+					  uint32_t leaf_side,
+					  const uint8_t pubnonce66[66])
+{
+	if (cap < 102) return 0;
+	memcpy(out, iid, 32);
+	out[32] = (leaf_side >> 24) & 0xFF;
+	out[33] = (leaf_side >> 16) & 0xFF;
+	out[34] = (leaf_side >>  8) & 0xFF;
+	out[35] = leaf_side & 0xFF;
+	memcpy(out + 36, pubnonce66, 66);
+	return 102;
+}
+
+static bool ss_leaf_realloc_nonce_parse(const uint8_t *data, size_t len,
+					uint8_t iid_out[32],
+					uint32_t *leaf_side_out,
+					uint8_t pubnonce66_out[66])
+{
+	if (len < 102) return false;
+	memcpy(iid_out, data, 32);
+	*leaf_side_out = ((uint32_t)data[32] << 24)
+		       | ((uint32_t)data[33] << 16)
+		       | ((uint32_t)data[34] <<  8)
+		       |  (uint32_t)data[35];
+	memcpy(pubnonce66_out, data + 36, 66);
+	return true;
+}
+
+static size_t ss_leaf_realloc_all_nonces_build(uint8_t *out, size_t cap,
+					       const uint8_t iid[32],
+					       uint32_t leaf_side,
+					       const uint8_t nonces[3][66])
+{
+	if (cap < 234) return 0;
+	memcpy(out, iid, 32);
+	out[32] = (leaf_side >> 24) & 0xFF;
+	out[33] = (leaf_side >> 16) & 0xFF;
+	out[34] = (leaf_side >>  8) & 0xFF;
+	out[35] = leaf_side & 0xFF;
+	memcpy(out + 36, nonces[0], 66);
+	memcpy(out + 102, nonces[1], 66);
+	memcpy(out + 168, nonces[2], 66);
+	return 234;
+}
+
+static bool ss_leaf_realloc_all_nonces_parse(const uint8_t *data, size_t len,
+					     uint8_t iid_out[32],
+					     uint32_t *leaf_side_out,
+					     uint8_t nonces_out[3][66])
+{
+	if (len < 234) return false;
+	memcpy(iid_out, data, 32);
+	*leaf_side_out = ((uint32_t)data[32] << 24)
+		       | ((uint32_t)data[33] << 16)
+		       | ((uint32_t)data[34] <<  8)
+		       |  (uint32_t)data[35];
+	memcpy(nonces_out[0], data + 36, 66);
+	memcpy(nonces_out[1], data + 102, 66);
+	memcpy(nonces_out[2], data + 168, 66);
+	return true;
+}
+
+/* PSIG_3 reuses the same 134-byte shape as ss_leaf_advance_psig_*; just the
+ * submsg ID differs.  We keep dedicated helpers in case the format diverges
+ * in the future, but they call through. */
+static size_t ss_leaf_realloc_psig3_build(uint8_t *out, size_t cap,
+					  const uint8_t iid[32],
+					  uint32_t leaf_side,
+					  const uint8_t pubnonce66[66],
+					  const uint8_t psig32[32])
+{
+	return ss_leaf_advance_psig_build(out, cap, iid, leaf_side,
+					  pubnonce66, psig32);
+}
+
+static bool ss_leaf_realloc_psig3_parse(const uint8_t *data, size_t len,
+					uint8_t iid_out[32],
+					uint32_t *leaf_side_out,
+					uint8_t pubnonce66_out[66],
+					uint8_t psig32_out[32])
+{
+	return ss_leaf_advance_psig_parse(data, len, iid_out, leaf_side_out,
+					  pubnonce66_out, psig32_out);
+}
+
+static size_t ss_leaf_realloc_done3_build(uint8_t *out, size_t cap,
+					  const uint8_t iid[32],
+					  uint32_t leaf_side,
+					  const uint8_t lsp_psig32[32],
+					  const uint8_t clientA_psig32[32],
+					  const uint8_t clientB_psig32[32])
+{
+	if (cap < 132) return 0;
+	memcpy(out, iid, 32);
+	out[32] = (leaf_side >> 24) & 0xFF;
+	out[33] = (leaf_side >> 16) & 0xFF;
+	out[34] = (leaf_side >>  8) & 0xFF;
+	out[35] = leaf_side & 0xFF;
+	memcpy(out + 36, lsp_psig32, 32);
+	memcpy(out + 68, clientA_psig32, 32);
+	memcpy(out + 100, clientB_psig32, 32);
+	return 132;
+}
+
+static bool ss_leaf_realloc_done3_parse(const uint8_t *data, size_t len,
+					uint8_t iid_out[32],
+					uint32_t *leaf_side_out,
+					uint8_t lsp_psig32_out[32],
+					uint8_t clientA_psig32_out[32],
+					uint8_t clientB_psig32_out[32])
+{
+	if (len < 132) return false;
+	memcpy(iid_out, data, 32);
+	*leaf_side_out = ((uint32_t)data[32] << 24)
+		       | ((uint32_t)data[33] << 16)
+		       | ((uint32_t)data[34] <<  8)
+		       |  (uint32_t)data[35];
+	memcpy(lsp_psig32_out, data + 36, 32);
+	memcpy(clientA_psig32_out, data + 68, 32);
+	memcpy(clientB_psig32_out, data + 100, 32);
+	return true;
+}
+
 /* Send FACTORY_READY to a single client, with signed-tree trailer.
  *
  * Wire format (backward-compatible):
@@ -1188,6 +1329,13 @@ static void ss_clear_ps_pending(factory_instance_t *fi)
 	fi->ps_pending_node_idx = 0;
 	fi->ps_pending_start_block = 0;
 	fi->ps_pending_is_realloc = 0;
+	/* Task #93: zero ARITY_2 3-of-3 ceremony scratch space. */
+	memset(fi->realloc_subtree_clients, 0,
+	       sizeof(fi->realloc_subtree_clients));
+	memset(fi->realloc_pubnonces, 0, sizeof(fi->realloc_pubnonces));
+	memset(fi->realloc_psigs, 0, sizeof(fi->realloc_psigs));
+	memset(fi->realloc_has_pubnonce, 0, sizeof(fi->realloc_has_pubnonce));
+	memset(fi->realloc_has_psig, 0, sizeof(fi->realloc_has_psig));
 }
 
 /* Persist one PS leaf chain entry at its current (just-signed) state.
@@ -6231,7 +6379,13 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 					       &lsp_pn_obj))
 			break;
 
-		/* Generate own nonce + partial sig, consume secnonce */
+		/* Generate our own secnonce + pubnonce. The secnonce path
+		 * differs between 2-of-2 and 3-of-3:
+		 *   - 2-of-2: consume immediately (finalize+create_psig+free)
+		 *   - 3-of-3: stash on fp->ps_pending_secnonce, defer until
+		 *             ALL_NONCES arrives carrying the OTHER client's
+		 *             nonce (MuSig2 needs all pubnonces set before
+		 *             session_finalize_nonces). */
 		secp256k1_musig_secnonce *my_sn =
 			calloc(1, sizeof(secp256k1_musig_secnonce));
 		if (!my_sn) break;
@@ -6250,6 +6404,50 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 					       &my_pn)) {
 			free(my_sn); break;
 		}
+
+		/* Task #93 fork: 2-of-2 vs 3-of-3 */
+		if (nd->n_signers == 3) {
+			/* 3-of-3: don't try to finalize yet — we're missing
+			 * the other client's pubnonce. Stash own secnonce +
+			 * pubnonce, send REALLOC_NONCE to LSP, await
+			 * ALL_NONCES. */
+			fp->ps_pending_leaf = (int32_t)leaf_side;
+			fp->ps_pending_node_idx = (uint32_t)nidx;
+			fp->ps_pending_secnonce = my_sn; /* keep alive */
+			fp->ps_pending_start_block =
+				ss_state.current_blockheight;
+			fp->ps_pending_is_realloc = 1;
+			/* Stash own pubnonce for later when the LSP's
+			 * REALLOC_ALL_NONCES arrives — we'll need it to
+			 * verify our own nonce wasn't garbled in transit. */
+			musig_pubnonce_serialize(global_secp_ctx,
+				fp->realloc_pubnonces[my_slot], &my_pn);
+			fp->realloc_has_pubnonce[my_slot] = 1;
+			musig_pubnonce_serialize(global_secp_ctx,
+				fp->realloc_pubnonces[lsp_slot], lsp_pn);
+			fp->realloc_has_pubnonce[lsp_slot] = 1;
+
+			/* Send REALLOC_NONCE (own pubnonce) to LSP. */
+			uint8_t my_pn_ser[66];
+			musig_pubnonce_serialize(global_secp_ctx, my_pn_ser, &my_pn);
+			uint8_t payload[102];
+			size_t plen = ss_leaf_realloc_nonce_build(
+				payload, sizeof(payload),
+				fp->instance_id, leaf_side, my_pn_ser);
+			if (plen > 0) {
+				send_factory_msg(cmd, peer_id,
+					SS_SUBMSG_LEAF_REALLOC_NONCE,
+					payload, plen);
+				plugin_log(plugin_handle, LOG_INFORM,
+					"SS_METRIC event=realloc_nonce_sent leaf=%u "
+					"slot=%d",
+					leaf_side, my_slot);
+			}
+			break;
+		}
+
+		/* 2-of-2 path (ARITY_PS chain[0] / ARITY_1): finalize + create
+		 * psig + send PSIG back. */
 		if (!factory_session_finalize_node(cf, nidx)) {
 			free(my_sn); break;
 		}
@@ -6457,6 +6655,367 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 		ss_clear_ps_pending(fp);
 		plugin_log(plugin_handle, LOG_INFORM,
 			"SS_METRIC event=realloc_client_done leaf=%u",
+			leaf_side);
+		break;
+	}
+
+	/* --- Task #93: ARITY_2 3-of-3 LEAF_REALLOC handlers --- */
+
+	case SS_SUBMSG_LEAF_REALLOC_NONCE: {
+		/* LSP side: a client replied with their pubnonce. Stash it,
+		 * and once both clients have responded build REALLOC_ALL_NONCES
+		 * and broadcast to both. */
+		uint8_t iid[32], pn[66];
+		uint32_t leaf_side;
+		if (!ss_leaf_realloc_nonce_parse(data, len, iid, &leaf_side, pn)) {
+			plugin_log(plugin_handle, LOG_UNUSUAL,
+				"Bad LEAF_REALLOC_NONCE (len=%zu)", len);
+			break;
+		}
+		factory_instance_t *fp = ss_factory_find(&ss_state, iid);
+		if (!fp || !fp->is_lsp || !fp->ps_pending_is_realloc ||
+		    fp->ps_pending_leaf != (int32_t)leaf_side)
+			break;
+		factory_t *lf = (factory_t *)fp->lib_factory;
+		if (!lf) break;
+		size_t nidx = fp->ps_pending_node_idx;
+		factory_node_t *nd = &lf->nodes[nidx];
+		if (nd->n_signers != 3) break;
+
+		/* Identify which client replied via peer_id → participant_idx. */
+		if (strlen(peer_id) != 66) break;
+		uint8_t pid[33];
+		for (int j = 0; j < 33; j++) {
+			unsigned int b;
+			sscanf(peer_id + j*2, "%02x", &b);
+			pid[j] = (uint8_t)b;
+		}
+		client_state_t *cl = ss_factory_find_client(fp, pid);
+		if (!cl) break;
+		uint32_t their_pidx = (uint32_t)cl->signer_slot;
+		int their_slot = factory_find_signer_slot(lf, nidx, their_pidx);
+		if (their_slot < 0) break;
+
+		secp256k1_musig_pubnonce pn_obj;
+		if (!musig_pubnonce_parse(global_secp_ctx, &pn_obj, pn))
+			break;
+		if (!factory_session_set_nonce(lf, nidx, (size_t)their_slot,
+					       &pn_obj))
+			break;
+
+		/* Stash for ALL_NONCES rebroadcast. */
+		memcpy(fp->realloc_pubnonces[their_slot], pn, 66);
+		fp->realloc_has_pubnonce[their_slot] = 1;
+
+		/* Wait for both clients (slots 1 and 2; LSP is slot 0). */
+		int got = (fp->realloc_has_pubnonce[1] ? 1 : 0)
+			+ (fp->realloc_has_pubnonce[2] ? 1 : 0);
+		plugin_log(plugin_handle, LOG_INFORM,
+			"SS_METRIC event=realloc_nonce_recv leaf=%u slot=%d "
+			"got=%d/2",
+			leaf_side, their_slot, got);
+		if (got < 2) break;
+
+		/* All client nonces in. Build REALLOC_ALL_NONCES with the 3
+		 * pubnonces in slot order and broadcast to both clients. */
+		uint8_t all[3][66];
+		memcpy(all[0], fp->realloc_pubnonces[0], 66);
+		memcpy(all[1], fp->realloc_pubnonces[1], 66);
+		memcpy(all[2], fp->realloc_pubnonces[2], 66);
+		uint8_t payload[234];
+		size_t plen = ss_leaf_realloc_all_nonces_build(
+			payload, sizeof(payload),
+			fp->instance_id, leaf_side, all);
+		if (plen == 0) {
+			ss_clear_ps_pending(fp); break;
+		}
+		for (int i = 0; i < 2; i++) {
+			uint32_t pi = fp->realloc_subtree_clients[i];
+			if (pi == 0 || pi - 1 >= fp->n_clients) continue;
+			char ch[67];
+			for (int j = 0; j < 33; j++)
+				sprintf(ch + j*2, "%02x",
+					fp->clients[pi - 1].node_id[j]);
+			ch[66] = '\0';
+			send_factory_msg(cmd, ch,
+				SS_SUBMSG_LEAF_REALLOC_ALL_NONCES,
+				payload, plen);
+		}
+		plugin_log(plugin_handle, LOG_INFORM,
+			"SS_METRIC event=realloc_all_nonces_sent leaf=%u",
+			leaf_side);
+		break;
+	}
+
+	case SS_SUBMSG_LEAF_REALLOC_ALL_NONCES: {
+		/* Client side: LSP relayed all 3 pubnonces. Set them on the
+		 * session, finalize, create our partial sig, send PSIG_3. */
+		uint8_t iid[32];
+		uint8_t nonces[3][66];
+		uint32_t leaf_side;
+		if (!ss_leaf_realloc_all_nonces_parse(data, len, iid,
+						      &leaf_side, nonces)) {
+			plugin_log(plugin_handle, LOG_UNUSUAL,
+				"Bad LEAF_REALLOC_ALL_NONCES (len=%zu)", len);
+			break;
+		}
+		factory_instance_t *fp = ss_factory_find(&ss_state, iid);
+		if (!fp || fp->is_lsp || !fp->ps_pending_is_realloc ||
+		    fp->ps_pending_leaf != (int32_t)leaf_side ||
+		    !fp->ps_pending_secnonce)
+			break;
+		factory_t *cf = (factory_t *)fp->lib_factory;
+		if (!cf) break;
+		size_t nidx = fp->ps_pending_node_idx;
+		factory_node_t *nd = &cf->nodes[nidx];
+		if (nd->n_signers != 3) break;
+
+		int my_slot = factory_find_signer_slot(cf, nidx,
+			(uint32_t)fp->our_participant_idx);
+		if (my_slot < 0) break;
+
+		/* Set the OTHER signers' nonces; our own is already set from
+		 * the PROPOSE handler. We re-set defensively in case the
+		 * session state was lost somewhere. */
+		for (size_t s = 0; s < 3; s++) {
+			secp256k1_musig_pubnonce pn_obj;
+			if (!musig_pubnonce_parse(global_secp_ctx, &pn_obj,
+						  nonces[s])) {
+				ss_clear_ps_pending(fp); goto realloc_all_nonces_done;
+			}
+			factory_session_set_nonce(cf, nidx, s, &pn_obj);
+		}
+
+		if (!factory_session_finalize_node(cf, nidx)) {
+			ss_clear_ps_pending(fp); break;
+		}
+
+		/* Create our partial sig (consumes the stashed secnonce). */
+		secp256k1_keypair my_kp;
+		if (!secp256k1_keypair_create(global_secp_ctx, &my_kp,
+					      fp->our_seckey)) {
+			ss_clear_ps_pending(fp); break;
+		}
+		secp256k1_musig_partial_sig my_psig;
+		if (!musig_create_partial_sig(global_secp_ctx, &my_psig,
+			(secp256k1_musig_secnonce *)fp->ps_pending_secnonce,
+			&my_kp, &nd->signing_session)) {
+			ss_clear_ps_pending(fp); break;
+		}
+		free(fp->ps_pending_secnonce);
+		fp->ps_pending_secnonce = NULL;
+		if (!factory_session_set_partial_sig(cf, nidx,
+			(size_t)my_slot, &my_psig)) {
+			ss_clear_ps_pending(fp); break;
+		}
+
+		/* Stash own psig for the DONE_3 round (we'll need to combine
+		 * with peer's psig from DONE_3 to complete locally). */
+		musig_partial_sig_serialize(global_secp_ctx,
+			fp->realloc_psigs[my_slot], &my_psig);
+		fp->realloc_has_psig[my_slot] = 1;
+
+		/* Send PSIG_3 to LSP. */
+		uint8_t my_pn_ser[66];
+		musig_pubnonce_serialize(global_secp_ctx, my_pn_ser,
+					 &(secp256k1_musig_pubnonce){0});
+		/* Re-use stashed pubnonce we set above. */
+		memcpy(my_pn_ser, fp->realloc_pubnonces[my_slot], 66);
+		uint8_t payload[134];
+		size_t plen = ss_leaf_realloc_psig3_build(
+			payload, sizeof(payload),
+			fp->instance_id, leaf_side, my_pn_ser,
+			fp->realloc_psigs[my_slot]);
+		if (plen > 0) {
+			send_factory_msg(cmd, peer_id,
+				SS_SUBMSG_LEAF_REALLOC_PSIG_3, payload, plen);
+			plugin_log(plugin_handle, LOG_INFORM,
+				"SS_METRIC event=realloc_psig3_sent leaf=%u "
+				"slot=%d",
+				leaf_side, my_slot);
+		}
+realloc_all_nonces_done:
+		break;
+	}
+
+	case SS_SUBMSG_LEAF_REALLOC_PSIG_3: {
+		/* LSP side: a client replied with their partial sig. Stash,
+		 * and once both clients have responded create LSP psig,
+		 * complete_node, broadcast REALLOC_DONE_3 with all 3 psigs. */
+		uint8_t iid[32], cli_pn[66], cli_psig_ser[32];
+		uint32_t leaf_side;
+		if (!ss_leaf_realloc_psig3_parse(data, len, iid, &leaf_side,
+						 cli_pn, cli_psig_ser)) {
+			plugin_log(plugin_handle, LOG_UNUSUAL,
+				"Bad LEAF_REALLOC_PSIG_3 (len=%zu)", len);
+			break;
+		}
+		factory_instance_t *fp = ss_factory_find(&ss_state, iid);
+		if (!fp || !fp->is_lsp || !fp->ps_pending_is_realloc ||
+		    fp->ps_pending_leaf != (int32_t)leaf_side)
+			break;
+		factory_t *lf = (factory_t *)fp->lib_factory;
+		if (!lf) break;
+		size_t nidx = fp->ps_pending_node_idx;
+		factory_node_t *nd = &lf->nodes[nidx];
+		if (nd->n_signers != 3) break;
+
+		if (strlen(peer_id) != 66) break;
+		uint8_t pid[33];
+		for (int j = 0; j < 33; j++) {
+			unsigned int b;
+			sscanf(peer_id + j*2, "%02x", &b);
+			pid[j] = (uint8_t)b;
+		}
+		client_state_t *cl = ss_factory_find_client(fp, pid);
+		if (!cl) break;
+		int their_slot = factory_find_signer_slot(lf, nidx,
+			(uint32_t)cl->signer_slot);
+		if (their_slot < 0) break;
+
+		secp256k1_musig_partial_sig their_psig_obj;
+		if (!musig_partial_sig_parse(global_secp_ctx, &their_psig_obj,
+					     cli_psig_ser))
+			break;
+		if (!factory_session_set_partial_sig(lf, nidx,
+			(size_t)their_slot, &their_psig_obj))
+			break;
+		memcpy(fp->realloc_psigs[their_slot], cli_psig_ser, 32);
+		fp->realloc_has_psig[their_slot] = 1;
+
+		int got = (fp->realloc_has_psig[1] ? 1 : 0)
+			+ (fp->realloc_has_psig[2] ? 1 : 0);
+		plugin_log(plugin_handle, LOG_INFORM,
+			"SS_METRIC event=realloc_psig3_recv leaf=%u slot=%d "
+			"got=%d/2",
+			leaf_side, their_slot, got);
+		if (got < 2) break;
+
+		/* Both client psigs received. Create LSP own psig, set on
+		 * session, complete the node. */
+		if (!fp->ps_pending_secnonce) {
+			ss_clear_ps_pending(fp); break;
+		}
+		secp256k1_keypair lsp_kp;
+		if (!secp256k1_keypair_create(global_secp_ctx, &lsp_kp,
+					      fp->our_seckey)) {
+			ss_clear_ps_pending(fp); break;
+		}
+		secp256k1_musig_partial_sig lsp_psig;
+		if (!musig_create_partial_sig(global_secp_ctx, &lsp_psig,
+			(secp256k1_musig_secnonce *)fp->ps_pending_secnonce,
+			&lsp_kp, &nd->signing_session)) {
+			ss_clear_ps_pending(fp); break;
+		}
+		free(fp->ps_pending_secnonce);
+		fp->ps_pending_secnonce = NULL;
+		musig_partial_sig_serialize(global_secp_ctx,
+			fp->realloc_psigs[0], &lsp_psig);
+		fp->realloc_has_psig[0] = 1;
+		if (!factory_session_set_partial_sig(lf, nidx, 0, &lsp_psig)) {
+			ss_clear_ps_pending(fp); break;
+		}
+		if (!factory_session_complete_node(lf, nidx)) {
+			ss_clear_ps_pending(fp); break;
+		}
+
+		/* Persist re-signed leaf. */
+		ss_save_factory(cmd, fp);
+
+		/* Build REALLOC_DONE_3 carrying all 3 psigs. Broadcast to
+		 * both clients. */
+		uint8_t payload[132];
+		size_t plen = ss_leaf_realloc_done3_build(
+			payload, sizeof(payload),
+			fp->instance_id, leaf_side,
+			fp->realloc_psigs[0],
+			fp->realloc_psigs[1],
+			fp->realloc_psigs[2]);
+		if (plen > 0) {
+			for (int i = 0; i < 2; i++) {
+				uint32_t pi = fp->realloc_subtree_clients[i];
+				if (pi == 0 || pi - 1 >= fp->n_clients) continue;
+				char ch[67];
+				for (int j = 0; j < 33; j++)
+					sprintf(ch + j*2, "%02x",
+						fp->clients[pi - 1].node_id[j]);
+				ch[66] = '\0';
+				send_factory_msg(cmd, ch,
+					SS_SUBMSG_LEAF_REALLOC_DONE_3,
+					payload, plen);
+			}
+		}
+
+		char iid_hex[65];
+		for (int j = 0; j < 32; j++)
+			sprintf(iid_hex + j*2, "%02x", fp->instance_id[j]);
+		iid_hex[64] = '\0';
+		plugin_log(plugin_handle, LOG_INFORM,
+			"SS_METRIC event=realloc_complete iid=%s leaf=%u "
+			"arity=2",
+			iid_hex, leaf_side);
+		ss_clear_ps_pending(fp);
+		break;
+	}
+
+	case SS_SUBMSG_LEAF_REALLOC_DONE_3: {
+		/* Client side: LSP shipped all 3 psigs. Complete locally. */
+		uint8_t iid[32], lsp_psig[32], a_psig[32], b_psig[32];
+		uint32_t leaf_side;
+		if (!ss_leaf_realloc_done3_parse(data, len, iid, &leaf_side,
+						 lsp_psig, a_psig, b_psig)) {
+			plugin_log(plugin_handle, LOG_UNUSUAL,
+				"Bad LEAF_REALLOC_DONE_3 (len=%zu)", len);
+			break;
+		}
+		factory_instance_t *fp = ss_factory_find(&ss_state, iid);
+		if (!fp || fp->is_lsp || !fp->ps_pending_is_realloc ||
+		    fp->ps_pending_leaf != (int32_t)leaf_side)
+			break;
+		factory_t *cf = (factory_t *)fp->lib_factory;
+		if (!cf) break;
+		size_t nidx = fp->ps_pending_node_idx;
+		factory_node_t *nd = &cf->nodes[nidx];
+		if (nd->n_signers != 3) break;
+
+		/* Set LSP slot (always 0) + set the OTHER client's slot.
+		 * Our own is already set from the ALL_NONCES handler. */
+		secp256k1_musig_partial_sig lsp_psig_obj;
+		if (!musig_partial_sig_parse(global_secp_ctx, &lsp_psig_obj,
+					     lsp_psig)) {
+			ss_clear_ps_pending(fp); break;
+		}
+		if (!factory_session_set_partial_sig(cf, nidx, 0,
+						     &lsp_psig_obj)) {
+			ss_clear_ps_pending(fp); break;
+		}
+
+		/* Determine our own slot and pick the other client psig. */
+		int my_slot = factory_find_signer_slot(cf, nidx,
+			(uint32_t)fp->our_participant_idx);
+		if (my_slot < 0) {
+			ss_clear_ps_pending(fp); break;
+		}
+		const uint8_t *peer_psig = (my_slot == 1) ? b_psig : a_psig;
+		int peer_slot = (my_slot == 1) ? 2 : 1;
+		secp256k1_musig_partial_sig peer_psig_obj;
+		if (!musig_partial_sig_parse(global_secp_ctx, &peer_psig_obj,
+					     peer_psig)) {
+			ss_clear_ps_pending(fp); break;
+		}
+		if (!factory_session_set_partial_sig(cf, nidx,
+			(size_t)peer_slot, &peer_psig_obj)) {
+			ss_clear_ps_pending(fp); break;
+		}
+
+		if (!factory_session_complete_node(cf, nidx)) {
+			ss_clear_ps_pending(fp); break;
+		}
+
+		ss_save_factory(cmd, fp);
+		ss_clear_ps_pending(fp);
+		plugin_log(plugin_handle, LOG_INFORM,
+			"SS_METRIC event=realloc_client_done leaf=%u arity=2",
 			leaf_side);
 		break;
 	}
@@ -13847,15 +14406,10 @@ static struct command_result *json_factory_buy_liquidity(struct command *cmd,
 		return command_fail(cmd, LIGHTNINGD,
 			"factory rotation in progress — retry after completion");
 
-	/* The reallocation ceremony is a 2-of-2 between LSP and the client
-	 * on the affected leaf. For ARITY_2 (3-of-3) it would need a
-	 * different ceremony — not wired here. */
+	/* Task #93: ARITY_2 leaves have 3 signers (LSP + 2 clients) and
+	 * require an extra nonce-relay round. The flow forks below;
+	 * ARITY_PS / ARITY_1 stay on the existing 2-of-2 path. */
 	factory_arity_t eff = ss_effective_arity(fi);
-	if (eff == FACTORY_ARITY_2) {
-		return command_fail(cmd, LIGHTNINGD,
-			"factory-buy-liquidity re-sign not yet implemented for "
-			"ARITY_2 (3-of-3 ceremony) — use ARITY_1 or ARITY_PS");
-	}
 
 	/* PS-specific: only chain[0] has an L-stock output. After any PS
 	 * advance chain[N>=1] has only the channel output, so value transfer
@@ -13915,18 +14469,24 @@ static struct command_result *json_factory_buy_liquidity(struct command *cmd,
 	fi->ps_pending_start_block = ss_state.current_blockheight;
 	fi->ps_pending_is_realloc = 1;
 
-	/* Locate the client's peer_id. For ARITY_PS / ARITY_1 (1 client per
-	 * leaf), client[leaf_side] is the one on this leaf. */
-	if ((size_t)leaf_side >= fi->n_clients) {
-		ss_clear_ps_pending(fi);
-		return command_fail(cmd, LIGHTNINGD,
-			"leaf_side %d has no client mapping", leaf_side);
+	/* Task #93: for ARITY_2 (3-of-3), populate the realloc scratch space
+	 * so the NONCE / ALL_NONCES / PSIG_3 handlers can collect peer state. */
+	if (eff == FACTORY_ARITY_2) {
+		uint32_t two_clients[2];
+		size_t got = factory_get_subtree_clients(factory,
+			(int)node_idx, two_clients, 2);
+		if (got != 2) {
+			ss_clear_ps_pending(fi);
+			return command_fail(cmd, LIGHTNINGD,
+				"ARITY_2 leaf has %zu clients (expected 2)",
+				got);
+		}
+		fi->realloc_subtree_clients[0] = two_clients[0];
+		fi->realloc_subtree_clients[1] = two_clients[1];
+		/* Stash the LSP's own pubnonce in slot order. */
+		memcpy(fi->realloc_pubnonces[lsp_slot], lsp_pubnonce_ser, 66);
+		fi->realloc_has_pubnonce[lsp_slot] = 1;
 	}
-	char client_hex[67];
-	for (int j = 0; j < 33; j++)
-		sprintf(client_hex + j*2, "%02x",
-			fi->clients[leaf_side].node_id[j]);
-	client_hex[66] = '\0';
 
 	uint8_t payload[32 + 4 + 2 + SS_LEAF_REALLOC_PROPOSE_MAX_OUTPUTS * 8 + 66];
 	size_t plen = ss_leaf_realloc_propose_build(payload, sizeof(payload),
@@ -13937,23 +14497,59 @@ static struct command_result *json_factory_buy_liquidity(struct command *cmd,
 		return command_fail(cmd, LIGHTNINGD,
 			"REALLOC_PROPOSE build failed");
 	}
-	send_factory_msg(cmd, client_hex, SS_SUBMSG_LEAF_REALLOC_PROPOSE,
-			 payload, plen);
 
+	/* Send PROPOSE to the right set of clients depending on arity. */
 	char iid_hex[65];
 	for (int j = 0; j < 32; j++)
 		sprintf(iid_hex + j*2, "%02x", fi->instance_id[j]);
 	iid_hex[64] = '\0';
-	plugin_log(plugin_handle, LOG_INFORM,
-		"SS_METRIC event=realloc_propose iid=%s leaf=%d "
-		"client=%u amount=%"PRIu64,
-		iid_hex, leaf_side, *client_idx, *amount_sats);
+
+	if (eff == FACTORY_ARITY_2) {
+		/* 3-of-3: send to both clients on this leaf. realloc_subtree_clients
+		 * holds factory-wide participant_idx values (1..N). fi->clients[]
+		 * is 0-indexed, so participant_idx i maps to fi->clients[i-1]. */
+		for (int i = 0; i < 2; i++) {
+			uint32_t pi = fi->realloc_subtree_clients[i];
+			if (pi == 0 || pi - 1 >= fi->n_clients) continue;
+			char ch[67];
+			for (int j = 0; j < 33; j++)
+				sprintf(ch + j*2, "%02x",
+					fi->clients[pi - 1].node_id[j]);
+			ch[66] = '\0';
+			send_factory_msg(cmd, ch,
+				SS_SUBMSG_LEAF_REALLOC_PROPOSE, payload, plen);
+		}
+		plugin_log(plugin_handle, LOG_INFORM,
+			"SS_METRIC event=realloc_propose iid=%s leaf=%d "
+			"client=%u amount=%"PRIu64" arity=2",
+			iid_hex, leaf_side, *client_idx, *amount_sats);
+	} else {
+		/* 2-of-2: send to the single client on this leaf. */
+		if ((size_t)leaf_side >= fi->n_clients) {
+			ss_clear_ps_pending(fi);
+			return command_fail(cmd, LIGHTNINGD,
+				"leaf_side %d has no client mapping", leaf_side);
+		}
+		char client_hex[67];
+		for (int j = 0; j < 33; j++)
+			sprintf(client_hex + j*2, "%02x",
+				fi->clients[leaf_side].node_id[j]);
+		client_hex[66] = '\0';
+		send_factory_msg(cmd, client_hex,
+			SS_SUBMSG_LEAF_REALLOC_PROPOSE, payload, plen);
+		plugin_log(plugin_handle, LOG_INFORM,
+			"SS_METRIC event=realloc_propose iid=%s leaf=%d "
+			"client=%u amount=%"PRIu64,
+			iid_hex, leaf_side, *client_idx, *amount_sats);
+	}
 
 	struct json_stream *js = jsonrpc_stream_success(cmd);
 	json_add_string(js, "status", "realloc_proposed");
 	json_add_u64(js, "amount_sats", *amount_sats);
 	json_add_u32(js, "leaf_side", leaf_side);
 	json_add_u32(js, "client_idx", *client_idx);
+	json_add_string(js, "ceremony",
+		eff == FACTORY_ARITY_2 ? "3-of-3" : "2-of-2");
 	return command_finished(cmd, js);
 }
 

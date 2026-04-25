@@ -355,6 +355,22 @@ typedef struct factory_instance {
 					  * amounts, no chain advance); 0 for
 					  * LEAF_ADVANCE. Memory-only. */
 
+	/* Task #93: ARITY_2 3-of-3 LEAF_REALLOC ceremony state.  ARITY_2
+	 * leaves have 3 signers (LSP + 2 clients) — the simple 2-of-2
+	 * pending fields above can't track which clients have replied.
+	 * realloc_subtree_clients holds the two client participant_idx
+	 * values (factory-wide, not slot-within-leaf) collected via
+	 * factory_get_subtree_clients() at PROPOSE time on the LSP side.
+	 * realloc_pubnonces / realloc_has_pubnonce / realloc_psigs /
+	 * realloc_has_psig are indexed by signer_slot WITHIN the leaf
+	 * (0..2 — slot 0 is always LSP). All zeroed when no 3-of-3
+	 * ceremony is in flight. Memory-only. */
+	uint32_t realloc_subtree_clients[2];
+	uint8_t  realloc_pubnonces[3][66];
+	uint8_t  realloc_psigs[3][32];
+	uint8_t  realloc_has_pubnonce[3];
+	uint8_t  realloc_has_psig[3];
+
 	/* Lifecycle */
 	factory_lifecycle_t lifecycle;
 	uint32_t creation_block;	/* Block height at creation */
