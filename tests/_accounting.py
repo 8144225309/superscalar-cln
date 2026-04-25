@@ -209,16 +209,20 @@ def find_factory_funding_output(node, funding_txid: str,
 
 # ---------- Ceremony progression helpers ----------
 
-def wait_metric(node, pattern: str, *, timeout: float = 15.0) -> str:
+def wait_metric(node, pattern: str, *, timeout: float = 30.0) -> str:
     """Poll node logs for a regex match. Tests use this to confirm
-    ceremony sub-steps fired."""
-    import re
-    rx = re.compile(pattern)
+    ceremony sub-steps fired.
+
+    Delegates to pyln-testing's ``daemon.is_in_log`` because that helper
+    calls ``logs_catchup()`` first, which drains the daemon's log
+    buffer. Iterating ``daemon.logs`` directly without that catchup
+    misses lines emitted in the last poll interval and leads to
+    spurious timeouts on otherwise-correct metrics."""
     deadline = time.time() + timeout
     while time.time() < deadline:
-        for line in node.daemon.logs:
-            if rx.search(line):
-                return line
+        line = node.daemon.is_in_log(pattern)
+        if line:
+            return line
         time.sleep(0.2)
     raise TimeoutError(
         f"metric pattern {pattern!r} not seen within {timeout}s")
