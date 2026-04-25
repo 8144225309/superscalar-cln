@@ -2164,8 +2164,20 @@ static void ss_load_factories(struct command *cmd)
 					if (fi->n_clients > 0) {
 						for (size_t ci = 0; ci < fi->n_clients
 						     && ok; ci++) {
+							/* LSP-side: clients[ci] = signer at slot ci+1.
+							 * Client-side: clients[ci].signer_slot
+							 * carries the actual slot (0=LSP,
+							 * peers at their factory-wide indices).
+							 * Skip our own slot — already filled
+							 * with the derived seckey above. */
 							int slot = fi->is_lsp
-								? (int)(ci + 1) : 0;
+								? (int)(ci + 1)
+								: fi->clients[ci].signer_slot;
+							if (!fi->is_lsp
+							    && slot == fi->our_participant_idx)
+								continue;
+							if (slot < 0 || slot >= (int)n_total)
+								continue;
 							if (fi->clients[ci].has_factory_pubkey) {
 								ok = secp256k1_ec_pubkey_parse(
 									global_secp_ctx,
@@ -2740,6 +2752,13 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 				break;
 			}
 			fi->is_lsp = false;
+			/* Client-side semantic for fi->clients[]: one entry per
+			 * OTHER signer (LSP + peer clients), in arbitrary order;
+			 * each entry's signer_slot carries its factory-wide slot
+			 * (0=LSP, 1..n=clients). For 2-party there is exactly one
+			 * other signer (the LSP at slot 0); for 3+-party there is
+			 * the LSP plus peer clients. n_clients counts other-signers,
+			 * which happens to equal nb->n_participants - 1. */
 			fi->n_clients = nb->n_participants > 1
 				? nb->n_participants - 1 : 0;
 			fi->funding_amount_sats = propose_funding_sats;
@@ -2761,12 +2780,38 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 				}
 			}
 
-			/* Store LSP factory pubkey (slot 0) for
-			 * tree rebuild after restart */
-			if (nb->n_participants > 0 && nb->pubkeys[0][0] != 0) {
-				fi->clients[0].has_factory_pubkey = true;
-				memcpy(fi->clients[0].factory_pubkey,
-				       nb->pubkeys[0], 33);
+			/* Store every other-signer's factory pubkey + signer_slot
+			 * so tree rebuild after restart sees correct keys at
+			 * every slot (not just the LSP). For 3+-party factories
+			 * the peer client's slot is also populated here — without
+			 * this, ss_load_factories would leave that slot zeroed
+			 * and crash inside secp256k1_musig_pubkey_agg. */
+			{
+				size_t ci_out = 0;
+				for (uint32_t pi = 0;
+				     pi < nb->n_participants
+				     && ci_out < MAX_FACTORY_PARTICIPANTS;
+				     pi++) {
+					if ((int)pi == (int)our_pidx)
+						continue;
+					fi->clients[ci_out].signer_slot = (int)pi;
+					if (nb->pubkeys[pi][0] != 0) {
+						fi->clients[ci_out].has_factory_pubkey =
+							true;
+						memcpy(fi->clients[ci_out].factory_pubkey,
+						       nb->pubkeys[pi], 33);
+					}
+					fi->clients[ci_out].pending_revoke_epoch =
+						UINT32_MAX;
+					fi->clients[ci_out].last_acked_epoch =
+						UINT32_MAX;
+					ci_out++;
+				}
+				/* fi->n_clients was set above to
+				 * nb->n_participants - 1 which equals ci_out
+				 * unless we exceeded MAX. Track the actual count
+				 * so persistence/load align. */
+				fi->n_clients = ci_out;
 			}
 
 			/* Use pubkeys from the bundle (same as LSP's) */
