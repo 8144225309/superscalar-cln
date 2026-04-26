@@ -773,11 +773,7 @@ static void apply_allocations_to_leaves(factory_instance_t *fi,
 		}
 		uint64_t lt = ln->input_amount;
 		amts[nclients] = lt > csum ? lt - csum : 546;
-		int sla_rc = factory_set_leaf_amounts(factory, ls, amts, n_outputs);
-		plugin_log(plugin_handle, LOG_INFORM,
-			   "apply_allocations: leaf=%d n_outputs=%zu input_amt=%"PRIu64
-			   " csum=%"PRIu64" set_leaf_amounts=%d",
-			   ls, n_outputs, lt, csum, sla_rc);
+		factory_set_leaf_amounts(factory, ls, amts, n_outputs);
 		free(amts);
 	}
 }
@@ -7956,14 +7952,13 @@ static struct command_result *json_factory_create(struct command *cmd,
 					amts[n_clients_on_leaf] = leaf_total > client_sum
 						? leaf_total - client_sum : 546;
 
-					int slr = factory_set_leaf_amounts(
-						factory, ls, amts, n_outputs);
-					plugin_log(plugin_handle, LOG_INFORM,
-						   "Leaf %d: %zu clients, "
-						   "L-stock=%"PRIu64" sats "
-						   "set_leaf_amounts=%d",
-						   ls, n_clients_on_leaf,
-						   amts[n_clients_on_leaf], slr);
+					if (factory_set_leaf_amounts(factory, ls,
+								    amts, n_outputs))
+						plugin_log(plugin_handle, LOG_INFORM,
+							   "Leaf %d: %zu clients, "
+							   "L-stock=%"PRIu64" sats",
+							   ls, n_clients_on_leaf,
+							   amts[n_clients_on_leaf]);
 					free(amts);
 				}
 			}
