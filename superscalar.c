@@ -2519,6 +2519,13 @@ static void continue_after_funding(struct command *cmd,
 		factory_set_lifecycle(new_f, fi->creation_block, 4320, 432);
 		factory_build_tree(new_f);
 
+		/* Re-apply per-client allocations on the LSP's rebuilt tree.
+		 * Without this, the post-funding LSP tree carries libsuperscalar
+		 * default even-split amounts while the client's PROPOSE/ALL_NONCES
+		 * rebuild already applied allocations — the two sides would sign
+		 * different per-leaf outputs. No-op when n_allocations==0. */
+		apply_allocations_to_leaves(fi, new_f, n_total);
+
 		factory_t *old_f = f;
 		if (old_f) { factory_free(old_f); free(old_f); }
 		fi->lib_factory = new_f;
@@ -7775,9 +7782,14 @@ static struct command_result *json_factory_create(struct command *cmd,
 		size_t ai;
 		size_t alloc_count = 0;
 		uint64_t alloc_sum = 0;
+		size_t array_total = 0;
+		json_for_each_arr(ai, at, allocations_tok)
+			array_total++;
+		if (array_total != fi->n_clients)
+			return command_fail(cmd, LIGHTNINGD,
+				"allocations length (%zu) != clients length (%zu)",
+				array_total, fi->n_clients);
 		json_for_each_arr(ai, at, allocations_tok) {
-			if (alloc_count >= fi->n_clients)
-				break;
 			u64 v;
 			if (!json_to_u64(buf, at, &v))
 				return command_fail(cmd, LIGHTNINGD,
@@ -7786,10 +7798,6 @@ static struct command_result *json_factory_create(struct command *cmd,
 			alloc_sum += v;
 			alloc_count++;
 		}
-		if (alloc_count != fi->n_clients)
-			return command_fail(cmd, LIGHTNINGD,
-				"allocations length (%zu) != clients length (%zu)",
-				alloc_count, fi->n_clients);
 		/* Validate sum fits within non-L-stock 80% of funding. */
 		uint64_t cap = (*funding_sats) * 80 / 100;
 		if (alloc_sum > cap)
