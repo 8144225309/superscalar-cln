@@ -8549,6 +8549,65 @@ static struct command_result *json_factory_list(struct command *cmd,
 			json_add_u32(js, "funding_outnum", fi->funding_outnum);
 		}
 
+		/* Funding amount (post-CLN-withdraw fee deduction). Tests
+		 * use this to assert sums against the on-chain funding
+		 * output without having to read the TX themselves. */
+		json_add_u64(js, "funding_amount_sats",
+			     (u64)fi->funding_amount_sats);
+
+		/* Per-leaf snapshot: outputs (amount + scriptpubkey hex)
+		 * for every leaf node. Tests use this to map per-party
+		 * amounts to expected SPKs without having to read tree TXs
+		 * back from the blockchain. The leaves are indexed by
+		 * leaf_side (0..n_leaf_nodes-1) — same indexing as
+		 * factory-ps-advance and factory-buy-liquidity. */
+		if (lf) {
+			json_array_start(js, "leaves");
+			for (int ls = 0; ls < lf->n_leaf_nodes; ls++) {
+				size_t nidx = lf->leaf_node_indices[ls];
+				if (nidx >= lf->n_nodes) continue;
+				factory_node_t *nd = &lf->nodes[nidx];
+				json_object_start(js, NULL);
+				json_add_u32(js, "leaf_side", (u32)ls);
+				json_add_u32(js, "node_idx", (u32)nidx);
+				json_add_u32(js, "n_signers",
+					     (u32)nd->n_signers);
+				json_add_bool(js, "is_ps_leaf",
+					      nd->is_ps_leaf);
+				if (nd->is_ps_leaf)
+					json_add_u32(js, "ps_chain_len",
+						     (u32)nd->ps_chain_len);
+				/* signer participant indices (factory-wide,
+				 * 0=LSP, 1..N=clients). Lets tests map an
+				 * output to the party who controls its SPK. */
+				json_array_start(js, "signers");
+				for (size_t s = 0; s < nd->n_signers; s++)
+					json_add_u32(js, NULL,
+						(u32)nd->signer_indices[s]);
+				json_array_end(js);
+				/* Outputs with amount + spk hex */
+				json_array_start(js, "outputs");
+				for (size_t o = 0; o < nd->n_outputs; o++) {
+					json_object_start(js, NULL);
+					json_add_u64(js, "amount_sats",
+						(u64)nd->outputs[o].amount_sats);
+					char spk_hex[34*2 + 1] = {0};
+					for (size_t k = 0;
+					     k < nd->outputs[o].script_pubkey_len
+					     && k < 34;
+					     k++)
+						sprintf(spk_hex + k*2, "%02x",
+							nd->outputs[o].script_pubkey[k]);
+					json_add_string(js, "scriptpubkey",
+							spk_hex);
+					json_object_end(js);
+				}
+				json_array_end(js);
+				json_object_end(js);
+			}
+			json_array_end(js);
+		}
+
 		/* Per-channel data with DW leaf funding outpoint */
 		json_array_start(js, "channels");
 		for (size_t ch = 0; ch < fi->n_channels; ch++) {
