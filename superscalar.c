@@ -1326,6 +1326,12 @@ static void ss_clear_ps_pending(factory_instance_t *fi)
 		free(fi->ps_pending_secnonce);
 		fi->ps_pending_secnonce = NULL;
 	}
+	if (fi->cached_ps_propose_wire) {
+		free(fi->cached_ps_propose_wire);
+		fi->cached_ps_propose_wire = NULL;
+		fi->cached_ps_propose_len = 0;
+		memset(fi->cached_ps_propose_target_pid, 0, 33);
+	}
 	fi->ps_pending_leaf = -1;
 	fi->ps_pending_node_idx = 0;
 	fi->ps_pending_start_block = 0;
@@ -9294,6 +9300,21 @@ static struct command_result *json_factory_ps_advance(struct command *cmd,
 	send_factory_msg(cmd, client_hex, SS_SUBMSG_LEAF_ADVANCE_PROPOSE,
 			 payload, plen);
 
+	/* Cache the PROPOSE payload + target client pid for reconnect
+	 * resume. If the client drops between PROPOSE and PSIG, the
+	 * peer_connected handler resends this payload so the ceremony
+	 * doesn't wedge. Freed in ss_clear_ps_pending. */
+	if (fi->cached_ps_propose_wire) {
+		free(fi->cached_ps_propose_wire);
+	}
+	fi->cached_ps_propose_wire = malloc(plen);
+	if (fi->cached_ps_propose_wire) {
+		memcpy(fi->cached_ps_propose_wire, payload, plen);
+		fi->cached_ps_propose_len = plen;
+		memcpy(fi->cached_ps_propose_target_pid,
+		       fi->clients[leaf_side].node_id, 33);
+	}
+
 	plugin_log(plugin_handle, LOG_INFORM,
 		"SS_METRIC event=ps_advance_propose iid=%s leaf=%u "
 		"chain_pos=%d",
@@ -14132,6 +14153,26 @@ static struct command_result *handle_connect(struct command *cmd,
 		bool is_rotating = (fi->ceremony == CEREMONY_ROTATING &&
 				    fi->cached_rotate_propose_wire &&
 				    fi->cached_rotate_propose_len > 0);
+		/* PS-advance reconnect: if a client disconnects after
+		 * receiving LEAF_ADVANCE_PROPOSE but before sending PSIG,
+		 * resend the cached PROPOSE so the ceremony continues.
+		 * Triggered by ps_pending_leaf != -1 + a cached payload. */
+		bool is_ps_pending = (fi->ps_pending_leaf != -1 &&
+				      fi->cached_ps_propose_wire &&
+				      fi->cached_ps_propose_len > 0);
+		if (is_ps_pending && fi->is_lsp &&
+		    memcmp(fi->cached_ps_propose_target_pid, pid, 33) == 0) {
+			send_factory_msg(cmd, peer_id,
+				SS_SUBMSG_LEAF_ADVANCE_PROPOSE,
+				fi->cached_ps_propose_wire,
+				fi->cached_ps_propose_len);
+			plugin_log(plugin_handle, LOG_INFORM,
+				"Reconnect recovery: re-sent"
+				" LEAF_ADVANCE_PROPOSE to client (PS"
+				" advance was stalled with"
+				" ps_pending_leaf=%d)",
+				fi->ps_pending_leaf);
+		}
 		if (!is_propose && !is_nonces && !is_rotating)
 			continue;
 

@@ -38,17 +38,17 @@ def _setup_ps(ss_node_factory, funding_sats=200_000):
 
 
 @pytest.mark.xfail(
-    reason="The plugin lacks an explicit reconnect-resume for PS "
-           "ceremonies (rotation has cached_rotate_propose_wire for "
-           "this; ps-advance does not). After a disconnect/reconnect "
-           "mid-PROPOSE→PSIG, neither path completes within 60s: "
-           "(a) connectd doesn't redeliver the queued custommsg on "
-           "reconnect (CLN may be holding it on the dead connection), "
-           "and (b) the PS_PENDING_TIMEOUT path itself doesn't fire "
-           "in this test harness (see test_ps_resilience.py for the "
-           "matching xfail). Adding cached_ps_propose_wire on the "
-           "ps_pending state and replaying it from peer_connected "
-           "would close the gap, mirroring the ROTATE_PROPOSE pattern.",
+    reason="LSP-side cached_ps_propose_wire resend on peer_connected "
+           "is now wired (commit 92cbaa6 follow-up), but the client "
+           "side bails on duplicate LEAF_ADVANCE_PROPOSE because its "
+           "own ps_pending_leaf is already set from the first attempt. "
+           "Making the client idempotent on duplicate PROPOSE for the "
+           "same leaf+chain_pos would close the gap, but needs careful "
+           "thought about replay vs MuSig nonce-reuse — the second "
+           "PROPOSE could carry a different LSP pubnonce. Two-step "
+           "fix: (a) client matches duplicate by (leaf,chain_pos) and "
+           "ignores if its own PSIG was already sent, (b) re-uses the "
+           "stashed secnonce instead of generating fresh.",
     strict=True)
 def test_ps_advance_completes_after_disconnect_reconnect(ss_node_factory):
     """Issue ps-advance, immediately flap the peer connection, then

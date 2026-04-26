@@ -355,6 +355,16 @@ typedef struct factory_instance {
 					  * amounts, no chain advance); 0 for
 					  * LEAF_ADVANCE. Memory-only. */
 
+	/* Cached LEAF_ADVANCE_PROPOSE wire payload + target peer for
+	 * reconnect resume. Mirrors the cached_rotate_propose_wire
+	 * pattern: if the peer drops between PROPOSE-send and PSIG-
+	 * receipt, peer_connected resends the cached payload so the
+	 * ceremony continues. Allocated at json_factory_ps_advance
+	 * PROPOSE-send time; freed in ss_clear_ps_pending. */
+	uint8_t *cached_ps_propose_wire;
+	size_t   cached_ps_propose_len;
+	uint8_t  cached_ps_propose_target_pid[33];
+
 	/* Task #93: ARITY_2 3-of-3 LEAF_REALLOC ceremony state.  ARITY_2
 	 * leaves have 3 signers (LSP + 2 clients) — the simple 2-of-2
 	 * pending fields above can't track which clients have replied.
