@@ -7696,8 +7696,22 @@ static struct command_result *json_factory_create(struct command *cmd,
 
 	/* Parse optional allocations array (per-client sats, ordered to match
 	 * clients array). If omitted, allocation_sats stays 0 and the even-
-	 * split fallback is used downstream. */
+	 * split fallback is used downstream.
+	 *
+	 * ARITY_PS: apply_allocations_to_leaves does not currently rewrite
+	 * chain[0]'s outputs (setup_ps_leaf_outputs hardcodes a 50/50
+	 * channel/L-stock split that survives the allocation pass). Until
+	 * PS-aware allocation logic lands, reject the parameter rather than
+	 * silently ignoring it — operators who set allocations expect them
+	 * to take effect. */
 	fi->n_allocations = 0;
+	if (allocations_tok && parsed_arity_mode == 3) {
+		return command_fail(cmd, LIGHTNINGD,
+			"allocations parameter is not supported for ARITY_PS "
+			"factories — apply_allocations_to_leaves doesn't "
+			"rewrite chain[0] outputs. Use arity_1 or arity_2 if "
+			"you need explicit per-client allocations.");
+	}
 	if (allocations_tok) {
 		const jsmntok_t *at;
 		size_t ai;
@@ -15248,6 +15262,56 @@ static struct command_result *json_dev_factory_set_signal(struct command *cmd,
 /* dev-factory-inject-penalty — test-only hook for Phase 3c.
  * Inserts a pending_penalty_t directly so tests can exercise the
  * fee-bump scheduler, reorg handling, and SIGNAL_PENALTY_CONFIRMED
+/* dev-superscalar-state — test-only probe. Returns the plugin's view
+ * of current_blockheight and per-factory ps_pending state so tests
+ * can synchronize with block-driven scheduler behavior (timeout
+ * cleanup, etc.) without polling logs or guessing timing. */
+static struct command_result *
+json_dev_superscalar_state(struct command *cmd,
+			   const char *buf,
+			   const jsmntok_t *params)
+{
+	const char *id_hex;
+	if (!param(cmd, buf, params,
+		   p_opt("instance_id", param_string, &id_hex),
+		   NULL))
+		return command_param_failed();
+
+	struct json_stream *js = jsonrpc_stream_success(cmd);
+	json_add_u32(js, "current_blockheight", ss_state.current_blockheight);
+	json_add_u32(js, "last_observed_blockheight",
+		     ss_state.last_observed_blockheight);
+	json_add_u64(js, "n_factories", (u64)ss_state.n_factories);
+
+	if (id_hex) {
+		if (strlen(id_hex) != 64)
+			return command_fail(cmd, LIGHTNINGD,
+				"Bad instance_id length");
+		uint8_t instance_id[32];
+		for (int j = 0; j < 32; j++) {
+			unsigned int b;
+			if (sscanf(id_hex + j*2, "%02x", &b) != 1)
+				return command_fail(cmd, LIGHTNINGD,
+					"Bad instance_id hex");
+			instance_id[j] = (uint8_t)b;
+		}
+		factory_instance_t *fi = ss_factory_find(&ss_state, instance_id);
+		if (!fi)
+			return command_fail(cmd, LIGHTNINGD,
+				"Factory not found");
+		json_add_string(js, "instance_id", id_hex);
+		json_add_s32(js, "ps_pending_leaf", fi->ps_pending_leaf);
+		json_add_u32(js, "ps_pending_start_block",
+			     fi->ps_pending_start_block);
+		json_add_u32(js, "ps_pending_is_realloc",
+			     (u32)fi->ps_pending_is_realloc);
+		json_add_u32(js, "ceremony", (u32)fi->ceremony);
+		json_add_u32(js, "epoch", fi->epoch);
+	}
+	return command_finished(cmd, js);
+}
+
+ /* dev-factory-inject-penalty — synthesize a pending_penalty entry
  * without requiring a real breach/broadcast. */
 static struct command_result *
 json_dev_factory_inject_penalty(struct command *cmd,
@@ -16536,6 +16600,10 @@ static const struct plugin_command commands[] = {
 	{
 		"dev-factory-set-signal",
 		json_dev_factory_set_signal,
+	},
+	{
+		"dev-superscalar-state",
+		json_dev_superscalar_state,
 	},
 	{
 		"dev-factory-inject-penalty",
