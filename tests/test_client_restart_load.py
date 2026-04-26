@@ -33,9 +33,23 @@ def test_client_plugin_reloads_factory_after_restart(ss_node_factory):
                                    arity_mode="arity_ps")
     wait_for_ceremony_complete(lsp, iid, timeout=120.0)
 
-    pre = next(f for f in client.rpc.call("factory-list")["factories"]
-               if f["instance_id"] == iid)
-    assert pre["ceremony"] == "complete"
+    # Wait for the CLIENT side ceremony to also reach 'complete'.
+    # wait_for_ceremony_complete polls the LSP — the client side
+    # ceremony state machine lags slightly because it advances on
+    # FACTORY_READY receipt. Without this wait, the test races and
+    # may catch the client at 'nonces_collected' or 'psigs_collected'.
+    import time
+    deadline = time.time() + 60.0
+    pre = None
+    while time.time() < deadline:
+        f = next(x for x in client.rpc.call("factory-list")["factories"]
+                 if x["instance_id"] == iid)
+        if f["ceremony"] == "complete":
+            pre = f
+            break
+        time.sleep(0.5)
+    assert pre is not None and pre["ceremony"] == "complete", (
+        "client side ceremony didn't reach 'complete' within 60s")
 
     # Restart triggers ss_load_factories on the client side.
     # Pre-fix this would have crashed with SIGABRT inside
