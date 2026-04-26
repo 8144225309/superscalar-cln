@@ -1332,6 +1332,11 @@ static void ss_clear_ps_pending(factory_instance_t *fi)
 		fi->cached_ps_propose_len = 0;
 		memset(fi->cached_ps_propose_target_pid, 0, 33);
 	}
+	if (fi->cached_ps_psig_wire) {
+		free(fi->cached_ps_psig_wire);
+		fi->cached_ps_psig_wire = NULL;
+		fi->cached_ps_psig_len = 0;
+	}
 	fi->ps_pending_leaf = -1;
 	fi->ps_pending_node_idx = 0;
 	fi->ps_pending_start_block = 0;
@@ -5169,8 +5174,18 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 							}
 						}
 					}
-					/* Reset nonce tracking for PSIG round */
+					/* Reset nonce tracking for PSIG round.
+					 * ss_factory_reset_ceremony also sets
+					 * ceremony=IDLE; restore CEREMONY_ROTATING
+					 * immediately so factory-list / ps-advance
+					 * see the correct rotation-in-progress
+					 * state during the gap before DIST psigs
+					 * finish. Otherwise factory-ps-advance
+					 * fails with "factory not in signed state
+					 * (ceremony=0)" on PS factories whose dist
+					 * TX re-sign hasn't completed yet. */
 					ss_factory_reset_ceremony(fi);
+					fi->ceremony = CEREMONY_ROTATING;
 				}
 			}
 		}
@@ -6057,6 +6072,29 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 			break;
 		}
 		if (fp->ps_pending_leaf != -1) {
+			/* Duplicate PROPOSE for the same leaf is treated as
+			 * an LSP-side reconnect resend: re-emit the cached
+			 * PSIG instead of re-signing. BIP-327 forbids fresh-
+			 * nonce re-signing the same MuSig session (it would
+			 * leak our seckey).
+			 *
+			 * If pending is for a DIFFERENT leaf, or if we have
+			 * no cached PSIG (PROPOSE was processed but PSIG
+			 * couldn't be built — partial fail), drop. */
+			if (fp->ps_pending_leaf == (int32_t)leaf_side &&
+			    fp->cached_ps_psig_wire &&
+			    fp->cached_ps_psig_len > 0) {
+				send_factory_msg(cmd, peer_id,
+					SS_SUBMSG_LEAF_ADVANCE_PSIG,
+					fp->cached_ps_psig_wire,
+					fp->cached_ps_psig_len);
+				plugin_log(plugin_handle, LOG_INFORM,
+					"Reconnect recovery: re-sent cached "
+					"LEAF_ADVANCE_PSIG for leaf %u "
+					"(LSP resent PROPOSE)",
+					leaf_side);
+				break;
+			}
 			plugin_log(plugin_handle, LOG_UNUSUAL,
 				"LEAF_ADVANCE_PROPOSE while another advance "
 				"pending on leaf %d — dropping",
@@ -6236,6 +6274,20 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 			sizeof(payload), fp->instance_id, leaf_side,
 			my_pn_ser, my_psig_ser);
 		if (plen > 0) {
+			/* Cache the PSIG payload before sending so a duplicate
+			 * PROPOSE (from an LSP-side reconnect resend) can
+			 * re-emit the SAME bytes instead of re-signing. BIP-327
+			 * forbids fresh-nonce re-signing of the same message
+			 * (would leak our seckey). Freed in
+			 * ss_clear_ps_pending. */
+			if (fp->cached_ps_psig_wire)
+				free(fp->cached_ps_psig_wire);
+			fp->cached_ps_psig_wire = malloc(plen);
+			if (fp->cached_ps_psig_wire) {
+				memcpy(fp->cached_ps_psig_wire, payload, plen);
+				fp->cached_ps_psig_len = plen;
+			}
+
 			send_factory_msg(cmd, peer_id,
 				SS_SUBMSG_LEAF_ADVANCE_PSIG, payload, plen);
 			plugin_log(plugin_handle, LOG_INFORM,
@@ -8971,6 +9023,22 @@ static struct command_result *json_factory_rotate(struct command *cmd,
 			return command_fail(cmd, LIGHTNINGD,
 					    "Failed to rebuild tree");
 		}
+	}
+
+	/* Reset PS chain state on every PS leaf. Rotation rebuilds the
+	 * tree at a new epoch — the new state TXs supersede whatever PS
+	 * chain we had advanced to in the old epoch. Without this reset,
+	 * the next factory-ps-advance would increment ps_chain_len past
+	 * the old value (e.g., chain_pos=3 instead of 1) and the persisted
+	 * chain[0] from ss_save_all_ps_chain0 would no longer match the
+	 * lib_factory's view. Upstream factory.c doesn't expose a reset
+	 * helper for PS leaves, so do it inline. */
+	for (size_t ni = 0; ni < factory->n_nodes; ni++) {
+		factory_node_t *nd = &factory->nodes[ni];
+		if (!nd->is_ps_leaf) continue;
+		nd->ps_chain_len = 0;
+		memset(nd->ps_prev_txid, 0, 32);
+		nd->ps_prev_chan_amount = 0;
 	}
 
 	/* Re-initialize signing sessions */
@@ -15352,6 +15420,60 @@ json_dev_superscalar_state(struct command *cmd,
 	return command_finished(cmd, js);
 }
 
+/* dev-superscalar-tick — synthetically advance ss_state.current_block-
+ * height and run the per-block PS-pending timeout cleanup. Avoids the
+ * pyln-testing harness gap where mined bitcoind blocks don't trigger
+ * the plugin's block_added notification (CLN sees the new tip but
+ * the notification doesn't reach our handler in --developer mode).
+ *
+ * Production code is unaffected — this RPC just bumps the height and
+ * runs the same cleanup loop the real handler would. */
+static struct command_result *
+json_dev_superscalar_tick(struct command *cmd,
+			  const char *buf,
+			  const jsmntok_t *params)
+{
+	u32 *to_height;
+	if (!param(cmd, buf, params,
+		   p_req("to_height", param_u32, &to_height),
+		   NULL))
+		return command_param_failed();
+
+	uint32_t height = *to_height;
+	uint32_t prev = ss_state.current_blockheight;
+	ss_state.current_blockheight = height;
+	ss_state.last_observed_blockheight = height;
+
+	/* Run the same PS_PENDING_TIMEOUT_BLOCKS cleanup as
+	 * handle_block_added. Don't run the heavier breach-scan / cpfp /
+	 * sweep logic — those are out of scope for this dev RPC and
+	 * would slow down tests. */
+	size_t cleared = 0;
+	for (size_t i = 0; i < ss_state.n_factories; i++) {
+		factory_instance_t *fi = ss_state.factories[i];
+		if (!fi) continue;
+		if (fi->ps_pending_leaf != -1 &&
+		    fi->ps_pending_start_block > 0 &&
+		    ss_state.current_blockheight >
+			fi->ps_pending_start_block + PS_PENDING_TIMEOUT_BLOCKS) {
+			plugin_log(plugin_handle, LOG_UNUSUAL,
+				"SS_METRIC event=ps_advance_timeout "
+				"leaf=%d started_at=%u current=%u",
+				fi->ps_pending_leaf,
+				fi->ps_pending_start_block,
+				ss_state.current_blockheight);
+			ss_clear_ps_pending(fi);
+			cleared++;
+		}
+	}
+
+	struct json_stream *js = jsonrpc_stream_success(cmd);
+	json_add_u32(js, "previous_blockheight", prev);
+	json_add_u32(js, "current_blockheight", height);
+	json_add_u64(js, "ps_pending_cleared", (u64)cleared);
+	return command_finished(cmd, js);
+}
+
  /* dev-factory-inject-penalty — synthesize a pending_penalty entry
  * without requiring a real breach/broadcast. */
 static struct command_result *
@@ -16645,6 +16767,10 @@ static const struct plugin_command commands[] = {
 	{
 		"dev-superscalar-state",
 		json_dev_superscalar_state,
+	},
+	{
+		"dev-superscalar-tick",
+		json_dev_superscalar_tick,
 	},
 	{
 		"dev-factory-inject-penalty",

@@ -38,17 +38,19 @@ def _setup_ps(ss_node_factory, funding_sats=200_000):
 
 
 @pytest.mark.xfail(
-    reason="LSP-side cached_ps_propose_wire resend on peer_connected "
-           "is now wired (commit 92cbaa6 follow-up), but the client "
-           "side bails on duplicate LEAF_ADVANCE_PROPOSE because its "
-           "own ps_pending_leaf is already set from the first attempt. "
-           "Making the client idempotent on duplicate PROPOSE for the "
-           "same leaf+chain_pos would close the gap, but needs careful "
-           "thought about replay vs MuSig nonce-reuse — the second "
-           "PROPOSE could carry a different LSP pubnonce. Two-step "
-           "fix: (a) client matches duplicate by (leaf,chain_pos) and "
-           "ignores if its own PSIG was already sent, (b) re-uses the "
-           "stashed secnonce instead of generating fresh.",
+    reason="Both halves of reconnect resume are now wired in the "
+           "plugin: (a) LSP-side cached_ps_propose_wire + resend at "
+           "peer_connected, (b) client-side cached_ps_psig_wire that "
+           "re-emits on duplicate PROPOSE for the same leaf (BIP-327-"
+           "safe — no re-signing). But pyln-testing's lsp.rpc.disconnect "
+           "+ lsp.connect doesn't reliably trigger the LSP's "
+           "peer_connected handler in the test harness, so the "
+           "resend never fires and the ceremony stays stuck. "
+           "Production behavior should be correct (verified on signet "
+           "would close the gap); regtest infrastructure can't drive "
+           "the connect notification path. Future fix: add a "
+           "dev-superscalar-trigger-resend RPC, or use a different "
+           "test approach (e.g., simulate via raw custommsg flow).",
     strict=True)
 def test_ps_advance_completes_after_disconnect_reconnect(ss_node_factory):
     """Issue ps-advance, immediately flap the peer connection, then

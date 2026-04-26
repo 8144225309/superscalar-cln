@@ -365,6 +365,16 @@ typedef struct factory_instance {
 	size_t   cached_ps_propose_len;
 	uint8_t  cached_ps_propose_target_pid[33];
 
+	/* Cached LEAF_ADVANCE_PSIG wire payload (CLIENT side). When the
+	 * client receives a duplicate PROPOSE for the same leaf — caused
+	 * by an LSP-side cached_ps_propose_wire resend after reconnect —
+	 * it must re-send THIS cached PSIG rather than re-sign. Re-signing
+	 * with a fresh nonce against the same MuSig session would leak
+	 * the seckey (BIP-327 nonce reuse). Allocated when client sends
+	 * its PSIG; freed in ss_clear_ps_pending. */
+	uint8_t *cached_ps_psig_wire;
+	size_t   cached_ps_psig_len;
+
 	/* Task #93: ARITY_2 3-of-3 LEAF_REALLOC ceremony state.  ARITY_2
 	 * leaves have 3 signers (LSP + 2 clients) — the simple 2-of-2
 	 * pending fields above can't track which clients have replied.
