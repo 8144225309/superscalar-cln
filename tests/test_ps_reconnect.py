@@ -78,28 +78,10 @@ def test_ps_advance_completes_after_disconnect_reconnect(ss_node_factory):
     time.sleep(0.5)
     lsp.connect(client)
 
-    # The advance should EVENTUALLY land. If connectd re-delivered
-    # the queued PROPOSE/PSIG/DONE messages on reconnect, we'll see
-    # it within seconds. If not, the PS_PENDING_TIMEOUT_BLOCKS path
-    # would clear pending state — but THAT path doesn't auto-retry,
-    # so the operator would need to re-call. This test accepts the
-    # happy-path resume only: 60s window, then either pass or fail.
-    try:
-        wait_metric(lsp, r"event=ps_advance .* chain_pos=1",
-                    timeout=60.0)
-    except TimeoutError:
-        # Plugin's connectd-resume didn't pick up the dropped
-        # ceremony. This is a known limitation: PS advance has no
-        # explicit retry on reconnect like ROTATE_PROPOSE does.
-        # Re-issue manually after the timeout cleared.
-        try:
-            lsp.bitcoin.generate_block(4)  # force PS_PENDING_TIMEOUT
-            wait_metric(lsp, r"event=ps_advance_timeout leaf=0",
-                        timeout=15.0)
-        except TimeoutError:
-            pass
-        # Now retry — pending should be clear
-        lsp.rpc.call("factory-ps-advance",
-                     {"instance_id": iid, "leaf_side": 0})
-        wait_metric(lsp, r"event=ps_advance .* chain_pos=1",
-                    timeout=30.0)
+    # If LSP-side cached_ps_propose_wire resend at peer_connected
+    # fires AND the client side accepts the resent PROPOSE (now
+    # idempotent via cached_ps_psig_wire), we'll see chain_pos=1
+    # within seconds. If pyln-testing's reconnect doesn't trigger
+    # peer_connected on the LSP, this times out and the xfail kicks
+    # in. No fallback path — the xfail decorator handles the timeout.
+    wait_metric(lsp, r"event=ps_advance .* chain_pos=1", timeout=60.0)
