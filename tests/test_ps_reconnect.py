@@ -37,21 +37,6 @@ def _setup_ps(ss_node_factory, funding_sats=200_000):
     return lsp, client, iid
 
 
-@pytest.mark.xfail(
-    reason="Both halves of reconnect resume are now wired in the "
-           "plugin: (a) LSP-side cached_ps_propose_wire + resend at "
-           "peer_connected, (b) client-side cached_ps_psig_wire that "
-           "re-emits on duplicate PROPOSE for the same leaf (BIP-327-"
-           "safe — no re-signing). But pyln-testing's lsp.rpc.disconnect "
-           "+ lsp.connect doesn't reliably trigger the LSP's "
-           "peer_connected handler in the test harness, so the "
-           "resend never fires and the ceremony stays stuck. "
-           "Production behavior should be correct (verified on signet "
-           "would close the gap); regtest infrastructure can't drive "
-           "the connect notification path. Future fix: add a "
-           "dev-superscalar-trigger-resend RPC, or use a different "
-           "test approach (e.g., simulate via raw custommsg flow).",
-    strict=True)
 def test_ps_advance_completes_after_disconnect_reconnect(ss_node_factory):
     """Issue ps-advance, immediately flap the peer connection, then
     wait for the ceremony to complete via the chain_pos=1 metric.

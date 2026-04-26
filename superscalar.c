@@ -14151,10 +14151,13 @@ static struct command_result *handle_connect(struct command *cmd,
 	/* Send our supported protocols to the newly connected peer */
 	send_supported_protocols(cmd, peer_id);
 
-	/* Recovery: if we're the LSP and this peer is a factory client
-	 * who disconnected mid-ceremony, re-send FACTORY_PROPOSE so the
-	 * ceremony can continue without manual intervention. */
-	if (!ss_state.is_lsp || strlen(peer_id) != 66)
+	/* Recovery: if a factory we're the LSP for has this peer as a
+	 * client mid-ceremony, re-send the cached payload so the
+	 * ceremony can continue without manual intervention.
+	 * NOTE: ss_state.is_lsp is never assigned anywhere (calloc-zero
+	 * default), so we can't gate on the global. The per-factory
+	 * fi->is_lsp check inside the loop body is the actual gate. */
+	if (strlen(peer_id) != 66)
 		return notification_handled(cmd);
 
 	uint8_t pid[33];
@@ -15416,6 +15419,21 @@ json_dev_superscalar_state(struct command *cmd,
 			     (u32)fi->ps_pending_is_realloc);
 		json_add_u32(js, "ceremony", (u32)fi->ceremony);
 		json_add_u32(js, "epoch", fi->epoch);
+		json_add_bool(js, "is_lsp", fi->is_lsp);
+		json_add_u64(js, "cached_ps_propose_len",
+			     (u64)fi->cached_ps_propose_len);
+		json_add_bool(js, "cached_ps_propose_wire_set",
+			      fi->cached_ps_propose_wire != NULL);
+		{
+			char tpid_hex[67] = {0};
+			for (int j = 0; j < 33; j++)
+				sprintf(tpid_hex + j*2, "%02x",
+					fi->cached_ps_propose_target_pid[j]);
+			json_add_string(js, "cached_ps_propose_target_pid",
+					tpid_hex);
+		}
+		json_add_u64(js, "cached_ps_psig_len",
+			     (u64)fi->cached_ps_psig_len);
 	}
 	return command_finished(cmd, js);
 }
