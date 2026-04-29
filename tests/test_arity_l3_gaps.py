@@ -56,17 +56,6 @@ def test_force_close_rejects_unknown_factory(ss_node_factory):
 
 # --- apply_allocations_to_leaves: ARITY_1 with custom allocations ---
 
-@pytest.mark.xfail(strict=True, reason=(
-    "libsuperscalar's factory_set_leaf_amounts() refuses to rewrite "
-    "leaf output amounts on the LSP and client sides for ARITY_1: "
-    "every call (initial factory-create build, post-funding rebuild "
-    "in continue_after_funding, client PROPOSE/ALL_NONCES rebuild) "
-    "returns 0, so the libsuperscalar even-split default survives "
-    "and the requested allocation is silently dropped. The plugin "
-    "wiring is correct (parse → fi->allocations → "
-    "apply_allocations_to_leaves on every rebuild) — fix needs to "
-    "land in 8144225309/SuperScalar so set_leaf_amounts accepts the "
-    "rewrite. Tracked in OPEN-WORK.md."))
 def test_arity1_custom_allocations_applied(ss_node_factory):
     """factory-create on ARITY_1 (default 2-party) with allocations=[N]
     must rewrite the leaf's client output to N sats. Covers the body

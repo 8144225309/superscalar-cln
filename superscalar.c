@@ -771,8 +771,24 @@ static void apply_allocations_to_leaves(factory_instance_t *fi,
 			amts[out_idx++] = a;
 			csum += a;
 		}
-		uint64_t lt = ln->input_amount;
-		amts[nclients] = lt > csum ? lt - csum : 546;
+		/* Library enforces strict fund conservation: new_total must
+		 * equal sum(node->outputs[].amount_sats), NOT ln->input_amount.
+		 * The library deducts internal tree fees from outputs at
+		 * build time, so input_amount is larger than the output sum.
+		 * Mismatch → factory_set_leaf_amounts returns 0 silently and
+		 * the rewrite is dropped. Compute current_total from outputs. */
+		uint64_t current_total = 0;
+		for (size_t o = 0; o < ln->n_outputs; o++)
+			current_total += ln->outputs[o].amount_sats;
+		if (csum + 546 > current_total) {
+			plugin_log(plugin_handle, LOG_UNUSUAL,
+				   "apply_allocations: leaf=%d allocations sum %"PRIu64
+				   " leaves L-stock below dust (current_total=%"PRIu64
+				   "); skipping rewrite", ls, csum, current_total);
+			free(amts);
+			continue;
+		}
+		amts[nclients] = current_total - csum;
 		factory_set_leaf_amounts(factory, ls, amts, n_outputs);
 		free(amts);
 	}
@@ -7948,9 +7964,25 @@ static struct command_result *json_factory_create(struct command *cmd,
 						amts[out_idx++] = a;
 						client_sum += a;
 					}
-					uint64_t leaf_total = ln->input_amount;
-					amts[n_clients_on_leaf] = leaf_total > client_sum
-						? leaf_total - client_sum : 546;
+					/* Library requires sum(amts) == sum(current node
+					 * outputs), NOT ln->input_amount (which excludes the
+					 * tree-fee deduction the library has already applied).
+					 * Read current_total from outputs to satisfy the
+					 * conservation check in factory_set_leaf_amounts. */
+					uint64_t current_total = 0;
+					for (size_t o = 0; o < ln->n_outputs; o++)
+						current_total += ln->outputs[o].amount_sats;
+					if (client_sum + 546 > current_total) {
+						plugin_log(plugin_handle, LOG_UNUSUAL,
+							   "Leaf %d: allocations sum %"PRIu64
+							   " leaves L-stock below dust "
+							   "(current_total=%"PRIu64
+							   "); skipping rewrite",
+							   ls, client_sum, current_total);
+						free(amts);
+						continue;
+					}
+					amts[n_clients_on_leaf] = current_total - client_sum;
 
 					if (factory_set_leaf_amounts(factory, ls,
 								    amts, n_outputs))
