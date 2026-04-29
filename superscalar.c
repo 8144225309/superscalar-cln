@@ -2006,6 +2006,132 @@ static void ss_load_iid_counter(struct command *cmd)
 	ss_state.has_counter_loaded = true;
 }
 
+/* Gap 7: funding-pending chain reconciliation.
+ *
+ * After a crash between `withdraw` broadcast and txid persistence, a
+ * factory loads with funding_spk set but funding_txid all-zeros. The
+ * funds are recoverable on-chain — we just need to find which TX paid
+ * the expected address. Rather than make the operator resolve manually,
+ * walk the wallet's transaction history (`listtransactions`) and match
+ * any output's scriptPubKey against fi->funding_spk. On a match: fill
+ * in funding_txid + funding_outnum and persist.
+ *
+ * Best-effort. If the TX is not in the wallet (foreign-funded factory)
+ * or the wallet was wiped, the factory stays in funding-pending state
+ * and the existing operator-facing log line still fires. */
+struct reconcile_ctx {
+	factory_instance_t *fi;
+};
+
+static struct command_result *
+ss_reconcile_listtx_ok(struct command *cmd, const char *method,
+		       const char *buf, const jsmntok_t *result,
+		       void *arg)
+{
+	struct reconcile_ctx *rc = (struct reconcile_ctx *)arg;
+	factory_instance_t *fi = rc->fi;
+
+	const jsmntok_t *txs = json_get_member(buf, result, "transactions");
+	if (!txs || txs->type != JSMN_ARRAY) {
+		plugin_log(plugin_handle, LOG_UNUSUAL,
+			   "Reconcile: listtransactions response missing "
+			   "transactions[] for fi=%p", (void *)fi);
+		free(rc);
+		return command_finished(cmd, result);
+	}
+
+	/* Hex-encode the expected scriptPubKey for substring compare. */
+	char exp_spk_hex[34*2 + 1] = {0};
+	for (size_t k = 0; k < fi->funding_spk_len && k < 34; k++)
+		sprintf(exp_spk_hex + k*2, "%02x", fi->funding_spk[k]);
+
+	const jsmntok_t *tx;
+	size_t ti;
+	bool found = false;
+	json_for_each_arr(ti, tx, txs) {
+		const jsmntok_t *outs = json_get_member(buf, tx, "outputs");
+		if (!outs || outs->type != JSMN_ARRAY) continue;
+		const jsmntok_t *o;
+		size_t oi;
+		json_for_each_arr(oi, o, outs) {
+			const jsmntok_t *spk_t =
+				json_get_member(buf, o, "scriptPubKey");
+			if (!spk_t) continue;
+			/* Hex-compare; CLN emits lowercase hex. */
+			if ((size_t)(spk_t->end - spk_t->start) !=
+			    strlen(exp_spk_hex))
+				continue;
+			if (strncmp(buf + spk_t->start, exp_spk_hex,
+				    strlen(exp_spk_hex)) != 0)
+				continue;
+			/* Match — pull txid (display order) and vout. */
+			const jsmntok_t *txid_t =
+				json_get_member(buf, tx, "hash");
+			if (!txid_t)
+				txid_t = json_get_member(buf, tx, "txid");
+			const jsmntok_t *vout_t =
+				json_get_member(buf, o, "index");
+			if (!txid_t || !vout_t) continue;
+			char txid_hex[65] = {0};
+			size_t tlen = txid_t->end - txid_t->start;
+			if (tlen != 64) continue;
+			memcpy(txid_hex, buf + txid_t->start, 64);
+			/* Reverse hex into internal byte order. */
+			for (int j = 0; j < 32; j++) {
+				unsigned int b;
+				sscanf(txid_hex + j*2, "%02x", &b);
+				fi->funding_txid[31 - j] = (uint8_t)b;
+			}
+			u64 vout;
+			if (!json_to_u64(buf, vout_t, &vout)) continue;
+			fi->funding_outnum = (uint32_t)vout;
+			found = true;
+			plugin_log(plugin_handle, LOG_INFORM,
+				   "Reconciled funding-pending factory: "
+				   "txid=%.64s outnum=%u",
+				   buf + txid_t->start, fi->funding_outnum);
+			break;
+		}
+		if (found) break;
+	}
+
+	if (found) {
+		/* Persist updated meta so the next load sees the txid. */
+		ss_save_factory(cmd, fi);
+	} else {
+		plugin_log(plugin_handle, LOG_UNUSUAL,
+			   "Reconcile: no wallet TX matches funding_spk; "
+			   "factory stays in funding-pending state");
+	}
+	free(rc);
+	return command_finished(cmd, result);
+}
+
+static struct command_result *
+ss_reconcile_listtx_err(struct command *cmd, const char *method,
+			const char *buf, const jsmntok_t *err, void *arg)
+{
+	struct reconcile_ctx *rc = (struct reconcile_ctx *)arg;
+	plugin_log(plugin_handle, LOG_UNUSUAL,
+		   "Reconcile: listtransactions failed: %.*s",
+		   err ? err->end - err->start : 0,
+		   err ? buf + err->start : "");
+	free(rc);
+	return command_finished(cmd, err);
+}
+
+static void ss_reconcile_funding_pending(struct command *cmd,
+					 factory_instance_t *fi)
+{
+	struct reconcile_ctx *rc = malloc(sizeof(*rc));
+	if (!rc) return;
+	rc->fi = fi;
+	struct out_req *req = jsonrpc_request_start(cmd,
+		"listtransactions",
+		ss_reconcile_listtx_ok, ss_reconcile_listtx_err, rc);
+	send_outreq(req);
+}
+
 static void ss_load_factories(struct command *cmd)
 {
 	size_t loaded = 0;
@@ -2469,10 +2595,12 @@ static void ss_load_factories(struct command *cmd)
 				plugin_log(plugin_handle, LOG_UNUSUAL,
 					"Factory %s: funding-pending at startup "
 					"(no txid recorded). Expected funding "
-					"address: %s. Check on-chain and either "
-					"complete the ceremony or delete the "
-					"factory.", iid_hex, addr);
+					"address: %s. Attempting wallet "
+					"reconciliation.", iid_hex, addr);
 			}
+			/* Gap 7: try to find the funding TX in the wallet's
+			 * history and fill in the txid/outnum automatically. */
+			ss_reconcile_funding_pending(cmd, fi);
 		}
 	}
 }
