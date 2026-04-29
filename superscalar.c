@@ -2770,7 +2770,9 @@ static void continue_after_funding(struct command *cmd,
 		/* Gap 9: snapshot the rebuilt tree's keyagg state. This is the
 		 * post-real-funding tree we're about to ALL_NONCES → PSIG →
 		 * sign against; persist its cache so a future reload restores
-		 * the same bytes instead of trusting the recompute. */
+		 * the same bytes instead of trusting the recompute. The
+		 * subsequent ss_save_factory call (line ~2881) picks up the
+		 * fresh blob and writes it to the meta record. */
 		ss_keyagg_snapshot_capture(fi);
 
 		factory_sessions_init(f);
@@ -3825,8 +3827,13 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 
 						/* Gap 9: snapshot keyagg state on this
 						 * client-side rebuild path (post-PROPOSE
-						 * with real funding). */
+						 * with real funding). Force a save now
+						 * so the blob is durable before we begin
+						 * sending PSIG — the existing PROPOSE
+						 * handler doesn't otherwise persist meta
+						 * here. */
 						ss_keyagg_snapshot_capture(fi);
+						ss_save_factory(cmd, fi);
 
 						/* Re-init sessions then re-set all nonces
 						 * from cache (LSP's + all clients') */
@@ -4089,8 +4096,11 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 					 * client-side ALL_NONCES rebuild — this
 					 * is the tree we're about to PSIG with
 					 * real pubkeys, so the cache here is
-					 * what we need to restore on reload. */
+					 * what we need to restore on reload.
+					 * Force a save so the blob is durable
+					 * before PSIG. */
 					ss_keyagg_snapshot_capture(fi);
+					ss_save_factory(cmd, fi);
 
 					plugin_log(plugin_handle, LOG_INFORM,
 						   "Client: rebuilt tree with real "
@@ -15782,6 +15792,26 @@ json_dev_superscalar_state(struct command *cmd,
 		}
 		json_add_u64(js, "cached_ps_psig_len",
 			     (u64)fi->cached_ps_psig_len);
+		/* Gap 9: keyagg snapshot fingerprint. SHA256 of the persisted
+		 * blob — tests use this to verify pre-restart and post-restart
+		 * caches are byte-identical. Empty string when no snapshot has
+		 * been captured (factory pre-v15 or pre-funding). */
+		json_add_u64(js, "keyagg_snapshots_len",
+			     (u64)fi->keyagg_snapshots_len);
+		if (fi->keyagg_snapshots && fi->keyagg_snapshots_len > 0) {
+			struct sha256 fp;
+			sha256(&fp, fi->keyagg_snapshots,
+			       fi->keyagg_snapshots_len);
+			char fp_hex[65] = {0};
+			for (int j = 0; j < 32; j++)
+				sprintf(fp_hex + j*2, "%02x",
+					((uint8_t *)&fp)[j]);
+			json_add_string(js, "keyagg_snapshots_fingerprint",
+					fp_hex);
+		} else {
+			json_add_string(js, "keyagg_snapshots_fingerprint",
+					"");
+		}
 	}
 	return command_finished(cmd, js);
 }
