@@ -92,8 +92,11 @@ size_t ss_persist_serialize_meta(const factory_instance_t *fi, uint8_t **out)
 	 *      (watcher Phase 4d)
 	 *  v12 adds aborted_at_block (watcher Phase 4c)
 	 *  v13 adds pending_cpfps array (watcher Phase 3c2)
-	 *  v14 adds arity_mode (Tier 2.6: PS arity support) */
-	buf_u8(&buf, &len, &cap, 14);
+	 *  v14 adds arity_mode (Tier 2.6: PS arity support)
+	 *  v15 adds keyagg_snapshots blob (Gap 9: MuSig2 keyagg cache
+	 *      persistence so reload doesn't depend on a bit-identical
+	 *      recompute) */
+	buf_u8(&buf, &len, &cap, 15);
 
 	/* Identity */
 	buf_append(&buf, &len, &cap, fi->instance_id, 32);
@@ -323,6 +326,20 @@ size_t ss_persist_serialize_meta(const factory_instance_t *fi, uint8_t **out)
 	/* v14: Tier 2.6 arity_mode. 0 = auto; 1/2/3 = ARITY_1/2/PS. */
 	buf_u8(&buf, &len, &cap, fi->arity_mode);
 
+	/* v15: Gap 9 keyagg_snapshots blob. Length-prefixed so we don't have
+	 * to know the libsuperscalar struct size at this layer. The plugin
+	 * captures lib_factory->nodes[i].keyagg into fi->keyagg_snapshots
+	 * before each save (see ss_keyagg_snapshot_capture). */
+	{
+		uint32_t klen = (uint32_t)fi->keyagg_snapshots_len;
+		uint8_t lb[4] = { (klen>>24)&0xFF, (klen>>16)&0xFF,
+				  (klen>>8)&0xFF, klen&0xFF };
+		buf_append(&buf, &len, &cap, lb, 4);
+		if (fi->keyagg_snapshots && klen > 0)
+			buf_append(&buf, &len, &cap,
+				   fi->keyagg_snapshots, klen);
+	}
+
 	*out = buf;
 	return len;
 }
@@ -336,7 +353,7 @@ bool ss_persist_deserialize_meta(factory_instance_t *fi,
 	uint8_t version, tmp8;
 	uint16_t tmp16;
 
-	if (!read_u8(&p, &rem, &version) || version < 1 || version > 14)
+	if (!read_u8(&p, &rem, &version) || version < 1 || version > 15)
 		return false;
 
 	if (!read_bytes(&p, &rem, fi->instance_id, 32)) return false;
@@ -726,6 +743,28 @@ bool ss_persist_deserialize_meta(factory_instance_t *fi,
 	if (version >= 14) {
 		if (!read_u8(&p, &rem, &fi->arity_mode))
 			return false;
+	}
+
+	/* v15: Gap 9 keyagg_snapshots blob. Stash for restore-after-build
+	 * in superscalar.c. Pre-v15 records leave the field NULL — restore
+	 * is a no-op and we fall back to the recompute path. */
+	fi->keyagg_snapshots = NULL;
+	fi->keyagg_snapshots_len = 0;
+	if (version >= 15) {
+		uint32_t klen;
+		if (!read_u32(&p, &rem, &klen))
+			return false;
+		if (klen > 0) {
+			if (rem < klen)
+				return false;
+			fi->keyagg_snapshots = malloc(klen);
+			if (!fi->keyagg_snapshots)
+				return false;
+			memcpy(fi->keyagg_snapshots, p, klen);
+			fi->keyagg_snapshots_len = klen;
+			p += klen;
+			rem -= klen;
+		}
 	}
 
 	return true;
