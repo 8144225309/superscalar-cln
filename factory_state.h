@@ -656,6 +656,27 @@ typedef struct factory_instance {
 	uint8_t n_allocations;
 	uint64_t allocations[MAX_FACTORY_PARTICIPANTS];
 
+	/* Gap 9: MuSig2 keyagg cache snapshots per node, captured at
+	 * factory_build_tree time and persisted in meta v15+. Restored onto
+	 * lib_factory->nodes[i].keyagg after every rebuild so we never
+	 * depend on the recompute being bit-for-bit identical to what the
+	 * tree was originally signed with. Defends the signet-recovery
+	 * incident where two factories produced sigs that failed on-chain
+	 * validation despite the x-only agg pubkey matching.
+	 *
+	 * Blob layout:
+	 *   u16  n_entries
+	 *   for each entry:
+	 *     u16  node_idx
+	 *     u32  payload_size
+	 *     u8[payload_size]   raw bytes of musig_keyagg_t (memcpy)
+	 *
+	 * n_entries == 0 (or NULL blob) means no snapshot — caller falls
+	 * back to whatever factory_build_tree computed. Heap-owned; freed
+	 * on factory destruction. */
+	uint8_t *keyagg_snapshots;
+	size_t   keyagg_snapshots_len;
+
 } factory_instance_t;
 
 /* Global plugin state */

@@ -730,6 +730,91 @@ struct funding_ctx {
 	uint8_t funding_spk_len;
 };
 
+/* Gap 9: capture/restore MuSig2 keyagg cache snapshots.
+ *
+ * After factory_build_tree, every node's keyagg (agg_pubkey + opaque
+ * cache) has been recomputed from pubkeys + arity. The signet-recovery
+ * incident showed that this recompute can produce a cache whose agg
+ * pubkey matches the originally-signed value yet still produces sigs
+ * that fail on-chain validation — likely subtle non-determinism in
+ * tweaking / parity state inside the opaque cache.
+ *
+ * Capture: serialize lib_factory->nodes[i].keyagg into fi->keyagg_-
+ * snapshots, replacing any previous blob. Persisted in meta v15.
+ *
+ * Restore: walk fi->keyagg_snapshots after factory_build_tree and
+ * memcpy each entry back onto lib_factory->nodes[node_idx].keyagg.
+ *
+ * Blob format (matches the structure documented on
+ * factory_instance_t.keyagg_snapshots):
+ *   u16 BE n_entries
+ *   for each entry:
+ *     u16 BE node_idx
+ *     u32 BE payload_size
+ *     payload_size bytes : raw memcpy of musig_keyagg_t */
+static void ss_keyagg_snapshot_capture(factory_instance_t *fi)
+{
+	factory_t *lf = (factory_t *)fi->lib_factory;
+	if (!lf || lf->n_nodes == 0) return;
+
+	const size_t entry_size = sizeof(musig_keyagg_t);
+	const size_t blob_len =
+		2 + lf->n_nodes * (2 + 4 + entry_size);
+
+	uint8_t *buf = malloc(blob_len);
+	if (!buf) return;
+	size_t off = 0;
+	buf[off++] = (lf->n_nodes >> 8) & 0xFF;
+	buf[off++] = lf->n_nodes & 0xFF;
+	for (size_t i = 0; i < lf->n_nodes; i++) {
+		buf[off++] = (i >> 8) & 0xFF;
+		buf[off++] = i & 0xFF;
+		buf[off++] = (entry_size >> 24) & 0xFF;
+		buf[off++] = (entry_size >> 16) & 0xFF;
+		buf[off++] = (entry_size >>  8) & 0xFF;
+		buf[off++] = entry_size & 0xFF;
+		memcpy(buf + off, &lf->nodes[i].keyagg, entry_size);
+		off += entry_size;
+	}
+
+	free(fi->keyagg_snapshots);
+	fi->keyagg_snapshots = buf;
+	fi->keyagg_snapshots_len = blob_len;
+}
+
+static void ss_keyagg_snapshot_restore(factory_instance_t *fi)
+{
+	factory_t *lf = (factory_t *)fi->lib_factory;
+	if (!lf || lf->n_nodes == 0) return;
+	if (!fi->keyagg_snapshots || fi->keyagg_snapshots_len < 2) return;
+
+	const uint8_t *p = fi->keyagg_snapshots;
+	size_t rem = fi->keyagg_snapshots_len;
+	uint16_t n_entries = ((uint16_t)p[0] << 8) | p[1];
+	p += 2; rem -= 2;
+
+	size_t restored = 0;
+	for (uint16_t i = 0; i < n_entries; i++) {
+		if (rem < 2 + 4) return;
+		uint16_t node_idx = ((uint16_t)p[0] << 8) | p[1];
+		uint32_t sz = ((uint32_t)p[2] << 24) | ((uint32_t)p[3] << 16)
+			    | ((uint32_t)p[4] <<  8) | p[5];
+		p += 6; rem -= 6;
+		if (rem < sz) return;
+		if (node_idx < lf->n_nodes
+		    && sz == sizeof(musig_keyagg_t)) {
+			memcpy(&lf->nodes[node_idx].keyagg, p, sz);
+			restored++;
+		}
+		p += sz; rem -= sz;
+	}
+	if (restored > 0)
+		plugin_log(plugin_handle, LOG_DBG,
+			   "Gap 9: restored %zu keyagg snapshot(s) onto "
+			   "rebuilt tree (n_nodes=%zu)",
+			   restored, lf->n_nodes);
+}
+
 /* Apply per-client allocations to every leaf's output amounts.
  * Uses fi->allocations[] (populated from factory-create RPC or from
  * FACTORY_PROPOSE/ALL_NONCES payload). Falls back to even split when
@@ -2408,6 +2493,13 @@ static void ss_load_factories(struct command *cmd)
 							fi->lib_factory = f;
 							fi->n_tree_nodes =
 								(uint32_t)f->n_nodes;
+							/* Gap 9: restore persisted
+							 * keyagg cache snapshots
+							 * onto the rebuilt tree.
+							 * No-op if the meta record
+							 * predates v15 or no
+							 * blob was captured. */
+							ss_keyagg_snapshot_restore(fi);
 							/* Load signed TXs from
 							 * datastore if available */
 							{
@@ -2674,6 +2766,14 @@ static void continue_after_funding(struct command *cmd,
 		if (old_f) { factory_free(old_f); free(old_f); }
 		fi->lib_factory = new_f;
 		f = new_f;
+
+		/* Gap 9: snapshot the rebuilt tree's keyagg state. This is the
+		 * post-real-funding tree we're about to ALL_NONCES → PSIG →
+		 * sign against; persist its cache so a future reload restores
+		 * the same bytes instead of trusting the recompute. The
+		 * subsequent ss_save_factory call (line ~2881) picks up the
+		 * fresh blob and writes it to the meta record. */
+		ss_keyagg_snapshot_capture(fi);
 
 		factory_sessions_init(f);
 		nonce_entry_t *cache = (nonce_entry_t *)fi->cached_nonces;
@@ -3725,6 +3825,16 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 						fi->lib_factory = new_f;
 						f = new_f;
 
+						/* Gap 9: snapshot keyagg state on this
+						 * client-side rebuild path (post-PROPOSE
+						 * with real funding). Force a save now
+						 * so the blob is durable before we begin
+						 * sending PSIG — the existing PROPOSE
+						 * handler doesn't otherwise persist meta
+						 * here. */
+						ss_keyagg_snapshot_capture(fi);
+						ss_save_factory(cmd, fi);
+
 						/* Re-init sessions then re-set all nonces
 						 * from cache (LSP's + all clients') */
 						factory_sessions_init(f);
@@ -3981,6 +4091,17 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 					free(old_f);
 					fi->lib_factory = new_f;
 					f = new_f;
+
+					/* Gap 9: snapshot keyagg state on the
+					 * client-side ALL_NONCES rebuild — this
+					 * is the tree we're about to PSIG with
+					 * real pubkeys, so the cache here is
+					 * what we need to restore on reload.
+					 * Force a save so the blob is durable
+					 * before PSIG. */
+					ss_keyagg_snapshot_capture(fi);
+					ss_save_factory(cmd, fi);
+
 					plugin_log(plugin_handle, LOG_INFORM,
 						   "Client: rebuilt tree with real "
 						   "pubkeys from ALL_NONCES");
@@ -15418,6 +15539,7 @@ static struct command_result *json_factory_confirm_closed(struct command *cmd,
 	}
 	if (fi->breach_data) free(fi->breach_data);
 	if (fi->dist_signed_tx) free(fi->dist_signed_tx);
+	if (fi->keyagg_snapshots) free(fi->keyagg_snapshots);
 	free(fi);
 	fi = NULL; /* poison */
 
@@ -15670,6 +15792,26 @@ json_dev_superscalar_state(struct command *cmd,
 		}
 		json_add_u64(js, "cached_ps_psig_len",
 			     (u64)fi->cached_ps_psig_len);
+		/* Gap 9: keyagg snapshot fingerprint. SHA256 of the persisted
+		 * blob — tests use this to verify pre-restart and post-restart
+		 * caches are byte-identical. Empty string when no snapshot has
+		 * been captured (factory pre-v15 or pre-funding). */
+		json_add_u64(js, "keyagg_snapshots_len",
+			     (u64)fi->keyagg_snapshots_len);
+		if (fi->keyagg_snapshots && fi->keyagg_snapshots_len > 0) {
+			struct sha256 fp;
+			sha256(&fp, fi->keyagg_snapshots,
+			       fi->keyagg_snapshots_len);
+			char fp_hex[65] = {0};
+			for (int j = 0; j < 32; j++)
+				sprintf(fp_hex + j*2, "%02x",
+					((uint8_t *)&fp)[j]);
+			json_add_string(js, "keyagg_snapshots_fingerprint",
+					fp_hex);
+		} else {
+			json_add_string(js, "keyagg_snapshots_fingerprint",
+					"");
+		}
 	}
 	return command_finished(cmd, js);
 }
