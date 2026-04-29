@@ -14941,7 +14941,16 @@ static struct command_result *json_factory_buy_liquidity(struct command *cmd,
 	 *     PS users wanting more inbound capacity should rotate the
 	 *     factory.
 	 *   - ARITY_1: 2-of-2 single-client leaf, "buying liquidity from
-	 *     yourself" — degenerate; upstream doesn't implement it. */
+	 *     yourself" — degenerate; upstream doesn't implement it.
+	 *
+	 * WITHIN-EPOCH POISONING NOTE: a successful realloc re-signs the
+	 * leaf with new amounts but the previous signed state remains
+	 * publishable by the LSP. Until cross-epoch rotation hands over
+	 * this epoch's revocation secret, the client has no chain-level
+	 * burn path against the old state. Operators MUST sequence the
+	 * client's LN payment AFTER the realloc_complete metric fires —
+	 * see "Within-Epoch LEAF_REALLOC Poisoning" in README.md for the
+	 * design rationale and future hardening options. */
 	factory_arity_t eff = ss_effective_arity(fi);
 	if (eff != FACTORY_ARITY_2)
 		return command_fail(cmd, LIGHTNINGD,
