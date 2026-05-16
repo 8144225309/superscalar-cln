@@ -114,6 +114,11 @@
 #define SS_SUBMSG_LEAF_REALLOC_PSIG_3		0x0139
 #define SS_SUBMSG_LEAF_REALLOC_DONE_3		0x013A
 
+/* Browse / discovery (third-party can ask: 'what factories do you run?').
+ * Wire-only, no MuSig2 / no funding tx. Read-only. */
+#define SS_SUBMSG_FACTORY_INFO_REQUEST		0x0140 /* client -> host */
+#define SS_SUBMSG_FACTORY_INFO_RESPONSE		0x0141 /* host -> client */
+
 /* Ceremony state */
 typedef enum {
 	CEREMONY_IDLE,

@@ -267,6 +267,61 @@ static const uint8_t SUPERSCALAR_PROTOCOL_ID[32] = {
 };
 
 /* --------------------------------------------------------------------- *
+ * Browse (third-party factory enumeration) — pending request tracking
+ *
+ * factory-browse-host sends FACTORY_INFO_REQUEST (0x0140) to a target peer
+ * and awaits FACTORY_INFO_RESPONSE (0x0141). The RPC returns
+ * command_still_pending; this table maps request_id -> cmd so the dispatch
+ * handler can resolve the right RPC when the response arrives.
+ * --------------------------------------------------------------------- */
+#define SS_BROWSE_MAX_PENDING		16
+#define SS_BROWSE_TIMEOUT_SECS		30
+struct ss_browse_pending_slot {
+	uint64_t request_id;
+	struct command *cmd;
+	time_t deadline;
+};
+static struct ss_browse_pending_slot ss_browse_pending[SS_BROWSE_MAX_PENDING];
+static uint64_t ss_browse_next_request_id = 1;
+
+static int ss_browse_alloc_slot(void)
+{
+	time_t now = time(NULL);
+	int free_slot = -1;
+	for (int i = 0; i < SS_BROWSE_MAX_PENDING; i++) {
+		if (ss_browse_pending[i].request_id == 0) {
+			if (free_slot < 0) free_slot = i;
+			continue;
+		}
+		if (now > ss_browse_pending[i].deadline) {
+			struct command *stuck = ss_browse_pending[i].cmd;
+			uint64_t stuck_id = ss_browse_pending[i].request_id;
+			ss_browse_pending[i].request_id = 0;
+			ss_browse_pending[i].cmd = NULL;
+			plugin_log(plugin_handle, LOG_UNUSUAL,
+				   "browse: timing out stuck request_id=%llu",
+				   (unsigned long long)stuck_id);
+			if (stuck) {
+				struct command_result *_cfail = command_fail(stuck, LIGHTNINGD,
+					"factory-browse-host: timeout waiting for peer response (req_id=%llu)",
+					(unsigned long long)stuck_id);
+				(void)_cfail;
+			}
+			if (free_slot < 0) free_slot = i;
+		}
+	}
+	return free_slot;
+}
+
+static int ss_browse_find_slot(uint64_t request_id)
+{
+	for (int i = 0; i < SS_BROWSE_MAX_PENDING; i++) {
+		if (ss_browse_pending[i].request_id == request_id) return i;
+	}
+	return -1;
+}
+
+/* --------------------------------------------------------------------- *
  * BIP-141 parser helpers (Phase 2b)
  *
  * Used for two purposes:
@@ -2897,7 +2952,9 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 	    && submsg_id != SS_SUBMSG_ROTATE_PROPOSE
 	    && submsg_id != SS_SUBMSG_REVOKE
 	    && submsg_id != SS_SUBMSG_REVOKE_ACK
-	    && submsg_id != SS_SUBMSG_CLOSE_PROPOSE) {
+	    && submsg_id != SS_SUBMSG_CLOSE_PROPOSE
+	    && submsg_id != SS_SUBMSG_FACTORY_INFO_REQUEST
+	    && submsg_id != SS_SUBMSG_FACTORY_INFO_RESPONSE) {
 		fi = ss_factory_find(&ss_state, data);
 		if (!fi) {
 			plugin_log(plugin_handle, LOG_UNUSUAL,
@@ -7616,6 +7673,151 @@ realloc_all_nonces_done:
 		break;
 	}
 
+	case SS_SUBMSG_FACTORY_INFO_REQUEST: {
+		if (len < 12) {
+			plugin_log(plugin_handle, LOG_UNUSUAL,
+				   "FACTORY_INFO_REQUEST from %s too short (%zu bytes)",
+				   peer_id, len);
+			break;
+		}
+		uint64_t req_id = 0;
+		for (int i = 0; i < 8; i++) req_id = (req_id << 8) | data[i];
+		uint32_t since_block = 0;
+		for (int i = 0; i < 4; i++) since_block = (since_block << 8) | data[8+i];
+
+		plugin_log(plugin_handle, LOG_INFORM,
+			   "FACTORY_INFO_REQUEST from %s (req_id=%llu since_block=%u)",
+			   peer_id, (unsigned long long)req_id, since_block);
+
+		size_t n_facts = ss_state.n_factories;
+		if (n_facts > 32) n_facts = 32;
+		size_t total = 13 + n_facts * 47;
+		uint8_t *resp = tal_arr(cmd, uint8_t, total);
+		uint8_t *p = resp;
+		for (int i = 7; i >= 0; i--) *p++ = (uint8_t)(req_id >> (i*8));
+		uint32_t snap = ss_state.current_blockheight;
+		for (int i = 3; i >= 0; i--) *p++ = (uint8_t)(snap >> (i*8));
+		uint8_t *n_facts_field = p;
+		*p++ = (uint8_t)n_facts;
+		size_t emitted = 0;
+		for (size_t fi_i = 0; fi_i < ss_state.n_factories && emitted < n_facts; fi_i++) {
+			factory_instance_t *xfi = ss_state.factories[fi_i];
+			if (!xfi) continue;
+			if (since_block && xfi->creation_block < since_block) continue;
+			memcpy(p, xfi->instance_id, 32); p += 32;
+			*p++ = (uint8_t)xfi->lifecycle;
+			for (int j = 3; j >= 0; j--) *p++ = (uint8_t)(xfi->creation_block >> (j*8));
+			for (int j = 3; j >= 0; j--) *p++ = (uint8_t)(xfi->expiry_block >> (j*8));
+			*p++ = (uint8_t)xfi->n_clients;
+			*p++ = (uint8_t)xfi->n_channels;
+			*p++ = xfi->is_lsp ? 1 : 0;
+			bool accepting = xfi->is_lsp && xfi->lifecycle == FACTORY_LIFECYCLE_INIT;
+			*p++ = accepting ? 1 : 0;
+			*p++ = 0; *p++ = 0;
+			emitted++;
+		}
+		if (emitted != n_facts) {
+			*n_facts_field = (uint8_t)emitted;
+			total = 13 + emitted * 47;
+		}
+
+		send_factory_msg(cmd, peer_id, SS_SUBMSG_FACTORY_INFO_RESPONSE,
+				 resp, total);
+		plugin_log(plugin_handle, LOG_INFORM,
+			   "Sent FACTORY_INFO_RESPONSE to %s (req_id=%llu, %zu bytes, %zu factories)",
+			   peer_id, (unsigned long long)req_id, total, emitted);
+		tal_free(resp);
+		break;
+	}
+
+	case SS_SUBMSG_FACTORY_INFO_RESPONSE: {
+		if (len < 13) {
+			plugin_log(plugin_handle, LOG_UNUSUAL,
+				   "FACTORY_INFO_RESPONSE from %s too short (%zu bytes)",
+				   peer_id, len);
+			break;
+		}
+		uint64_t req_id = 0;
+		for (int i = 0; i < 8; i++) req_id = (req_id << 8) | data[i];
+
+		int slot = ss_browse_find_slot(req_id);
+		if (slot < 0) {
+			plugin_log(plugin_handle, LOG_UNUSUAL,
+				   "FACTORY_INFO_RESPONSE for unknown req_id=%llu from %s (already timed out?)",
+				   (unsigned long long)req_id, peer_id);
+			break;
+		}
+		struct command *orig_cmd = ss_browse_pending[slot].cmd;
+		if (!orig_cmd) {
+			ss_browse_pending[slot].request_id = 0;
+			break;
+		}
+
+		uint32_t snap = 0;
+		for (int i = 0; i < 4; i++) snap = (snap << 8) | data[8+i];
+		uint8_t n_factories = data[12];
+
+		struct json_stream *js = jsonrpc_stream_success(orig_cmd);
+		json_add_string(js, "host_node_id", peer_id);
+		json_add_string(js, "factory_protocol_id", "SuperScalar/v1");
+		json_add_u32(js, "snapshot_block", snap);
+		json_array_start(js, "factories");
+
+		size_t offset = 13;
+		for (uint8_t i = 0; i < n_factories && offset + 47 <= len; i++) {
+			json_object_start(js, NULL);
+			char iid_hex[65];
+			for (int j = 0; j < 32; j++) sprintf(iid_hex + j*2, "%02x", data[offset + j]);
+			iid_hex[64] = 0;
+			json_add_string(js, "instance_id", iid_hex);
+			offset += 32;
+
+			uint8_t lc = data[offset++];
+			const char *lc_name;
+			switch (lc) {
+			case FACTORY_LIFECYCLE_INIT:               lc_name = "init"; break;
+			case FACTORY_LIFECYCLE_ACTIVE:             lc_name = "active"; break;
+			case FACTORY_LIFECYCLE_DYING:              lc_name = "dying"; break;
+			case FACTORY_LIFECYCLE_EXPIRED:            lc_name = "expired"; break;
+			case FACTORY_LIFECYCLE_CLOSED_EXTERNALLY:  lc_name = "closed_externally"; break;
+			case FACTORY_LIFECYCLE_CLOSED_COOPERATIVE: lc_name = "closed_cooperative"; break;
+			case FACTORY_LIFECYCLE_CLOSED_UNILATERAL:  lc_name = "closed_unilateral"; break;
+			case FACTORY_LIFECYCLE_CLOSED_BREACHED:    lc_name = "closed_breached"; break;
+			case FACTORY_LIFECYCLE_ABORTED:            lc_name = "aborted"; break;
+			default: lc_name = "unknown"; break;
+			}
+			json_add_string(js, "lifecycle", lc_name);
+
+			uint32_t cb = 0;
+			for (int j = 0; j < 4; j++) cb = (cb << 8) | data[offset + j];
+			json_add_u32(js, "created_block", cb);
+			offset += 4;
+			uint32_t eb = 0;
+			for (int j = 0; j < 4; j++) eb = (eb << 8) | data[offset + j];
+			json_add_u32(js, "expiry_block", eb);
+			offset += 4;
+			json_add_u32(js, "n_clients", data[offset++]);
+			json_add_u32(js, "n_channels", data[offset++]);
+			json_add_bool(js, "is_lsp", data[offset++] != 0);
+			json_add_bool(js, "accepting_joins", data[offset++] != 0);
+			offset += 2;
+			json_object_end(js);
+		}
+		json_array_end(js);
+
+		plugin_log(plugin_handle, LOG_INFORM,
+			   "factory-browse-host: resolved req_id=%llu with %u factories from %s",
+			   (unsigned long long)req_id, (unsigned)n_factories, peer_id);
+
+		ss_browse_pending[slot].request_id = 0;
+		ss_browse_pending[slot].cmd = NULL;
+		ss_browse_pending[slot].deadline = 0;
+
+		struct command_result *_cf_unused = command_finished(orig_cmd, js);
+		(void)_cf_unused;
+		break;
+	}
+
 	default:
 		plugin_log(plugin_handle, LOG_DBG,
 			   "Unknown submsg 0x%04x from %s (len=%zu)",
@@ -7922,6 +8124,47 @@ static struct command_result *handle_openchannel(struct command *cmd,
 
 /* factory-create RPC — LSP creates a new factory (Phase 1)
  * Takes client node IDs and creates the DW tree. */
+static struct command_result *json_factory_browse_host(struct command *cmd,
+						       const char *buf,
+						       const jsmntok_t *params)
+{
+	const char *node_id_str = NULL;
+	uint32_t *since_block_opt = NULL;
+
+	if (!param(cmd, buf, params,
+		   p_req("node_id", param_string, &node_id_str),
+		   p_opt("since_block", param_u32, &since_block_opt),
+		   NULL))
+		return command_param_failed();
+
+	int slot = ss_browse_alloc_slot();
+	if (slot < 0) {
+		return command_fail(cmd, LIGHTNINGD,
+			"factory-browse-host: too many pending requests (max %d). Try again later.",
+			SS_BROWSE_MAX_PENDING);
+	}
+
+	uint64_t req_id = ss_browse_next_request_id++;
+	ss_browse_pending[slot].request_id = req_id;
+	ss_browse_pending[slot].cmd = cmd;
+	ss_browse_pending[slot].deadline = time(NULL) + SS_BROWSE_TIMEOUT_SECS;
+
+	uint8_t payload[12];
+	uint8_t *p = payload;
+	for (int i = 7; i >= 0; i--) *p++ = (uint8_t)(req_id >> (i*8));
+	uint32_t since_block = since_block_opt ? *since_block_opt : 0;
+	for (int i = 3; i >= 0; i--) *p++ = (uint8_t)(since_block >> (i*8));
+
+	send_factory_msg(cmd, node_id_str, SS_SUBMSG_FACTORY_INFO_REQUEST,
+			 payload, sizeof(payload));
+
+	plugin_log(plugin_handle, LOG_INFORM,
+		   "factory-browse-host: sent FACTORY_INFO_REQUEST to %s (req_id=%llu since_block=%u)",
+		   node_id_str, (unsigned long long)req_id, since_block);
+
+	return command_still_pending(cmd);
+}
+
 static struct command_result *json_factory_create(struct command *cmd,
 						  const char *buf,
 						  const jsmntok_t *params)
@@ -17274,6 +17517,10 @@ static const struct plugin_command commands[] = {
 	{
 		"dev-factory-mark-cpfp-parent-confirmed",
 		json_dev_factory_mark_cpfp_parent_confirmed,
+	},
+	{
+		"factory-browse-host",
+		json_factory_browse_host,
 	},
 	{
 		"factory-create",
