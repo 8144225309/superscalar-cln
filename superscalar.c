@@ -11183,7 +11183,7 @@ static int ss_penalty_scheduler_tick(struct command *cmd,
 
 		tx_buf_t burn_tx;
 		tx_buf_init(&burn_tx, 256);
-		if (factory_build_burn_tx(f, &burn_tx, leaf->txid,
+		if (factory_build_burn_tx(f, &burn_tx, leaf, leaf->txid,
 					  lstock_vout, lstock_amt,
 					  pp->epoch)) {
 			char *burn_hex = tal_arr(cmd, char,
@@ -11396,7 +11396,7 @@ static int ss_rebuild_breach_burns(struct command *cmd,
 
 			tx_buf_t burn_tx;
 			tx_buf_init(&burn_tx, 256);
-			if (factory_build_burn_tx(f, &burn_tx, leaf->txid,
+			if (factory_build_burn_tx(f, &burn_tx, leaf, leaf->txid,
 						  lstock_vout, lstock_amt,
 						  bd->epoch)) {
 				char *burn_hex = tal_arr(cmd, char,
@@ -13765,7 +13765,7 @@ static struct command_result *breach_utxo_checked(struct command *cmd,
 
 				tx_buf_t burn_tx;
 				tx_buf_init(&burn_tx, 256);
-				if (factory_build_burn_tx(f, &burn_tx,
+				if (factory_build_burn_tx(f, &burn_tx, leaf,
 							  leaf->txid,
 							  lstock_vout,
 							  lstock_amt,
@@ -14445,11 +14445,30 @@ static struct command_result *json_factory_check_breach(struct command *cmd,
 		l_txid[31 - j] = (uint8_t)b; /* internal byte order */
 	}
 
-	/* Build burn tx for the specified epoch */
+	/* Build burn tx for the specified epoch.
+	 * lib PR #121 (zmn t/1242) added leaf_node as the 3rd arg to
+	 * factory_build_burn_tx. This dev RPC takes a raw txid from the
+	 * operator, so we look up the matching leaf by scanning the
+	 * factory's nodes. Returns a clear error if no leaf matches
+	 * (caller must have passed a valid L-stock txid from one of this
+	 * factory's leaves). */
+	const factory_node_t *leaf_for_burn = NULL;
+	for (size_t li = 0; li < factory->n_nodes; li++) {
+		if (memcmp(factory->nodes[li].txid, l_txid, 32) == 0) {
+			leaf_for_burn = &factory->nodes[li];
+			break;
+		}
+	}
+	if (!leaf_for_burn) {
+		return command_fail(cmd, LIGHTNINGD,
+			"No leaf in factory with that l_stock_txid — "
+			"check the txid matches an existing leaf node");
+	}
+
 	tx_buf_t burn_tx;
 	tx_buf_init(&burn_tx, 256);
 
-	if (!factory_build_burn_tx(factory, &burn_tx,
+	if (!factory_build_burn_tx(factory, &burn_tx, leaf_for_burn,
 				    l_txid, *vout, *amount_sats,
 				    *epoch)) {
 		tx_buf_free(&burn_tx);
