@@ -2119,6 +2119,239 @@ static void rotate_finish_and_notify(struct command *cmd,
 }
 
 /* Persist a factory's state to CLN datastore (fire-and-forget) */
+/* ============================================================================
+ * Phase 3: join queue + outgoing joins persistence helpers
+ *
+ * Serialized formats use a leading u8 schema_version so future changes can
+ * detect and migrate old blobs. Current schema_version = 1.
+ *
+ * TODO(privacy): pre-mainnet, audit what subset of these fields can be
+ * hashed/dropped after lifecycle completes. Currently we retain everything.
+ * ============================================================================ */
+#define SS_JOIN_SCHEMA_V1 1
+
+/* Per-entry sizes are written explicitly so a parser at a different version
+ * can sanity-check before trying to deserialize. v1 entry sizes: */
+#define SS_JOIN_QUEUE_ENTRY_V1_SZ      126   /* 33+8+8+4+4+4+1+64 */
+#define SS_OUTGOING_JOIN_ENTRY_V1_SZ   157   /* 33+32+8+8+4+4+4+1+64 */
+
+/* Datastore key for an LSP's join queue: superscalar/<iid_hex>/join-queue */
+static void ss_persist_key_join_queue(const factory_instance_t *fi,
+				       char *key, size_t keylen)
+{
+	char iid_hex[65];
+	for (int j = 0; j < 32; j++)
+		sprintf(iid_hex + j*2, "%02x", fi->instance_id[j]);
+	iid_hex[64] = 0;
+	snprintf(key, keylen, "superscalar/%s/join-queue", iid_hex);
+}
+
+/* Serialize the LSP-side join_queue to a freshly-allocated buffer.
+ * Caller frees the returned buffer (via free()). Returns 0 on empty queue. */
+static size_t ss_persist_serialize_join_queue(const factory_instance_t *fi,
+					       uint8_t **out_buf)
+{
+	*out_buf = NULL;
+	if (fi->n_join_queue == 0)
+		return 0;
+	size_t len = 3 + fi->n_join_queue * SS_JOIN_QUEUE_ENTRY_V1_SZ;
+	uint8_t *buf = calloc(1, len);
+	if (!buf) return 0;
+	uint8_t *p = buf;
+	*p++ = SS_JOIN_SCHEMA_V1;
+	*p++ = (fi->n_join_queue >> 8) & 0xFF;
+	*p++ = fi->n_join_queue & 0xFF;
+	for (size_t i = 0; i < fi->n_join_queue; i++) {
+		const factory_join_t *j = &fi->join_queue[i];
+		memcpy(p, j->client_node_id, 33); p += 33;
+		for (int k = 7; k >= 0; k--) *p++ = (j->request_id >> (k*8)) & 0xFF;
+		for (int k = 7; k >= 0; k--) *p++ = (j->contribution_sats >> (k*8)) & 0xFF;
+		for (int k = 3; k >= 0; k--) *p++ = (j->received_at_block >> (k*8)) & 0xFF;
+		for (int k = 3; k >= 0; k--) *p++ = (j->accepted_at_block >> (k*8)) & 0xFF;
+		for (int k = 3; k >= 0; k--) *p++ = (j->decided_at_block >> (k*8)) & 0xFF;
+		*p++ = (uint8_t)j->status;
+		memcpy(p, j->reason, 64); p += 64;
+	}
+	*out_buf = buf;
+	return len;
+}
+
+/* Deserialize a join_queue blob into fi->join_queue. Returns true on success,
+ * false on schema-version mismatch or length mismatch (in which case the
+ * caller should treat as "no saved queue"). */
+static bool ss_persist_deserialize_join_queue(factory_instance_t *fi,
+					       const uint8_t *buf, size_t len)
+{
+	if (len < 3) return false;
+	if (buf[0] != SS_JOIN_SCHEMA_V1) {
+		plugin_log(plugin_handle, LOG_UNUSUAL,
+			   "join_queue blob has unknown schema_version=%u for "
+			   "factory, refusing to load (will start fresh)",
+			   buf[0]);
+		return false;
+	}
+	uint16_t n = ((uint16_t)buf[1] << 8) | buf[2];
+	if (n > MAX_JOIN_QUEUE) {
+		plugin_log(plugin_handle, LOG_UNUSUAL,
+			   "join_queue blob declares %u entries, exceeds "
+			   "MAX_JOIN_QUEUE=%u, refusing to load",
+			   (unsigned)n, MAX_JOIN_QUEUE);
+		return false;
+	}
+	if (len != (size_t)(3 + n * SS_JOIN_QUEUE_ENTRY_V1_SZ)) {
+		plugin_log(plugin_handle, LOG_UNUSUAL,
+			   "join_queue blob length mismatch (got %zu, "
+			   "expected %zu for n=%u)", len,
+			   (size_t)(3 + n * SS_JOIN_QUEUE_ENTRY_V1_SZ),
+			   (unsigned)n);
+		return false;
+	}
+	const uint8_t *p = buf + 3;
+	fi->n_join_queue = 0;
+	for (uint16_t i = 0; i < n; i++) {
+		factory_join_t *j = &fi->join_queue[i];
+		memcpy(j->client_node_id, p, 33); p += 33;
+		j->request_id = 0;
+		for (int k = 0; k < 8; k++) j->request_id = (j->request_id << 8) | *p++;
+		j->contribution_sats = 0;
+		for (int k = 0; k < 8; k++) j->contribution_sats = (j->contribution_sats << 8) | *p++;
+		j->received_at_block = 0;
+		for (int k = 0; k < 4; k++) j->received_at_block = (j->received_at_block << 8) | *p++;
+		j->accepted_at_block = 0;
+		for (int k = 0; k < 4; k++) j->accepted_at_block = (j->accepted_at_block << 8) | *p++;
+		j->decided_at_block = 0;
+		for (int k = 0; k < 4; k++) j->decided_at_block = (j->decided_at_block << 8) | *p++;
+		j->status = (factory_join_status_t)*p++;
+		memcpy(j->reason, p, 64); p += 64;
+		fi->n_join_queue++;
+	}
+	plugin_log(plugin_handle, LOG_INFORM,
+		   "Loaded join_queue: %u entries", (unsigned)n);
+	return true;
+}
+
+/* ----- Client-side outgoing joins ----------------------------------------- */
+
+#define SS_OUTGOING_JOINS_KEY "superscalar/outgoing-joins"
+
+/* Serialize the client-side outgoing_joins to a freshly-allocated buffer.
+ * Caller frees via free(). Returns 0 on empty list. */
+static size_t ss_persist_serialize_outgoing_joins(uint8_t **out_buf)
+{
+	*out_buf = NULL;
+	if (ss_state.n_outgoing_joins == 0)
+		return 0;
+	size_t len = 3 + ss_state.n_outgoing_joins * SS_OUTGOING_JOIN_ENTRY_V1_SZ;
+	uint8_t *buf = calloc(1, len);
+	if (!buf) return 0;
+	uint8_t *p = buf;
+	*p++ = SS_JOIN_SCHEMA_V1;
+	*p++ = (ss_state.n_outgoing_joins >> 8) & 0xFF;
+	*p++ = ss_state.n_outgoing_joins & 0xFF;
+	for (size_t i = 0; i < ss_state.n_outgoing_joins; i++) {
+		const outgoing_join_t *o = &ss_state.outgoing_joins[i];
+		memcpy(p, o->lsp_node_id, 33); p += 33;
+		memcpy(p, o->instance_id, 32); p += 32;
+		for (int k = 7; k >= 0; k--) *p++ = (o->request_id >> (k*8)) & 0xFF;
+		for (int k = 7; k >= 0; k--) *p++ = (o->contribution_sats >> (k*8)) & 0xFF;
+		for (int k = 3; k >= 0; k--) *p++ = (o->sent_at_block >> (k*8)) & 0xFF;
+		for (int k = 3; k >= 0; k--) *p++ = (o->expected_signing_block >> (k*8)) & 0xFF;
+		for (int k = 3; k >= 0; k--) *p++ = (o->updated_at_block >> (k*8)) & 0xFF;
+		*p++ = (uint8_t)o->status;
+		memcpy(p, o->reason, 64); p += 64;
+	}
+	*out_buf = buf;
+	return len;
+}
+
+/* Persist outgoing_joins to the datastore. Caller is responsible for not
+ * calling this excessively — current pattern saves on every mutation. */
+static void ss_save_outgoing_joins(struct command *cmd)
+{
+	uint8_t *buf = NULL;
+	size_t len = ss_persist_serialize_outgoing_joins(&buf);
+	if (len > 0 && buf) {
+		jsonrpc_set_datastore_binary(cmd, SS_OUTGOING_JOINS_KEY,
+			buf, len, "create-or-replace",
+			rpc_done, rpc_err, NULL);
+		free(buf);
+		plugin_log(plugin_handle, LOG_DBG,
+			   "Persisted outgoing_joins (%zu entries, %zu bytes)",
+			   ss_state.n_outgoing_joins, len);
+	} else if (ss_state.n_outgoing_joins == 0) {
+		/* Persist an empty marker so a later load knows "we exist
+		 * but have no joins" rather than "no data ever". v1
+		 * marker is just the 3-byte header. */
+		uint8_t empty[3] = { SS_JOIN_SCHEMA_V1, 0, 0 };
+		jsonrpc_set_datastore_binary(cmd, SS_OUTGOING_JOINS_KEY,
+			empty, 3, "create-or-replace",
+			rpc_done, rpc_err, NULL);
+	}
+}
+
+/* Called from init() — load outgoing_joins from datastore at startup so
+ * wallet restarts don't lose pending-rotation memberships. */
+static void ss_load_outgoing_joins(struct command *cmd)
+{
+	u8 *buf = NULL;
+	const char *err = rpc_scan_datastore_hex(cmd, SS_OUTGOING_JOINS_KEY,
+						  &buf);
+	if (err || !buf) {
+		/* No prior data — fresh plugin or first run. Fine. */
+		ss_state.n_outgoing_joins = 0;
+		return;
+	}
+	size_t len = tal_bytelen(buf);
+	if (len < 3 || buf[0] != SS_JOIN_SCHEMA_V1) {
+		plugin_log(plugin_handle, LOG_UNUSUAL,
+			   "outgoing_joins blob has bad header (len=%zu, "
+			   "schema=%u), starting fresh", len,
+			   len > 0 ? buf[0] : 0);
+		ss_state.n_outgoing_joins = 0;
+		return;
+	}
+	uint16_t n = ((uint16_t)buf[1] << 8) | buf[2];
+	if (n > MAX_OUTGOING_JOINS) {
+		plugin_log(plugin_handle, LOG_UNUSUAL,
+			   "outgoing_joins blob declares %u entries, exceeds "
+			   "MAX_OUTGOING_JOINS=%u, starting fresh",
+			   (unsigned)n, MAX_OUTGOING_JOINS);
+		ss_state.n_outgoing_joins = 0;
+		return;
+	}
+	if (len != (size_t)(3 + n * SS_OUTGOING_JOIN_ENTRY_V1_SZ)) {
+		plugin_log(plugin_handle, LOG_UNUSUAL,
+			   "outgoing_joins blob length mismatch (got %zu, "
+			   "expected %zu for n=%u), starting fresh", len,
+			   (size_t)(3 + n * SS_OUTGOING_JOIN_ENTRY_V1_SZ),
+			   (unsigned)n);
+		ss_state.n_outgoing_joins = 0;
+		return;
+	}
+	const uint8_t *p = buf + 3;
+	ss_state.n_outgoing_joins = 0;
+	for (uint16_t i = 0; i < n; i++) {
+		outgoing_join_t *o = &ss_state.outgoing_joins[i];
+		memcpy(o->lsp_node_id, p, 33); p += 33;
+		memcpy(o->instance_id, p, 32); p += 32;
+		o->request_id = 0;
+		for (int k = 0; k < 8; k++) o->request_id = (o->request_id << 8) | *p++;
+		o->contribution_sats = 0;
+		for (int k = 0; k < 8; k++) o->contribution_sats = (o->contribution_sats << 8) | *p++;
+		o->sent_at_block = 0;
+		for (int k = 0; k < 4; k++) o->sent_at_block = (o->sent_at_block << 8) | *p++;
+		o->expected_signing_block = 0;
+		for (int k = 0; k < 4; k++) o->expected_signing_block = (o->expected_signing_block << 8) | *p++;
+		o->updated_at_block = 0;
+		for (int k = 0; k < 4; k++) o->updated_at_block = (o->updated_at_block << 8) | *p++;
+		o->status = (outgoing_join_status_t)*p++;
+		memcpy(o->reason, p, 64); p += 64;
+		ss_state.n_outgoing_joins++;
+	}
+	plugin_log(plugin_handle, LOG_INFORM,
+		   "Loaded outgoing_joins: %u entries", (unsigned)n);
+}
+
 static void ss_save_factory(struct command *cmd, factory_instance_t *fi)
 {
 	char key[128];
@@ -2218,9 +2451,27 @@ static void ss_save_factory(struct command *cmd, factory_instance_t *fi)
 		}
 	}
 
+	/* Phase 3: persist LSP-side join queue (only meaningful for is_lsp).
+	 * Empty queues are still saved (as a 3-byte header) so loaders can
+	 * distinguish "no entries yet" from "factory not yet seen at all". */
+	if (fi->is_lsp) {
+		ss_persist_key_join_queue(fi, key, sizeof(key));
+		len = ss_persist_serialize_join_queue(fi, &buf);
+		if (len > 0 && buf) {
+			jsonrpc_set_datastore_binary(cmd, key, buf, len,
+				"create-or-replace", rpc_done, rpc_err, fi);
+			free(buf);
+		} else if (fi->n_join_queue == 0) {
+			uint8_t empty[3] = { SS_JOIN_SCHEMA_V1, 0, 0 };
+			jsonrpc_set_datastore_binary(cmd, key, empty, 3,
+				"create-or-replace", rpc_done, rpc_err, fi);
+		}
+	}
+
 	plugin_log(plugin_handle, LOG_DBG,
-		   "Persisted factory state (epoch=%u, channels=%zu)",
-		   fi->epoch, fi->n_channels);
+		   "Persisted factory state (epoch=%u, channels=%zu, "
+		   "join_queue=%zu)",
+		   fi->epoch, fi->n_channels, fi->n_join_queue);
 }
 
 /* Load factories from CLN datastore on startup.
@@ -2541,14 +2792,27 @@ static void ss_load_factories(struct command *cmd)
 					}
 				}
 
+				/* Phase 3: load LSP-side join queue if persisted. */
+				if (fi->is_lsp) {
+					char jq_key[128];
+					ss_persist_key_join_queue(fi, jq_key, sizeof(jq_key));
+					u8 *jq_buf = NULL;
+					const char *jq_err = rpc_scan_datastore_hex(cmd,
+						jq_key, &jq_buf);
+					if (!jq_err && jq_buf) {
+						ss_persist_deserialize_join_queue(fi,
+							jq_buf, tal_bytelen(jq_buf));
+					}
+				}
+
 				loaded++;
 				plugin_log(plugin_handle, LOG_INFORM,
 					   "Loaded factory %s (epoch=%u, "
 					   "channels=%zu, breach_epochs=%zu, "
-					   "lifecycle=%d)",
+					   "lifecycle=%d, join_queue=%zu)",
 					   id_hex, fi->epoch,
 					   fi->n_channels, fi->n_breach_epochs,
-					   fi->lifecycle);
+					   fi->lifecycle, fi->n_join_queue);
 
 				/* Rebuild factory_t from persisted data so
 				 * rotation/force-close work after restart. */
@@ -15350,6 +15614,9 @@ static const char *init(struct command *init_cmd,
 	/* Gap 8: load monotonic iid counter BEFORE factories so any
 	 * derivation we do during startup picks up the right value. */
 	ss_load_iid_counter(init_cmd);
+
+	/* Phase 3: load client-side outgoing_joins persistent state. */
+	ss_load_outgoing_joins(init_cmd);
 
 	/* Load persisted factories from datastore */
 	ss_load_factories(init_cmd);
