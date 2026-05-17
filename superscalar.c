@@ -7852,9 +7852,13 @@ realloc_all_nonces_done:
 	}
 
 	case SS_SUBMSG_FACTORY_INFO_RESPONSE: {
-		if (len < 13) {
+		/* Bug-1 hardening: if we can read req_id (>=8 bytes), free the
+		 * slot and command_fail. Otherwise we have nothing to attribute
+		 * the malformed message to — just log and drop. */
+		if (len < 8) {
 			plugin_log(plugin_handle, LOG_UNUSUAL,
-				   "FACTORY_INFO_RESPONSE from %s too short (%zu bytes)",
+				   "FACTORY_INFO_RESPONSE from %s too short to "
+				   "read req_id (%zu bytes) — dropped",
 				   peer_id, len);
 			break;
 		}
@@ -7874,9 +7878,43 @@ realloc_all_nonces_done:
 			break;
 		}
 
+		/* Helper to free the slot + command_fail with a reason.
+		 * Used for every malformed-response path so the RPC fails
+		 * in <1ms instead of waiting 30s for the reaper. */
+		#define BROWSE_FAIL_MALFORMED(fmt, ...) do {			\
+			ss_browse_pending[slot].request_id = 0;		\
+			ss_browse_pending[slot].cmd = NULL;		\
+			ss_browse_pending[slot].deadline = 0;		\
+			plugin_log(plugin_handle, LOG_UNUSUAL,		\
+				   "browse: malformed response from %s "	\
+				   "(req_id=%llu): " fmt,			\
+				   peer_id,					\
+				   (unsigned long long)req_id,		\
+				   ##__VA_ARGS__);				\
+			struct command_result *_bf = command_fail(	\
+				orig_cmd, LIGHTNINGD,			\
+				"factory-browse-host: malformed "	\
+				"response from peer: " fmt,		\
+				##__VA_ARGS__);				\
+			(void)_bf;					\
+		} while (0)
+
+		if (len < 13) {
+			BROWSE_FAIL_MALFORMED(
+				"header truncated (%zu bytes, need 13)",
+				len);
+			break;
+		}
+
 		uint32_t snap = 0;
 		for (int i = 0; i < 4; i++) snap = (snap << 8) | data[8+i];
 		uint8_t n_factories = data[12];
+
+		/* Bug-2 hardening: pre-validate the wire body fits. For v1 each
+		 * factory entry is 47 bytes (trailing_tlv_len=0). If a peer
+		 * starts sending non-zero trailing TLVs we need to honor them,
+		 * but they must still fit within len. We do a strict cumulative
+		 * walk below and fail if any boundary is overrun. */
 
 		struct json_stream *js = jsonrpc_stream_success(orig_cmd);
 		json_add_string(js, "host_node_id", peer_id);
@@ -7885,7 +7923,14 @@ realloc_all_nonces_done:
 		json_array_start(js, "factories");
 
 		size_t offset = 13;
-		for (uint8_t i = 0; i < n_factories && offset + 47 <= len; i++) {
+		bool malformed = false;
+		for (uint8_t i = 0; i < n_factories; i++) {
+			/* Each fixed-section entry is 47 bytes. Bounds check
+			 * BEFORE reading any of it. */
+			if (offset + 47 > len) {
+				malformed = true;
+				break;
+			}
 			json_object_start(js, NULL);
 			char iid_hex[65];
 			for (int j = 0; j < 32; j++) sprintf(iid_hex + j*2, "%02x", data[offset + j]);
@@ -7921,10 +7966,40 @@ realloc_all_nonces_done:
 			json_add_u32(js, "n_channels", data[offset++]);
 			json_add_bool(js, "is_lsp", data[offset++] != 0);
 			json_add_bool(js, "accepting_joins", data[offset++] != 0);
+
+			/* Bug-2 hardening: read trailing_tlv_len and honor it
+			 * (advance past any trailing TLV bytes). v1 spec says
+			 * trailing_tlv_len = 0; future versions may use it for
+			 * per-entry feature TLVs. Refuse if declared length
+			 * runs past the message buffer. */
+			uint16_t trailing_tlv_len =
+				((uint16_t)data[offset]) << 8 |
+				(uint16_t)data[offset + 1];
 			offset += 2;
+			if (offset + trailing_tlv_len > len) {
+				/* JSON object is mid-build — close it before
+				 * we bail so the JSON stream stays well-formed
+				 * for the BROWSE_FAIL_MALFORMED path. */
+				json_object_end(js);
+				malformed = true;
+				break;
+			}
+			offset += trailing_tlv_len;
 			json_object_end(js);
 		}
 		json_array_end(js);
+
+		if (malformed) {
+			/* Tear down the half-built JSON stream by closing it
+			 * (the success-stream is owned by lightningd's RPC
+			 * subsystem and gets discarded when command_fail
+			 * replaces the success path). */
+			BROWSE_FAIL_MALFORMED(
+				"truncated body — declared %u factories but "
+				"only %zu of %zu bytes consumed",
+				(unsigned)n_factories, offset, len);
+			break;
+		}
 
 		plugin_log(plugin_handle, LOG_INFORM,
 			   "factory-browse-host: resolved req_id=%llu with %u factories from %s",
@@ -7936,6 +8011,7 @@ realloc_all_nonces_done:
 
 		struct command_result *_cf_unused = command_finished(orig_cmd, js);
 		(void)_cf_unused;
+		#undef BROWSE_FAIL_MALFORMED
 		break;
 	}
 
