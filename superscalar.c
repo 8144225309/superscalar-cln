@@ -2466,8 +2466,9 @@ static void ss_save_outgoing_joins(struct command *cmd)
 static void ss_load_outgoing_joins(struct command *cmd)
 {
 	u8 *buf = NULL;
-	const char *err = rpc_scan_datastore_hex(cmd, SS_OUTGOING_JOINS_KEY,
-						  &buf);
+	const char *err = rpc_scan_datastore_hex(tmpctx, cmd,
+		SS_OUTGOING_JOINS_KEY,
+		JSON_SCAN_TAL(tmpctx, json_tok_bin_from_hex, &buf));
 	if (err || !buf) {
 		/* No prior data — fresh plugin or first run. Fine. */
 		ss_state.n_outgoing_joins = 0;
@@ -2969,8 +2970,9 @@ static void ss_load_factories(struct command *cmd)
 					char jq_key[128];
 					ss_persist_key_join_queue(fi, jq_key, sizeof(jq_key));
 					u8 *jq_buf = NULL;
-					const char *jq_err = rpc_scan_datastore_hex(cmd,
-						jq_key, &jq_buf);
+					const char *jq_err = rpc_scan_datastore_hex(tmpctx, cmd,
+						jq_key,
+						JSON_SCAN_TAL(tmpctx, json_tok_bin_from_hex, &jq_buf));
 					if (!jq_err && jq_buf) {
 						ss_persist_deserialize_join_queue(fi,
 							jq_buf, tal_bytelen(jq_buf));
@@ -9308,7 +9310,11 @@ static struct command_result *join_preflight_ok(struct command *cmd,
 						const jsmntok_t *result,
 						void *arg)
 {
+	plugin_log(plugin_handle, LOG_INFORM,
+		   "DEBUG: join_preflight_ok entered");
 	struct join_preflight_ctx *ctx = arg;
+	plugin_log(plugin_handle, LOG_INFORM,
+		   "DEBUG: ctx unpacked, lsp=%s", ctx->lsp_node_id_str);
 
 	const jsmntok_t *peers_tok = json_get_member(buf, result, "peers");
 	if (!peers_tok || peers_tok->type != JSMN_ARRAY ||
@@ -9388,7 +9394,12 @@ static struct command_result *join_preflight_ok(struct command *cmd,
 	o->updated_at_block = ss_state.current_blockheight;
 	o->status = OUTGOING_JOIN_SENT;
 	memset(o->reason, 0, 64);
+	plugin_log(plugin_handle, LOG_INFORM,
+		   "DEBUG: about to save outgoing joins n=%zu",
+		   ss_state.n_outgoing_joins);
 	ss_save_outgoing_joins(cmd);
+	plugin_log(plugin_handle, LOG_INFORM,
+		   "DEBUG: saved outgoing joins, about to send wire");
 
 	/* Build wire payload: req_id(8) + instance_id(32) + contribution(8) + tlv_len(2) = 50 */
 	uint8_t payload[50];
@@ -9417,6 +9428,8 @@ static struct command_result *join_preflight_err(struct command *cmd,
 						 const jsmntok_t *result,
 						 void *arg)
 {
+	plugin_log(plugin_handle, LOG_INFORM,
+		   "DEBUG: join_preflight_err entered");
 	struct join_preflight_ctx *ctx = arg;
 	const jsmntok_t *msg_tok = json_get_member(buf, result, "message");
 	const char *errmsg = msg_tok
@@ -9441,6 +9454,11 @@ static struct command_result *json_factory_join_request(struct command *cmd,
 		   p_req("contribution_sats", param_u64, &contribution_sats),
 		   NULL))
 		return command_param_failed();
+
+	plugin_log(plugin_handle, LOG_INFORM,
+		   "DEBUG: factory-join-request called for lsp=%s iid=%s contrib=%llu",
+		   lsp_node_id_str, instance_id_str,
+		   (unsigned long long)*contribution_sats);
 
 	struct join_preflight_ctx *ctx =
 		tal(cmd, struct join_preflight_ctx);
