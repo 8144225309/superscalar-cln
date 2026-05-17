@@ -294,6 +294,10 @@ static struct ss_browse_pending_slot ss_browse_pending[SS_BROWSE_MAX_PENDING];
 static void ss_audit_log(enum log_level lvl, const char *event,
                          const char *fmt, ...);
 
+/* Forward decl for factory-funding-precheck handler (Phase 4). */
+static struct command_result *json_factory_funding_precheck(
+	struct command *cmd, const char *buf, const jsmntok_t *params);
+
 /* ============================================================================
  * Per-peer rate limit + slot cap tracking (hardening: DoS resistance)
  *
@@ -341,6 +345,8 @@ static void ss_audit_log(enum log_level lvl, const char *event,
 #define SS_ERR_INSTANCE_ID_INVALID       2244
 /* Wire/timing */
 #define SS_ERR_REQUEST_TIMEOUT           2250
+/* Funding (Phase 4) */
+#define SS_ERR_INSUFFICIENT_FUNDS        2270
 
 #define SS_PEER_TABLE_SIZE          64
 #define SS_PEER_MAX_CONCURRENT       2
@@ -19525,6 +19531,131 @@ json_dev_factory_trigger_reorg_check(struct command *cmd,
 	return json_factory_reorg_check(cmd, buf, params);
 }
 
+/* ============================================================================
+ * factory-funding-precheck RPC (Phase 4)
+ *
+ * Wallet calls this BEFORE factory-create to verify enough confirmed
+ * non-reserved UTXOs exist. Pure inspection — does not allocate any
+ * factory state. Output is shaped to drive the wallet's "you need to
+ * deposit N more sats" UI.
+ *
+ * Default fee estimate: 1000 sats (~ a few hundred vbytes at modest
+ * feerate). Caller can override with fee_estimate_sats.
+ *
+ * Failure modes:
+ *   - SS_ERR_INSUFFICIENT_FUNDS only when caller passes strict=true
+ *     AND wallet can't cover it. Otherwise returns a JSON response with
+ *     sufficient=false so the wallet can render the gap.
+ * ============================================================================ */
+
+struct funding_precheck_ctx {
+	u64 funding_sats;
+	u64 fee_estimate_sats;
+	bool strict;
+};
+
+static struct command_result *
+funding_precheck_listfunds_reply(struct command *cmd,
+				 const char *method UNUSED,
+				 const char *buf,
+				 const jsmntok_t *result,
+				 void *arg)
+{
+	struct funding_precheck_ctx *ctx = (struct funding_precheck_ctx *)arg;
+
+	const jsmntok_t *outputs = json_get_member(buf, result, "outputs");
+	if (!outputs || outputs->type != JSMN_ARRAY) {
+		return command_fail(cmd, SS_ERR_INTERNAL,
+			"factory-funding-precheck: listfunds returned no outputs array");
+	}
+
+	uint64_t available_sats = 0;
+	uint32_t counted = 0;
+	const jsmntok_t *t;
+	size_t i;
+	json_for_each_arr(i, t, outputs) {
+		const jsmntok_t *status_tok = json_get_member(buf, t, "status");
+		const jsmntok_t *reserved_tok = json_get_member(buf, t, "reserved");
+		const jsmntok_t *amt_tok = json_get_member(buf, t, "amount_msat");
+		if (!status_tok || !reserved_tok || !amt_tok) continue;
+
+		if (!json_tok_streq(buf, status_tok, "confirmed")) continue;
+
+		bool reserved_flag;
+		if (!json_to_bool(buf, reserved_tok, &reserved_flag)) continue;
+		if (reserved_flag) continue;
+
+		u64 amt_msat;
+		if (!json_to_u64(buf, amt_tok, &amt_msat)) continue;
+		available_sats += amt_msat / 1000;
+		counted++;
+	}
+
+	uint64_t required_sats = ctx->funding_sats + ctx->fee_estimate_sats;
+	bool sufficient = available_sats >= required_sats;
+	uint64_t shortfall = sufficient ? 0 : (required_sats - available_sats);
+
+	if (ctx->strict && !sufficient) {
+		return command_fail(cmd, SS_ERR_INSUFFICIENT_FUNDS,
+			"factory-funding-precheck: wallet has %"PRIu64" sat "
+			"confirmed non-reserved, need %"PRIu64" sat "
+			"(funding=%"PRIu64" + fee=%"PRIu64"). Shortfall %"PRIu64" sat.",
+			available_sats, required_sats,
+			ctx->funding_sats, ctx->fee_estimate_sats,
+			shortfall);
+	}
+
+	struct json_stream *js = jsonrpc_stream_success(cmd);
+	json_add_u64(js, "funding_sats", ctx->funding_sats);
+	json_add_u64(js, "fee_estimate_sats", ctx->fee_estimate_sats);
+	json_add_u64(js, "required_sats", required_sats);
+	json_add_u64(js, "available_sats", available_sats);
+	json_add_u32(js, "utxos_counted", counted);
+	json_add_bool(js, "sufficient", sufficient);
+	if (!sufficient)
+		json_add_u64(js, "shortfall_sats", shortfall);
+	return command_finished(cmd, js);
+}
+
+static struct command_result *
+funding_precheck_listfunds_err(struct command *cmd,
+			       const char *method UNUSED,
+			       const char *buf UNUSED,
+			       const jsmntok_t *result UNUSED,
+			       void *arg UNUSED)
+{
+	return command_fail(cmd, SS_ERR_INTERNAL,
+		"factory-funding-precheck: listfunds RPC failed");
+}
+
+static struct command_result *
+json_factory_funding_precheck(struct command *cmd,
+			      const char *buf,
+			      const jsmntok_t *params)
+{
+	u64 *funding_sats;
+	u64 *fee_estimate_sats_opt;
+	bool *strict_opt;
+	if (!param(cmd, buf, params,
+		   p_req("funding_sats", param_u64, &funding_sats),
+		   p_opt("fee_estimate_sats", param_u64, &fee_estimate_sats_opt),
+		   p_opt("strict", param_bool, &strict_opt),
+		   NULL))
+		return command_param_failed();
+
+	struct funding_precheck_ctx *ctx = tal(cmd, struct funding_precheck_ctx);
+	ctx->funding_sats = *funding_sats;
+	ctx->fee_estimate_sats = fee_estimate_sats_opt ? *fee_estimate_sats_opt : 1000;
+	ctx->strict = strict_opt ? *strict_opt : false;
+
+	struct out_req *req = jsonrpc_request_start(cmd, "listfunds",
+		funding_precheck_listfunds_reply,
+		funding_precheck_listfunds_err,
+		ctx);
+	send_outreq(req);
+	return command_still_pending(cmd);
+}
+
 static const struct plugin_command commands[] = {
 	{
 		"dev-factory-set-signal",
@@ -19641,6 +19772,10 @@ static const struct plugin_command commands[] = {
 	{
 		"factory-incoming-joins",
 		json_factory_incoming_joins,
+	},
+	{
+		"factory-funding-precheck",
+		json_factory_funding_precheck,
 	},
 	{
 		"factory-kick-joiner",
