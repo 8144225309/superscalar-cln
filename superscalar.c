@@ -4553,6 +4553,16 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 							json_add_string(wreq->js,
 								"satoshi", amt_str);
 						}
+						/* Phase 4: caller-supplied feerate override.
+						 * Honors signet 0.1 sat/vb (=100 perkw) etc. */
+						if (fi->requested_feerate_perkw > 0) {
+							char fr_str[32];
+							snprintf(fr_str, sizeof(fr_str),
+								 "%uperkw",
+								 fi->requested_feerate_perkw);
+							json_add_string(wreq->js,
+								"feerate", fr_str);
+						}
 						send_outreq(wreq);
 
 						fi->ceremony = CEREMONY_FUNDING_PENDING;
@@ -9992,11 +10002,13 @@ static struct command_result *json_factory_create(struct command *cmd,
 
 	const jsmntok_t *allocations_tok = NULL;
 	const char *arity_mode_str = NULL;
+	u32 *feerate_perkw_opt = NULL;
 	if (!param(cmd, buf, params,
 		   p_req("funding_sats", param_u64, &funding_sats),
 		   p_req("clients", param_array, &clients_tok),
 		   p_opt("allocations", param_array, &allocations_tok),
 		   p_opt("arity_mode", param_string, &arity_mode_str),
+		   p_opt("feerate_perkw", param_u32, &feerate_perkw_opt),
 		   NULL))
 		return command_param_failed();
 
@@ -10059,6 +10071,7 @@ static struct command_result *json_factory_create(struct command *cmd,
 	fi->lifecycle = FACTORY_LIFECYCLE_INIT;
 	fi->ceremony = CEREMONY_IDLE;
 	fi->arity_mode = parsed_arity_mode;
+	fi->requested_feerate_perkw = feerate_perkw_opt ? *feerate_perkw_opt : 0;
 
 	/* Parse client node IDs */
 	const jsmntok_t *t;

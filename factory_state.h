@@ -752,6 +752,14 @@ typedef struct factory_instance {
 	uint8_t *keyagg_snapshots;
 	size_t   keyagg_snapshots_len;
 
+	/* Phase 4: optional caller-supplied feerate for the funding TX.
+	 * 0 means "use CLN default". Set by factory-create's optional
+	 * feerate_perkw param. Honored when this plugin sends the withdraw
+	 * RPC to create the funding UTXO. Memory-only — funding happens
+	 * once at create time and the value is consumed; doesn't need
+	 * persistence. */
+	uint32_t requested_feerate_perkw;
+
 	/* Phase 3: LSP-side join lifecycle queue. Only populated for factories
 	 * where is_lsp == true. Persisted alongside other factory state via
 	 * ss_save_factory. See factory_join_t for the lifecycle states.
