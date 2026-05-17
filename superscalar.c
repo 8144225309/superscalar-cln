@@ -277,12 +277,260 @@ static const uint8_t SUPERSCALAR_PROTOCOL_ID[32] = {
  * --------------------------------------------------------------------- */
 #define SS_BROWSE_MAX_PENDING		16
 #define SS_BROWSE_TIMEOUT_SECS		30
+/* Runtime-mutable copy set by --superscalar-browse-timeout-secs.
+ * Default mirrors the compile-time constant; operators can lower for
+ * impatient UIs or raise for high-latency networks. */
+static u32 ss_browse_timeout_secs = SS_BROWSE_TIMEOUT_SECS;
 struct ss_browse_pending_slot {
 	uint64_t request_id;
 	struct command *cmd;
 	time_t deadline;
+	uint8_t peer_id[33];        /* for per-peer cap release */
 };
 static struct ss_browse_pending_slot ss_browse_pending[SS_BROWSE_MAX_PENDING];
+
+/* Forward decl: ss_audit_log is defined below ss_fresh_request_id, but the
+ * peer-table helpers (which appear above the helper definition) call it. */
+static void ss_audit_log(enum log_level lvl, const char *event,
+                         const char *fmt, ...);
+
+/* ============================================================================
+ * Per-peer rate limit + slot cap tracking (hardening: DoS resistance)
+ *
+ * Goal: one hostile peer cannot exhaust the 16-slot global browse/join pools.
+ *
+ * Limits enforced per peer node_id:
+ *   - Max SS_PEER_MAX_CONCURRENT outstanding slots (browse + join combined)
+ *   - Max SS_PEER_RATE_LIMIT requests per SS_PEER_RATE_WINDOW_SECS
+ *
+ * Implementation: fixed-size table (no dynamic allocation). Entries are
+ * recycled LRU-style when full. Trade-off: under sustained attack from
+ * many distinct peers, the table is evicted in FIFO order; legitimate
+ * peers may briefly bypass the cap. Acceptable for v1.
+ * ============================================================================ */
+#define SS_PEER_TABLE_SIZE          64
+#define SS_PEER_MAX_CONCURRENT       2
+#define SS_PEER_RATE_LIMIT          10
+#define SS_PEER_RATE_WINDOW_SECS    60
+/* Soft-ban (#71): N fails within window triggers M-second ban. */
+#define SS_PEER_MAX_FAILS            5
+#define SS_PEER_FAIL_WINDOW_SECS    60
+#define SS_PEER_SOFT_BAN_SECS      300
+
+struct ss_peer_usage {
+	uint8_t node_id[33];
+	bool in_use;
+	int concurrent_slots;       /* current outstanding browse + join slots */
+	time_t window_start;        /* start of current rate-limit window */
+	int requests_in_window;     /* requests counted in current window */
+	time_t last_seen;           /* LRU tracking for eviction */
+	/* Soft-ban (#71): fails counted within fail_window_start..+SECS;
+	 * crossing SS_PEER_MAX_FAILS sets ban_until = now + SOFT_BAN_SECS.
+	 * 0 ban_until means not banned. */
+	int fail_count;
+	time_t fail_window_start;
+	time_t ban_until;
+};
+
+static struct ss_peer_usage ss_peer_table[SS_PEER_TABLE_SIZE];
+
+/* Find or allocate a peer-usage entry by node_id. Returns NULL only if
+ * the entry can't be allocated (shouldn't happen with LRU eviction). */
+static struct ss_peer_usage *ss_peer_usage_get(const uint8_t node_id[33])
+{
+	time_t now = time(NULL);
+
+	/* Pass 1: existing entry */
+	for (int i = 0; i < SS_PEER_TABLE_SIZE; i++) {
+		if (ss_peer_table[i].in_use &&
+		    memcmp(ss_peer_table[i].node_id, node_id, 33) == 0) {
+			ss_peer_table[i].last_seen = now;
+			return &ss_peer_table[i];
+		}
+	}
+
+	/* Pass 2: find a free slot */
+	for (int i = 0; i < SS_PEER_TABLE_SIZE; i++) {
+		if (!ss_peer_table[i].in_use) {
+			memcpy(ss_peer_table[i].node_id, node_id, 33);
+			ss_peer_table[i].in_use = true;
+			ss_peer_table[i].concurrent_slots = 0;
+			ss_peer_table[i].window_start = now;
+			ss_peer_table[i].requests_in_window = 0;
+			ss_peer_table[i].last_seen = now;
+			ss_peer_table[i].fail_count = 0;
+			ss_peer_table[i].fail_window_start = now;
+			ss_peer_table[i].ban_until = 0;
+			return &ss_peer_table[i];
+		}
+	}
+
+	/* Pass 3: LRU eviction. Find the oldest in_use entry whose
+	 * concurrent_slots == 0 (don't evict peers with live slots). */
+	int oldest_idx = -1;
+	time_t oldest_seen = now;
+	for (int i = 0; i < SS_PEER_TABLE_SIZE; i++) {
+		if (ss_peer_table[i].concurrent_slots > 0) continue;
+		if (ss_peer_table[i].last_seen < oldest_seen) {
+			oldest_seen = ss_peer_table[i].last_seen;
+			oldest_idx = i;
+		}
+	}
+	if (oldest_idx >= 0) {
+		memcpy(ss_peer_table[oldest_idx].node_id, node_id, 33);
+		ss_peer_table[oldest_idx].in_use = true;
+		ss_peer_table[oldest_idx].concurrent_slots = 0;
+		ss_peer_table[oldest_idx].window_start = now;
+		ss_peer_table[oldest_idx].requests_in_window = 0;
+		ss_peer_table[oldest_idx].last_seen = now;
+		ss_peer_table[oldest_idx].fail_count = 0;
+		ss_peer_table[oldest_idx].fail_window_start = now;
+		ss_peer_table[oldest_idx].ban_until = 0;
+		return &ss_peer_table[oldest_idx];
+	}
+
+	/* Table fully saturated with peers holding live slots — extreme
+	 * pathological case. Return NULL; caller will reject. */
+	return NULL;
+}
+
+/* Check if peer can take a new slot. Returns NULL on OK, or a static
+ * error reason string. Does NOT mutate state — caller commits on success
+ * via ss_peer_usage_commit_slot. */
+static const char *ss_peer_check_limits(const uint8_t node_id[33])
+{
+	struct ss_peer_usage *u = ss_peer_usage_get(node_id);
+	if (!u)
+		return "internal: per-peer tracking table saturated";
+
+	time_t now = time(NULL);
+	/* Reset window if expired */
+	if (now - u->window_start >= SS_PEER_RATE_WINDOW_SECS) {
+		u->window_start = now;
+		u->requests_in_window = 0;
+	}
+
+	/* Soft-ban check (#71). Returns the static "banned" string while
+	 * within ban_until; auto-clears when window expires. */
+	if (u->ban_until > 0) {
+		if (now < u->ban_until)
+			return "peer is soft-banned (too many recent failures)";
+		u->ban_until = 0;
+		u->fail_count = 0;
+		u->fail_window_start = now;
+	}
+
+	if (u->concurrent_slots >= SS_PEER_MAX_CONCURRENT)
+		return "peer has too many concurrent requests (max 2)";
+	if (u->requests_in_window >= SS_PEER_RATE_LIMIT)
+		return "peer exceeded rate limit (max 10 requests/minute)";
+
+	return NULL;
+}
+
+/* Record a soft-ban-eligible failure for the given peer. Resets the
+ * fail-window if it has elapsed; increments fail_count; triggers a
+ * ban if count >= SS_PEER_MAX_FAILS. Idempotent if peer table is
+ * saturated (no-op). */
+static void ss_peer_record_fail(const uint8_t node_id[33])
+{
+	struct ss_peer_usage *u = ss_peer_usage_get(node_id);
+	if (!u) return;
+	time_t now = time(NULL);
+	if (now - u->fail_window_start >= SS_PEER_FAIL_WINDOW_SECS) {
+		u->fail_window_start = now;
+		u->fail_count = 0;
+	}
+	u->fail_count++;
+	if (u->fail_count >= SS_PEER_MAX_FAILS && u->ban_until == 0) {
+		u->ban_until = now + SS_PEER_SOFT_BAN_SECS;
+		ss_audit_log(LOG_UNUSUAL, "peer_soft_banned",
+			     "\"fail_count\":%d,\"ban_secs\":%d",
+			     u->fail_count, SS_PEER_SOFT_BAN_SECS);
+	}
+}
+
+/* Commit a slot allocation. Caller must have already called check_limits
+ * and gotten NULL back. */
+static void ss_peer_usage_commit_slot(const uint8_t node_id[33])
+{
+	struct ss_peer_usage *u = ss_peer_usage_get(node_id);
+	if (!u) return;
+	u->concurrent_slots++;
+	u->requests_in_window++;
+}
+
+/* Release a slot when its RPC completes (success, failure, or timeout). */
+static void ss_peer_usage_release_slot(const uint8_t node_id[33])
+{
+	struct ss_peer_usage *u = ss_peer_usage_get(node_id);
+	if (!u) return;
+	if (u->concurrent_slots > 0)
+		u->concurrent_slots--;
+}
+
+/* Generate a fresh 64-bit request_id from /dev/urandom (CSPRNG). Birthday
+ * collision at 2^32 requests is ~10^-14 — safe at any realistic scale.
+ *
+ * Why not a counter? Counters reset on plugin restart. An old response
+ * with request_id=42 arriving after restart could match a fresh request
+ * slot that also got request_id=42 → wrong data returned to caller.
+ *
+ * Falls back to time(NULL) ^ rand() if /dev/urandom unavailable (tests
+ * only; production CLN nodes always have /dev/urandom).
+ */
+static uint64_t ss_fresh_request_id(void)
+{
+	uint64_t id = 0;
+	FILE *urandom = fopen("/dev/urandom", "rb");
+	if (urandom) {
+		if (fread(&id, sizeof(id), 1, urandom) != 1)
+			id = 0;
+		fclose(urandom);
+	}
+	if (id == 0) {
+		/* Fallback: time-mixed PRNG. Not collision-safe but better
+		 * than zero. Should never hit this path on a real CLN node. */
+		id = ((uint64_t)time(NULL) << 32) | (uint64_t)rand();
+	}
+	/* Avoid 0 (sentinel for "slot free" in slot tables). */
+	return id ? id : 1;
+}
+
+/* Structured audit log helper. Emits a single-line JSON object as the
+ * message body of an ordinary plugin_log call:
+ *
+ *   {"audit":"<event>",<caller json fragment>}
+ *
+ * Downstream log ingest (loki/elastic/etc.) can recognize lines whose
+ * body parses as JSON with an "audit" key and route them to a
+ * dedicated audit index. Free-form plugin_log calls are preserved for
+ * developer diagnostics; this helper is reserved for events relevant
+ * to ops/forensics (slot exhaustion, rate-limit rejections, join
+ * lifecycle transitions, timeouts).
+ *
+ * Caller writes the inner k:v fragment. All migration in this codebase
+ * is us-writes-both, so injection from untrusted strings is not a
+ * concern; if a future caller needs to embed peer-controlled data, it
+ * must escape JSON quotes first. */
+static void ss_audit_log(enum log_level lvl, const char *event,
+                         const char *fmt, ...)
+{
+	char body[1024];
+	va_list ap;
+	va_start(ap, fmt);
+	int n = vsnprintf(body, sizeof(body), fmt, ap);
+	va_end(ap);
+	if (n < 0) n = 0;
+	if ((size_t)n >= sizeof(body)) n = sizeof(body) - 1;
+	body[n] = '\0';
+	plugin_log(plugin_handle, lvl,
+	           "{\"audit\":\"%s\",%s}", event, body);
+}
+
+
+/* Kept for backward compatibility — will be deleted once all callers
+ * use ss_fresh_request_id. Currently unused after this commit. */
 static uint64_t ss_browse_next_request_id = 1;
 
 static int ss_browse_alloc_slot(void)
@@ -302,6 +550,10 @@ static int ss_browse_alloc_slot(void)
 			plugin_log(plugin_handle, LOG_UNUSUAL,
 				   "browse: timing out stuck request_id=%llu",
 				   (unsigned long long)stuck_id);
+			ss_audit_log(LOG_UNUSUAL, "request_timeout",
+				     "\"rpc\":\"factory-browse-host\","
+				     "\"request_id\":%llu",
+				     (unsigned long long)stuck_id);
 			if (stuck) {
 				struct command_result *_cfail = command_fail(stuck, LIGHTNINGD,
 					"factory-browse-host: timeout waiting for peer response (req_id=%llu)",
@@ -334,10 +586,14 @@ static int ss_browse_find_slot(uint64_t request_id)
  * ============================================================================ */
 #define SS_JOIN_MAX_PENDING		16
 #define SS_JOIN_TIMEOUT_SECS		30
+/* Runtime-mutable copy set by --superscalar-join-timeout-secs.
+ * See note on ss_browse_timeout_secs. */
+static u32 ss_join_timeout_secs = SS_JOIN_TIMEOUT_SECS;
 struct ss_join_pending_slot {
 	uint64_t request_id;
 	struct command *cmd;
 	time_t deadline;
+	uint8_t peer_id[33];        /* for per-peer cap release */
 };
 static struct ss_join_pending_slot ss_join_pending[SS_JOIN_MAX_PENDING];
 static uint64_t ss_join_next_request_id = 1;
@@ -359,6 +615,10 @@ static int ss_join_alloc_slot(void)
 			plugin_log(plugin_handle, LOG_UNUSUAL,
 				   "join: timing out stuck request_id=%llu",
 				   (unsigned long long)stuck_id);
+			ss_audit_log(LOG_UNUSUAL, "request_timeout",
+				     "\"rpc\":\"factory-join-request\","
+				     "\"request_id\":%llu",
+				     (unsigned long long)stuck_id);
 			if (stuck) {
 				struct command_result *_cf = command_fail(stuck,
 					LIGHTNINGD,
@@ -393,6 +653,7 @@ static void ss_join_reap_scan(void)
 		if (now <= ss_join_pending[i].deadline) continue;
 		struct command *stuck = ss_join_pending[i].cmd;
 		uint64_t stuck_id = ss_join_pending[i].request_id;
+		ss_peer_usage_release_slot(ss_join_pending[i].peer_id);
 		ss_join_pending[i].request_id = 0;
 		ss_join_pending[i].cmd = NULL;
 		plugin_log(plugin_handle, LOG_UNUSUAL,
@@ -442,6 +703,7 @@ static struct command_result *ss_browse_reap_tick(struct command *timer_cmd,
 		if (now <= ss_browse_pending[i].deadline) continue;
 		struct command *stuck = ss_browse_pending[i].cmd;
 		uint64_t stuck_id = ss_browse_pending[i].request_id;
+		ss_peer_usage_release_slot(ss_browse_pending[i].peer_id);
 		ss_browse_pending[i].request_id = 0;
 		ss_browse_pending[i].cmd = NULL;
 		plugin_log(plugin_handle, LOG_UNUSUAL,
@@ -1848,6 +2110,7 @@ static struct command_result *rpc_err_join(struct command *cmd,
 	for (int i = 0; i < SS_JOIN_MAX_PENDING; i++) {
 		if (ss_join_pending[i].cmd == cmd) {
 			uint64_t freed_id = ss_join_pending[i].request_id;
+			ss_peer_usage_release_slot(ss_join_pending[i].peer_id);
 			ss_join_pending[i].request_id = 0;
 			ss_join_pending[i].cmd = NULL;
 			plugin_log(plugin_handle, LOG_DBG,
@@ -1878,6 +2141,7 @@ static struct command_result *rpc_err_browse(struct command *cmd,
 	for (int i = 0; i < SS_BROWSE_MAX_PENDING; i++) {
 		if (ss_browse_pending[i].cmd == cmd) {
 			uint64_t freed_id = ss_browse_pending[i].request_id;
+			ss_peer_usage_release_slot(ss_browse_pending[i].peer_id);
 			ss_browse_pending[i].request_id = 0;
 			ss_browse_pending[i].cmd = NULL;
 			plugin_log(plugin_handle, LOG_DBG,
@@ -3513,12 +3777,53 @@ static void continue_after_funding(struct command *cmd,
 	ss_save_factory(cmd, fi);
 }
 
+/* Phase 4: passive last_seen tracking. Updates every factory's join_queue
+ * entry whose client_node_id matches the BOLT-8 sender. Called from the
+ * top of dispatch_superscalar_submsg so ANY wire message from a known
+ * client refreshes their last_seen_block. Replaces a dedicated heartbeat
+ * submsg — CLN BOLT-8 ping already covers wire-level liveness; this
+ * adds factory-state-level freshness without new wire traffic. */
+static void ss_update_peer_last_seen(const uint8_t peer_pk[33])
+{
+	for (size_t fi_idx = 0; fi_idx < ss_state.n_factories; fi_idx++) {
+		factory_instance_t *fi = ss_state.factories[fi_idx];
+		if (!fi || !fi->is_lsp) continue;
+		for (size_t i = 0; i < fi->n_join_queue; i++) {
+			if (memcmp(fi->join_queue[i].client_node_id,
+				   peer_pk, 33) == 0) {
+				fi->join_queue[i].last_seen_block =
+					ss_state.current_blockheight;
+			}
+		}
+	}
+}
+
 static void dispatch_superscalar_submsg(struct command *cmd,
 					const char *peer_id,
 					u16 submsg_id,
 					const u8 *data, size_t len)
 {
 	factory_instance_t *fi = NULL;
+
+	/* Phase 4: passive last_seen tracking. Update last_seen_block on every
+	 * factory's join_queue entry that matches this peer. Cheap O(F*Q) scan
+	 * — F factories × Q queue entries per factory. F is small (1-10 for
+	 * typical LSP), Q caps at MAX_JOIN_QUEUE=256. */
+	{
+		uint8_t peer_pk_seen[33];
+		if (strlen(peer_id) == 66) {
+			bool ok = true;
+			for (int k = 0; k < 33 && ok; k++) {
+				unsigned int by;
+				if (sscanf(peer_id + k*2, "%2x", &by) != 1)
+					ok = false;
+				else
+					peer_pk_seen[k] = (uint8_t)by;
+			}
+			if (ok)
+				ss_update_peer_last_seen(peer_pk_seen);
+		}
+	}
 
 	/* Extract instance_id from submessage (first 32 bytes).
 	 * Don't strip it — handlers that use nonce_bundle_deserialize
@@ -4348,6 +4653,16 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 								 fi->funding_amount_sats);
 							json_add_string(wreq->js,
 								"satoshi", amt_str);
+						}
+						/* Phase 4: caller-supplied feerate override.
+						 * Honors signet 0.1 sat/vb (=100 perkw) etc. */
+						if (fi->requested_feerate_perkw > 0) {
+							char fr_str[32];
+							snprintf(fr_str, sizeof(fr_str),
+								 "%uperkw",
+								 fi->requested_feerate_perkw);
+							json_add_string(wreq->js,
+								"feerate", fr_str);
 						}
 						send_outreq(wreq);
 
@@ -8462,6 +8777,7 @@ realloc_all_nonces_done:
 			   "factory-browse-host: resolved req_id=%llu with %u factories from %s",
 			   (unsigned long long)req_id, (unsigned)n_factories, peer_id);
 
+		ss_peer_usage_release_slot(ss_browse_pending[slot].peer_id);
 		ss_browse_pending[slot].request_id = 0;
 		ss_browse_pending[slot].cmd = NULL;
 		ss_browse_pending[slot].deadline = 0;
@@ -8613,6 +8929,15 @@ realloc_all_nonces_done:
 				   (unsigned long long)req_id,
 				   (unsigned long long)contribution_sats,
 				   target_fi->n_join_queue);
+			ss_audit_log(LOG_INFORM, "join_status",
+				     "\"peer\":\"%s\",\"req_id\":%llu,"
+				     "\"transition\":\"->ACCEPTED\","
+				     "\"contribution_sats\":%llu,"
+				     "\"queue_size\":%zu",
+				     peer_id,
+				     (unsigned long long)req_id,
+				     (unsigned long long)contribution_sats,
+				     target_fi->n_join_queue);
 			ss_save_factory(cmd, target_fi);
 		}
 
@@ -8712,6 +9037,7 @@ realloc_all_nonces_done:
 			break;
 		}
 		struct command *orig_cmd = ss_join_pending[slot].cmd;
+		ss_peer_usage_release_slot(ss_join_pending[slot].peer_id);
 		ss_join_pending[slot].request_id = 0;
 		ss_join_pending[slot].cmd = NULL;
 		ss_join_pending[slot].deadline = 0;
@@ -9159,16 +9485,20 @@ static struct command_result *browse_preflight_ok(struct command *cmd,
 
 	int slot = ss_browse_alloc_slot();
 	if (slot < 0) {
+		ss_audit_log(LOG_UNUSUAL, "slot_exhausted",
+			     "\"rpc\":\"factory-browse-host\","
+			     "\"peer\":\"%s\",\"max\":%d",
+			     ctx->node_id_str, SS_BROWSE_MAX_PENDING);
 		return command_fail(cmd, LIGHTNINGD,
 			"factory-browse-host: too many pending requests "
 			"(max %d). Try again later.",
 			SS_BROWSE_MAX_PENDING);
 	}
 
-	uint64_t req_id = ss_browse_next_request_id++;
+	uint64_t req_id = ss_fresh_request_id();
 	ss_browse_pending[slot].request_id = req_id;
 	ss_browse_pending[slot].cmd = cmd;
-	ss_browse_pending[slot].deadline = time(NULL) + SS_BROWSE_TIMEOUT_SECS;
+	ss_browse_pending[slot].deadline = time(NULL) + ss_browse_timeout_secs;
 
 	uint8_t payload[12];
 	uint8_t *p = payload;
@@ -9389,14 +9719,17 @@ static struct command_result *join_preflight_ok(struct command *cmd,
 	/* Allocate slot for response correlation */
 	int slot = ss_join_alloc_slot();
 	if (slot < 0) {
+		ss_audit_log(LOG_UNUSUAL, "slot_exhausted",
+			     "\"rpc\":\"factory-join-request\","
+			     "\"max\":%d", SS_JOIN_MAX_PENDING);
 		return command_fail(cmd, LIGHTNINGD,
 			"factory-join-request: too many pending requests "
 			"(max %d). Try again later.", SS_JOIN_MAX_PENDING);
 	}
-	uint64_t req_id = ss_join_next_request_id++;
+	uint64_t req_id = ss_fresh_request_id();
 	ss_join_pending[slot].request_id = req_id;
 	ss_join_pending[slot].cmd = cmd;
-	ss_join_pending[slot].deadline = time(NULL) + SS_JOIN_TIMEOUT_SECS;
+	ss_join_pending[slot].deadline = time(NULL) + ss_join_timeout_secs;
 
 	/* Add persistent outgoing_join_t entry */
 	/* TODO(privacy): retention review pre-mainnet */
@@ -9480,14 +9813,27 @@ static struct command_result *json_factory_join_request(struct command *cmd,
 	if (ss_state.n_outgoing_joins >= MAX_OUTGOING_JOINS)
 		return command_fail(cmd, LIGHTNINGD, "outgoing joins full");
 
+	/* Hardening Task #67: per-peer slot cap + rate limit */
+	const char *limit_err = ss_peer_check_limits(lsp_pk);
+	if (limit_err) {
+		ss_peer_record_fail(lsp_pk);
+		ss_audit_log(LOG_UNUSUAL, "peer_limit_reject",
+			     "\"rpc\":\"factory-join-request\","
+			     "\"reason\":\"%s\"", limit_err);
+		return command_fail(cmd, LIGHTNINGD,
+			"factory-join-request: %s", limit_err);
+	}
+
 	int slot = ss_join_alloc_slot();
 	if (slot < 0)
 		return command_fail(cmd, LIGHTNINGD, "too many pending requests");
 
-	uint64_t req_id = ss_join_next_request_id++;
+	uint64_t req_id = ss_fresh_request_id();
 	ss_join_pending[slot].request_id = req_id;
 	ss_join_pending[slot].cmd = cmd;
-	ss_join_pending[slot].deadline = time(NULL) + SS_JOIN_TIMEOUT_SECS;
+	ss_join_pending[slot].deadline = time(NULL) + ss_join_timeout_secs;
+	memcpy(ss_join_pending[slot].peer_id, lsp_pk, 33);
+	ss_peer_usage_commit_slot(lsp_pk);
 
 	outgoing_join_t *o = &ss_state.outgoing_joins[ss_state.n_outgoing_joins++];
 	memcpy(o->lsp_node_id, lsp_pk, 33);
@@ -9660,6 +10006,9 @@ static struct command_result *json_factory_incoming_joins(struct command *cmd,
 				     j->accepted_at_block);
 			json_add_u32(js, "decided_at_block",
 				     j->decided_at_block);
+			if (j->last_seen_block)
+				json_add_u32(js, "last_seen_block",
+					     j->last_seen_block);
 			if (j->reason[0])
 				json_add_string(js, "reason",
 						(const char *)j->reason);
@@ -9774,11 +10123,13 @@ static struct command_result *json_factory_create(struct command *cmd,
 
 	const jsmntok_t *allocations_tok = NULL;
 	const char *arity_mode_str = NULL;
+	u32 *feerate_perkw_opt = NULL;
 	if (!param(cmd, buf, params,
 		   p_req("funding_sats", param_u64, &funding_sats),
 		   p_req("clients", param_array, &clients_tok),
 		   p_opt("allocations", param_array, &allocations_tok),
 		   p_opt("arity_mode", param_string, &arity_mode_str),
+		   p_opt("feerate_perkw", param_u32, &feerate_perkw_opt),
 		   NULL))
 		return command_param_failed();
 
@@ -9841,6 +10192,7 @@ static struct command_result *json_factory_create(struct command *cmd,
 	fi->lifecycle = FACTORY_LIFECYCLE_INIT;
 	fi->ceremony = CEREMONY_IDLE;
 	fi->arity_mode = parsed_arity_mode;
+	fi->requested_feerate_perkw = feerate_perkw_opt ? *feerate_perkw_opt : 0;
 
 	/* Parse client node IDs */
 	const jsmntok_t *t;
@@ -10944,6 +11296,86 @@ static struct command_result *json_factory_metrics(struct command *cmd,
 				     swp_by_state[s]);
 	}
 	json_object_end(js);
+	json_object_end(js);
+
+	/* Phase 4 / Task #68: slot-table + peer-table stats for dashboard */
+	json_object_start(js, "slots");
+	{
+		unsigned int browse_used = 0, join_used = 0;
+		time_t now = time(NULL);
+		(void)now;
+		for (int i = 0; i < SS_BROWSE_MAX_PENDING; i++)
+			if (ss_browse_pending[i].request_id != 0) browse_used++;
+		for (int i = 0; i < SS_JOIN_MAX_PENDING; i++)
+			if (ss_join_pending[i].request_id != 0) join_used++;
+		json_add_u32(js, "browse_used", browse_used);
+		json_add_u32(js, "browse_total", SS_BROWSE_MAX_PENDING);
+		json_add_u32(js, "join_used", join_used);
+		json_add_u32(js, "join_total", SS_JOIN_MAX_PENDING);
+	}
+	json_object_end(js);
+
+	json_object_start(js, "peer_table");
+	{
+		unsigned int peers_tracked = 0;
+		unsigned int peers_with_active_slots = 0;
+		for (int i = 0; i < SS_PEER_TABLE_SIZE; i++) {
+			if (!ss_peer_table[i].in_use) continue;
+			peers_tracked++;
+			if (ss_peer_table[i].concurrent_slots > 0)
+				peers_with_active_slots++;
+		}
+		json_add_u32(js, "peers_tracked", peers_tracked);
+		json_add_u32(js, "peers_with_active_slots", peers_with_active_slots);
+		json_add_u32(js, "table_capacity", SS_PEER_TABLE_SIZE);
+	}
+	json_object_end(js);
+
+	json_object_start(js, "join_queue_summary");
+	{
+		unsigned int total_queued = 0, total_accepted = 0;
+		unsigned int total_signed = 0, total_rejected = 0;
+		unsigned int total_cancelled = 0;
+		for (size_t fi_idx = 0; fi_idx < ss_state.n_factories; fi_idx++) {
+			factory_instance_t *fi = ss_state.factories[fi_idx];
+			if (!fi || !fi->is_lsp) continue;
+			for (size_t j = 0; j < fi->n_join_queue; j++) {
+				switch (fi->join_queue[j].status) {
+				case JOIN_STATUS_QUEUED: total_queued++; break;
+				case JOIN_STATUS_ACCEPTED: total_accepted++; break;
+				case JOIN_STATUS_SIGNED: total_signed++; break;
+				case JOIN_STATUS_REJECTED: total_rejected++; break;
+				case JOIN_STATUS_CANCELLED: total_cancelled++; break;
+				default: break;
+				}
+			}
+		}
+		json_add_u32(js, "queued", total_queued);
+		json_add_u32(js, "accepted", total_accepted);
+		json_add_u32(js, "signed", total_signed);
+		json_add_u32(js, "rejected", total_rejected);
+		json_add_u32(js, "cancelled", total_cancelled);
+	}
+	json_object_end(js);
+
+	json_object_start(js, "outgoing_joins_summary");
+	{
+		unsigned int total_sent = 0, total_queued_out = 0;
+		unsigned int total_accepted_out = 0, total_other = 0;
+		for (size_t i = 0; i < ss_state.n_outgoing_joins; i++) {
+			switch (ss_state.outgoing_joins[i].status) {
+			case OUTGOING_JOIN_SENT: total_sent++; break;
+			case OUTGOING_JOIN_QUEUED: total_queued_out++; break;
+			case OUTGOING_JOIN_ACCEPTED: total_accepted_out++; break;
+			default: total_other++; break;
+			}
+		}
+		json_add_u32(js, "sent", total_sent);
+		json_add_u32(js, "queued", total_queued_out);
+		json_add_u32(js, "accepted", total_accepted_out);
+		json_add_u32(js, "other", total_other);
+		json_add_u32(js, "total", (unsigned)ss_state.n_outgoing_joins);
+	}
 	json_object_end(js);
 
 	return command_finished(cmd, js);
@@ -19272,5 +19704,17 @@ int main(int argc, char *argv[])
 		    notifs, ARRAY_SIZE(notifs),
 		    hooks, ARRAY_SIZE(hooks),
 		    NULL, 0,
+		    plugin_option("superscalar-browse-timeout-secs",
+				  "int",
+				  "Seconds before a pending factory-browse-host "
+				  "request times out and is reaped. Default 30.",
+				  u32_option, u32_jsonfmt,
+				  &ss_browse_timeout_secs),
+		    plugin_option("superscalar-join-timeout-secs",
+				  "int",
+				  "Seconds before a pending factory-join-request "
+				  "times out and is reaped. Default 30.",
+				  u32_option, u32_jsonfmt,
+				  &ss_join_timeout_secs),
 		    NULL);
 }

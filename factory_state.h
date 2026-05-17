@@ -343,6 +343,9 @@ typedef struct {
 	uint32_t received_at_block;    /* block height when JOIN_REQUEST arrived */
 	uint32_t accepted_at_block;    /* block height when status moved to ACCEPTED; 0 otherwise */
 	uint32_t decided_at_block;     /* block height of last status change (any direction) */
+	uint32_t last_seen_block;      /* Phase 4: updated on ANY wire message from this client.
+	                                * Memory-only — not persisted. Used for stale-detection
+	                                * in LSP UI ("client X last seen N blocks ago"). */
 	factory_join_status_t status;  /* current lifecycle position */
 	uint8_t  reason[64];           /* C-string; rejected/cancelled reason or empty */
 } factory_join_t;
@@ -748,6 +751,14 @@ typedef struct factory_instance {
 	 * on factory destruction. */
 	uint8_t *keyagg_snapshots;
 	size_t   keyagg_snapshots_len;
+
+	/* Phase 4: optional caller-supplied feerate for the funding TX.
+	 * 0 means "use CLN default". Set by factory-create's optional
+	 * feerate_perkw param. Honored when this plugin sends the withdraw
+	 * RPC to create the funding UTXO. Memory-only — funding happens
+	 * once at create time and the value is consumed; doesn't need
+	 * persistence. */
+	uint32_t requested_feerate_perkw;
 
 	/* Phase 3: LSP-side join lifecycle queue. Only populated for factories
 	 * where is_lsp == true. Persisted alongside other factory state via

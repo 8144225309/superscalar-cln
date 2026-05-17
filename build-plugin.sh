@@ -91,7 +91,7 @@ done
 # One secp256k1 (from CLN's wally, with musig enabled).
 # Slim libsuperscalar provides factory/musig/DW functions.
 # No --allow-multiple-definition needed.
-cc -Og -o plugins/superscalar \
+cc -Og -fsanitize=address -fsanitize=undefined -o plugins/superscalar \
   plugins/superscalar.o plugins/factory_state.o plugins/nonce_exchange.o \
   plugins/persist.o plugins/fee_stubs.o plugins/sweep_builder.o \
   plugins/libplugin.o \
