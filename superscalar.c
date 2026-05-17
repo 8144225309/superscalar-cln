@@ -9216,6 +9216,493 @@ static struct command_result *json_factory_browse_host(struct command *cmd,
 	return send_outreq(req);
 }
 
+/* ============================================================================
+ * Phase 3: factory-join-request / factory-cancel-join /
+ *          factory-incoming-joins / factory-kick-joiner RPCs
+ *
+ * factory-join-request: client RPC. Sends JOIN_REQUEST (0x0142) to a
+ *   specific LSP for a specific factory. Returns command_still_pending
+ *   while waiting for the LSPs JOIN_RESPONSE (0x0143).
+ *
+ * factory-cancel-join: client RPC. Marks a local outgoing_join entry as
+ *   CANCELLED and sends a fire-and-forget JOIN_CANCEL (0x0144) to the LSP
+ *   for visibility. Synchronous return.
+ *
+ * factory-incoming-joins: LSP RPC. Returns the join_queue for one or all
+ *   factories the LSP is hosting. Read-only, synchronous.
+ *
+ * factory-kick-joiner: LSP RPC. Marks a queue entry as REJECTED with an
+ *   optional reason and sends unsolicited JOIN_RESPONSE so the kicked
+ *   client's wallet can update.
+ *
+ * TODO(privacy): all four RPCs write/read persistent join records; the
+ * pre-mainnet privacy pass needs to review each.
+ * ============================================================================ */
+
+/* Helper: decode a 66-char hex node_id string into a 33-byte pubkey.
+ * Returns true on success, false on bad input. */
+static bool ss_decode_node_id_hex(const char *hex, uint8_t out[33])
+{
+	if (!hex || strlen(hex) != 66) return false;
+	for (int k = 0; k < 33; k++) {
+		unsigned int by;
+		if (sscanf(hex + k*2, "%2x", &by) != 1) return false;
+		out[k] = (uint8_t)by;
+	}
+	return true;
+}
+
+/* Helper: decode a 64-char hex instance_id string into a 32-byte buffer. */
+static bool ss_decode_instance_id_hex(const char *hex, uint8_t out[32])
+{
+	if (!hex || strlen(hex) != 64) return false;
+	for (int k = 0; k < 32; k++) {
+		unsigned int by;
+		if (sscanf(hex + k*2, "%2x", &by) != 1) return false;
+		out[k] = (uint8_t)by;
+	}
+	return true;
+}
+
+/* Helper: status enum to lowercase string for JSON output. */
+static const char *ss_outgoing_join_status_name(outgoing_join_status_t s)
+{
+	switch (s) {
+	case OUTGOING_JOIN_SENT:           return "sent";
+	case OUTGOING_JOIN_QUEUED:         return "queued";
+	case OUTGOING_JOIN_ACCEPTED:       return "accepted";
+	case OUTGOING_JOIN_SIGNED:         return "signed";
+	case OUTGOING_JOIN_REJECTED:       return "rejected";
+	case OUTGOING_JOIN_CANCELLED:      return "cancelled";
+	case OUTGOING_JOIN_TIMEOUT:        return "timeout";
+	case OUTGOING_JOIN_ALREADY_MEMBER: return "already_member";
+	}
+	return "unknown";
+}
+
+static const char *ss_factory_join_status_name(factory_join_status_t s)
+{
+	switch (s) {
+	case JOIN_STATUS_QUEUED:         return "queued";
+	case JOIN_STATUS_ACCEPTED:       return "accepted";
+	case JOIN_STATUS_SIGNED:         return "signed";
+	case JOIN_STATUS_REJECTED:       return "rejected";
+	case JOIN_STATUS_CANCELLED:      return "cancelled";
+	case JOIN_STATUS_ALREADY_MEMBER: return "already_member";
+	}
+	return "unknown";
+}
+
+/* ----- factory-join-request ----------------------------------------------- */
+
+/* Context carried across the listpeers preflight callback for join. */
+struct join_preflight_ctx {
+	const char *lsp_node_id_str;
+	uint8_t  instance_id[32];
+	uint64_t contribution_sats;
+};
+
+static struct command_result *join_preflight_ok(struct command *cmd,
+						const char *method,
+						const char *buf,
+						const jsmntok_t *result,
+						void *arg)
+{
+	struct join_preflight_ctx *ctx = arg;
+
+	const jsmntok_t *peers_tok = json_get_member(buf, result, "peers");
+	if (!peers_tok || peers_tok->type != JSMN_ARRAY ||
+	    peers_tok->size == 0) {
+		return command_fail(cmd, LIGHTNINGD,
+			"factory-join-request: not connected to %s. "
+			"Run `lightning-cli connect <node_id>@<host>:<port>` first.",
+			ctx->lsp_node_id_str);
+	}
+	const jsmntok_t *peer_tok = peers_tok + 1;
+	const jsmntok_t *conn_tok = json_get_member(buf, peer_tok,
+						   "connected");
+	bool connected = false;
+	if (!conn_tok || !json_to_bool(buf, conn_tok, &connected) ||
+	    !connected) {
+		return command_fail(cmd, LIGHTNINGD,
+			"factory-join-request: peer %s known but not "
+			"currently connected. Run `lightning-cli connect "
+			"<node_id>@<host>:<port>` to reconnect.",
+			ctx->lsp_node_id_str);
+	}
+
+	/* Check we don't already have an outstanding join for this
+	 * (lsp, instance_id). Dedup safety net at the local layer. */
+	uint8_t lsp_pk[33];
+	if (!ss_decode_node_id_hex(ctx->lsp_node_id_str, lsp_pk)) {
+		return command_fail(cmd, LIGHTNINGD,
+			"factory-join-request: invalid lsp node_id");
+	}
+	for (size_t i = 0; i < ss_state.n_outgoing_joins; i++) {
+		outgoing_join_t *o = &ss_state.outgoing_joins[i];
+		if (memcmp(o->lsp_node_id, lsp_pk, 33) == 0 &&
+		    memcmp(o->instance_id, ctx->instance_id, 32) == 0 &&
+		    (o->status == OUTGOING_JOIN_SENT ||
+		     o->status == OUTGOING_JOIN_QUEUED ||
+		     o->status == OUTGOING_JOIN_ACCEPTED ||
+		     o->status == OUTGOING_JOIN_SIGNED)) {
+			return command_fail(cmd, LIGHTNINGD,
+				"factory-join-request: already have an active "
+				"join for this factory (status=%s, "
+				"request_id=%llu). Cancel it first with "
+				"factory-cancel-join.",
+				ss_outgoing_join_status_name(o->status),
+				(unsigned long long)o->request_id);
+		}
+	}
+
+	/* Check we have room in outgoing_joins */
+	if (ss_state.n_outgoing_joins >= MAX_OUTGOING_JOINS) {
+		return command_fail(cmd, LIGHTNINGD,
+			"factory-join-request: outgoing joins full "
+			"(max %d). Cancel or wait for existing ones.",
+			MAX_OUTGOING_JOINS);
+	}
+
+	/* Allocate slot for response correlation */
+	int slot = ss_join_alloc_slot();
+	if (slot < 0) {
+		return command_fail(cmd, LIGHTNINGD,
+			"factory-join-request: too many pending requests "
+			"(max %d). Try again later.", SS_JOIN_MAX_PENDING);
+	}
+	uint64_t req_id = ss_join_next_request_id++;
+	ss_join_pending[slot].request_id = req_id;
+	ss_join_pending[slot].cmd = cmd;
+	ss_join_pending[slot].deadline = time(NULL) + SS_JOIN_TIMEOUT_SECS;
+
+	/* Add persistent outgoing_join_t entry */
+	/* TODO(privacy): retention review pre-mainnet */
+	outgoing_join_t *o = &ss_state.outgoing_joins[ss_state.n_outgoing_joins++];
+	memcpy(o->lsp_node_id, lsp_pk, 33);
+	memcpy(o->instance_id, ctx->instance_id, 32);
+	o->request_id = req_id;
+	o->contribution_sats = ctx->contribution_sats;
+	o->sent_at_block = ss_state.current_blockheight;
+	o->expected_signing_block = 0;
+	o->updated_at_block = ss_state.current_blockheight;
+	o->status = OUTGOING_JOIN_SENT;
+	memset(o->reason, 0, 64);
+	ss_save_outgoing_joins(cmd);
+
+	/* Build wire payload: req_id(8) + instance_id(32) + contribution(8) + tlv_len(2) = 50 */
+	uint8_t payload[50];
+	uint8_t *p = payload;
+	for (int i = 7; i >= 0; i--) *p++ = (uint8_t)(req_id >> (i*8));
+	memcpy(p, ctx->instance_id, 32); p += 32;
+	for (int i = 7; i >= 0; i--)
+		*p++ = (uint8_t)(ctx->contribution_sats >> (i*8));
+	*p++ = 0; *p++ = 0;  /* trailing_tlv_len = 0 */
+
+	send_factory_msg_join(cmd, ctx->lsp_node_id_str,
+			      SS_SUBMSG_JOIN_REQUEST, payload, sizeof(payload));
+
+	plugin_log(plugin_handle, LOG_INFORM,
+		   "factory-join-request: sent JOIN_REQUEST to %s "
+		   "(req_id=%llu, contribution=%llu sats)",
+		   ctx->lsp_node_id_str, (unsigned long long)req_id,
+		   (unsigned long long)ctx->contribution_sats);
+
+	return command_still_pending(cmd);
+}
+
+static struct command_result *join_preflight_err(struct command *cmd,
+						 const char *method,
+						 const char *buf,
+						 const jsmntok_t *result,
+						 void *arg)
+{
+	struct join_preflight_ctx *ctx = arg;
+	const jsmntok_t *msg_tok = json_get_member(buf, result, "message");
+	const char *errmsg = msg_tok
+		? json_strdup(cmd, buf, msg_tok)
+		: "listpeers failed";
+	return command_fail(cmd, LIGHTNINGD,
+		"factory-join-request: peer connectivity check failed "
+		"for %s: %s", ctx->lsp_node_id_str, errmsg);
+}
+
+static struct command_result *json_factory_join_request(struct command *cmd,
+							const char *buf,
+							const jsmntok_t *params)
+{
+	const char *lsp_node_id_str = NULL;
+	const char *instance_id_str = NULL;
+	uint64_t *contribution_sats = NULL;
+
+	if (!param(cmd, buf, params,
+		   p_req("lsp_node_id", param_string, &lsp_node_id_str),
+		   p_req("instance_id", param_string, &instance_id_str),
+		   p_req("contribution_sats", param_u64, &contribution_sats),
+		   NULL))
+		return command_param_failed();
+
+	struct join_preflight_ctx *ctx =
+		tal(cmd, struct join_preflight_ctx);
+	ctx->lsp_node_id_str = tal_strdup(ctx, lsp_node_id_str);
+	if (!ss_decode_instance_id_hex(instance_id_str, ctx->instance_id))
+		return command_fail(cmd, LIGHTNINGD,
+			"instance_id must be 64-char hex (32 bytes), got '%s'",
+			instance_id_str);
+	ctx->contribution_sats = *contribution_sats;
+
+	/* listpeers preflight, same pattern as factory-browse-host */
+	struct out_req *req = jsonrpc_request_start(cmd, "listpeers",
+						    join_preflight_ok,
+						    join_preflight_err, ctx);
+	json_add_string(req->js, "id", ctx->lsp_node_id_str);
+	return send_outreq(req);
+}
+
+/* ----- factory-cancel-join ------------------------------------------------ */
+
+static struct command_result *json_factory_cancel_join(struct command *cmd,
+						       const char *buf,
+						       const jsmntok_t *params)
+{
+	uint64_t *request_id = NULL;
+
+	if (!param(cmd, buf, params,
+		   p_req("request_id", param_u64, &request_id),
+		   NULL))
+		return command_param_failed();
+
+	outgoing_join_t *o = NULL;
+	size_t found_idx = 0;
+	for (size_t i = 0; i < ss_state.n_outgoing_joins; i++) {
+		if (ss_state.outgoing_joins[i].request_id == *request_id) {
+			o = &ss_state.outgoing_joins[i];
+			found_idx = i;
+			break;
+		}
+	}
+	if (!o)
+		return command_fail(cmd, LIGHTNINGD,
+			"factory-cancel-join: no outgoing join with "
+			"request_id=%llu",
+			(unsigned long long)*request_id);
+	(void)found_idx;
+
+	if (o->status == OUTGOING_JOIN_CANCELLED ||
+	    o->status == OUTGOING_JOIN_REJECTED ||
+	    o->status == OUTGOING_JOIN_SIGNED) {
+		return command_fail(cmd, LIGHTNINGD,
+			"factory-cancel-join: join request_id=%llu is "
+			"already in status=%s, cannot cancel.",
+			(unsigned long long)*request_id,
+			ss_outgoing_join_status_name(o->status));
+	}
+
+	/* Build wire payload: req_id(8) + instance_id(32) + tlv_len(2) = 42 */
+	uint8_t payload[42];
+	uint8_t *p = payload;
+	for (int i = 7; i >= 0; i--) *p++ = (uint8_t)(*request_id >> (i*8));
+	memcpy(p, o->instance_id, 32); p += 32;
+	*p++ = 0; *p++ = 0;
+
+	/* Hex-encode lsp_node_id for the send call */
+	char lsp_hex[67];
+	for (int k = 0; k < 33; k++)
+		sprintf(lsp_hex + k*2, "%02x", o->lsp_node_id[k]);
+	lsp_hex[66] = 0;
+
+	/* Fire-and-forget: use generic send_factory_msg (any error just gets
+	 * logged by rpc_err; we mark cancelled locally regardless). */
+	send_factory_msg(cmd, lsp_hex, SS_SUBMSG_JOIN_CANCEL,
+			 payload, sizeof(payload));
+
+	/* Update local state */
+	o->status = OUTGOING_JOIN_CANCELLED;
+	o->updated_at_block = ss_state.current_blockheight;
+	strncpy((char *)o->reason, "user cancelled", sizeof(o->reason) - 1);
+	o->reason[sizeof(o->reason) - 1] = 0;
+	ss_save_outgoing_joins(cmd);
+
+	plugin_log(plugin_handle, LOG_INFORM,
+		   "factory-cancel-join: cancelled join req_id=%llu to %s",
+		   (unsigned long long)*request_id, lsp_hex);
+
+	struct json_stream *js = jsonrpc_stream_success(cmd);
+	json_add_u64(js, "request_id", *request_id);
+	json_add_string(js, "status", "cancelled");
+	return command_finished(cmd, js);
+}
+
+/* ----- factory-incoming-joins --------------------------------------------- */
+
+static struct command_result *json_factory_incoming_joins(struct command *cmd,
+							  const char *buf,
+							  const jsmntok_t *params)
+{
+	const char *instance_id_str = NULL;
+
+	if (!param(cmd, buf, params,
+		   p_opt("instance_id", param_string, &instance_id_str),
+		   NULL))
+		return command_param_failed();
+
+	uint8_t filter_iid[32];
+	bool filter = false;
+	if (instance_id_str) {
+		if (!ss_decode_instance_id_hex(instance_id_str, filter_iid))
+			return command_fail(cmd, LIGHTNINGD,
+				"instance_id must be 64-char hex (32 bytes)");
+		filter = true;
+	}
+
+	struct json_stream *js = jsonrpc_stream_success(cmd);
+	json_array_start(js, "factories");
+
+	for (size_t fi_idx = 0; fi_idx < ss_state.n_factories; fi_idx++) {
+		factory_instance_t *fi = ss_state.factories[fi_idx];
+		if (!fi || !fi->is_lsp) continue;
+		if (filter && memcmp(fi->instance_id, filter_iid, 32) != 0)
+			continue;
+
+		json_object_start(js, NULL);
+		char iid_hex[65];
+		for (int j = 0; j < 32; j++)
+			sprintf(iid_hex + j*2, "%02x",
+				fi->instance_id[j]);
+		iid_hex[64] = 0;
+		json_add_string(js, "instance_id", iid_hex);
+		json_add_u32(js, "n_clients", fi->n_clients);
+		json_add_u32(js, "n_channels", fi->n_channels);
+		json_add_string(js, "lifecycle",
+			fi->lifecycle == FACTORY_LIFECYCLE_INIT ? "init" :
+			fi->lifecycle == FACTORY_LIFECYCLE_ACTIVE ? "active" :
+			fi->lifecycle == FACTORY_LIFECYCLE_DYING ? "dying" :
+			fi->lifecycle == FACTORY_LIFECYCLE_EXPIRED ? "expired" :
+			"other");
+
+		json_array_start(js, "joins");
+		for (size_t i = 0; i < fi->n_join_queue; i++) {
+			factory_join_t *j = &fi->join_queue[i];
+			json_object_start(js, NULL);
+			char cnid_hex[67];
+			for (int k = 0; k < 33; k++)
+				sprintf(cnid_hex + k*2, "%02x",
+					j->client_node_id[k]);
+			cnid_hex[66] = 0;
+			json_add_string(js, "client_node_id", cnid_hex);
+			json_add_u64(js, "request_id", j->request_id);
+			json_add_u64(js, "contribution_sats",
+				     j->contribution_sats);
+			json_add_string(js, "status",
+				ss_factory_join_status_name(j->status));
+			json_add_u32(js, "received_at_block",
+				     j->received_at_block);
+			json_add_u32(js, "accepted_at_block",
+				     j->accepted_at_block);
+			json_add_u32(js, "decided_at_block",
+				     j->decided_at_block);
+			if (j->reason[0])
+				json_add_string(js, "reason",
+						(const char *)j->reason);
+			json_object_end(js);
+		}
+		json_array_end(js);
+		json_object_end(js);
+	}
+	json_array_end(js);
+	return command_finished(cmd, js);
+}
+
+/* ----- factory-kick-joiner ------------------------------------------------ */
+
+static struct command_result *json_factory_kick_joiner(struct command *cmd,
+						       const char *buf,
+						       const jsmntok_t *params)
+{
+	const char *instance_id_str = NULL;
+	const char *client_node_id_str = NULL;
+	const char *reason_str = NULL;
+
+	if (!param(cmd, buf, params,
+		   p_req("instance_id", param_string, &instance_id_str),
+		   p_req("client_node_id", param_string, &client_node_id_str),
+		   p_opt("reason", param_string, &reason_str),
+		   NULL))
+		return command_param_failed();
+
+	uint8_t iid[32], client_pk[33];
+	if (!ss_decode_instance_id_hex(instance_id_str, iid))
+		return command_fail(cmd, LIGHTNINGD,
+			"instance_id must be 64-char hex");
+	if (!ss_decode_node_id_hex(client_node_id_str, client_pk))
+		return command_fail(cmd, LIGHTNINGD,
+			"client_node_id must be 66-char hex");
+
+	factory_instance_t *fi = ss_factory_find(&ss_state, iid);
+	if (!fi || !fi->is_lsp)
+		return command_fail(cmd, LIGHTNINGD,
+			"factory-kick-joiner: factory %s not found or "
+			"not hosted by us", instance_id_str);
+
+	factory_join_t *target = NULL;
+	for (size_t i = 0; i < fi->n_join_queue; i++) {
+		if (memcmp(fi->join_queue[i].client_node_id, client_pk, 33) == 0) {
+			target = &fi->join_queue[i];
+			break;
+		}
+	}
+	if (!target)
+		return command_fail(cmd, LIGHTNINGD,
+			"factory-kick-joiner: no queue entry for "
+			"client %s in factory %s",
+			client_node_id_str, instance_id_str);
+
+	if (target->status == JOIN_STATUS_REJECTED ||
+	    target->status == JOIN_STATUS_CANCELLED)
+		return command_fail(cmd, LIGHTNINGD,
+			"factory-kick-joiner: client %s is already in "
+			"status=%s, cannot kick",
+			client_node_id_str,
+			ss_factory_join_status_name(target->status));
+
+	target->status = JOIN_STATUS_REJECTED;
+	target->decided_at_block = ss_state.current_blockheight;
+	const char *use_reason = (reason_str && reason_str[0])
+		? reason_str : "kicked by LSP operator";
+	strncpy((char *)target->reason, use_reason, sizeof(target->reason) - 1);
+	target->reason[sizeof(target->reason) - 1] = 0;
+
+	plugin_log(plugin_handle, LOG_INFORM,
+		   "factory-kick-joiner: kicked client %s from factory %s "
+		   "(reason: %s)",
+		   client_node_id_str, instance_id_str, use_reason);
+
+	/* Send unsolicited JOIN_RESPONSE to the kicked client so their
+	 * wallet status updates. */
+	size_t rlen = strlen(use_reason);
+	if (rlen > 64) rlen = 64;
+	uint8_t resp[8 + 1 + 4 + 1 + 64 + 2];
+	uint8_t *rp = resp;
+	for (int k = 7; k >= 0; k--) *rp++ = (target->request_id >> (k*8)) & 0xFF;
+	*rp++ = (uint8_t)JOIN_STATUS_REJECTED;
+	for (int k = 0; k < 4; k++) *rp++ = 0;
+	*rp++ = (uint8_t)rlen;
+	memcpy(rp, use_reason, rlen); rp += rlen;
+	*rp++ = 0; *rp++ = 0;
+	size_t actual = (size_t)(rp - resp);
+	send_factory_msg(cmd, client_node_id_str,
+			 SS_SUBMSG_JOIN_RESPONSE, resp, actual);
+
+	ss_save_factory(cmd, fi);
+
+	struct json_stream *js = jsonrpc_stream_success(cmd);
+	json_add_string(js, "instance_id", instance_id_str);
+	json_add_string(js, "client_node_id", client_node_id_str);
+	json_add_string(js, "status", "rejected");
+	json_add_string(js, "reason", use_reason);
+	return command_finished(cmd, js);
+}
+
 static struct command_result *json_factory_create(struct command *cmd,
 						  const char *buf,
 						  const jsmntok_t *params)
@@ -18591,6 +19078,22 @@ static const struct plugin_command commands[] = {
 	{
 		"factory-browse-host",
 		json_factory_browse_host,
+	},
+	{
+		"factory-join-request",
+		json_factory_join_request,
+	},
+	{
+		"factory-cancel-join",
+		json_factory_cancel_join,
+	},
+	{
+		"factory-incoming-joins",
+		json_factory_incoming_joins,
+	},
+	{
+		"factory-kick-joiner",
+		json_factory_kick_joiner,
 	},
 	{
 		"factory-create",
