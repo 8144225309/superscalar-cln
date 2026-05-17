@@ -180,6 +180,15 @@ typedef struct {
  * specific and is deferred to Phase 4d2. The scheduler drives state
  * transitions based on the signals we have today. */
 #define MAX_PENDING_SWEEPS 16
+/* Phase 3 join queue: LSP-side per-factory pending+accepted+history queue.
+ * Sized to hold a realistic mix of QUEUED + ACCEPTED + SIGNED + recent
+ * REJECTED/CANCELLED entries over the factory's lifetime. 256 gives
+ * comfortable headroom past MAX_FACTORY_PARTICIPANTS (128). */
+#define MAX_JOIN_QUEUE 256
+/* Phase 3 outgoing joins: client-side persistent list of factories the
+ * wallet has tried to join. 32 is generous — most clients participate
+ * in only a handful of factories at a time. */
+#define MAX_OUTGOING_JOINS 32
 
 typedef enum {
 	SWEEP_STATE_PENDING   = 0,
@@ -303,6 +312,69 @@ typedef struct {
 } client_state_t;
 
 /* Factory instance */
+/* Phase 3: per-join lifecycle. Persists in factory_instance_t.join_queue.
+ *
+ * Lifecycle (typical happy path):
+ *   QUEUED -> ACCEPTED -> SIGNED
+ *
+ * Off-path:
+ *   QUEUED|ACCEPTED -> REJECTED   (policy refused OR LSP kicked)
+ *   QUEUED|ACCEPTED -> CANCELLED  (client withdrew)
+ *   any            -> ALREADY_MEMBER  (dedup safety net response code,
+ *                                       not normally persisted)
+ */
+typedef enum {
+	JOIN_STATUS_QUEUED         = 0,  /* received, awaiting policy check */
+	JOIN_STATUS_ACCEPTED       = 1,  /* policy passed, awaiting next rotation */
+	JOIN_STATUS_SIGNED         = 2,  /* included + signed in latest rotation */
+	JOIN_STATUS_REJECTED       = 3,  /* policy refused OR LSP kicked */
+	JOIN_STATUS_CANCELLED      = 4,  /* client sent JOIN_CANCEL */
+	JOIN_STATUS_ALREADY_MEMBER = 5,  /* dedup: client already in this factory */
+} factory_join_status_t;
+
+/* Persistent record of one join request seen by this LSP for this factory.
+ * TODO(privacy): pre-mainnet, decide what subset of these fields should
+ * be retained / hashed / dropped after lifecycle completes. Currently we
+ * retain everything for diagnostics. */
+typedef struct {
+	uint8_t  client_node_id[33];   /* BOLT-8 sender_id of the requester */
+	uint64_t request_id;           /* client-generated, used for response correlation */
+	uint64_t contribution_sats;    /* sats the client offered to contribute */
+	uint32_t received_at_block;    /* block height when JOIN_REQUEST arrived */
+	uint32_t accepted_at_block;    /* block height when status moved to ACCEPTED; 0 otherwise */
+	uint32_t decided_at_block;     /* block height of last status change (any direction) */
+	factory_join_status_t status;  /* current lifecycle position */
+	uint8_t  reason[64];           /* C-string; rejected/cancelled reason or empty */
+} factory_join_t;
+
+/* Client-side: persistent record of an outgoing join attempt this wallet has
+ * made. Lives in superscalar_state_t.outgoing_joins[], keyed by request_id.
+ * Wallet reads this to render the "My Memberships" UI (Phase 5). On wallet
+ * restart, this state survives via plugin datastore.
+ * TODO(privacy): same retention review as factory_join_t. */
+typedef enum {
+	OUTGOING_JOIN_SENT          = 0,  /* JOIN_REQUEST sent, no response yet */
+	OUTGOING_JOIN_QUEUED        = 1,  /* LSP queued us */
+	OUTGOING_JOIN_ACCEPTED      = 2,  /* LSP accepted, waiting for rotation */
+	OUTGOING_JOIN_SIGNED        = 3,  /* included in signed rotation = active */
+	OUTGOING_JOIN_REJECTED      = 4,  /* LSP refused (policy or kick) */
+	OUTGOING_JOIN_CANCELLED     = 5,  /* we sent JOIN_CANCEL */
+	OUTGOING_JOIN_TIMEOUT       = 6,  /* no response, gave up */
+	OUTGOING_JOIN_ALREADY_MEMBER = 7, /* tried to join one we're already in */
+} outgoing_join_status_t;
+
+typedef struct {
+	uint8_t  lsp_node_id[33];          /* who we asked */
+	uint8_t  instance_id[32];          /* which factory */
+	uint64_t request_id;               /* our outgoing request_id (we picked) */
+	uint64_t contribution_sats;        /* what we offered */
+	uint32_t sent_at_block;            /* block height when we sent the request */
+	uint32_t expected_signing_block;   /* from LSP's JOIN_RESPONSE; 0 if unknown */
+	uint32_t updated_at_block;         /* block height of last status change */
+	outgoing_join_status_t status;     /* current lifecycle */
+	uint8_t  reason[64];               /* C-string; for rejected/cancelled */
+} outgoing_join_t;
+
 typedef struct factory_instance {
 	/* Identity */
 	uint8_t instance_id[32];
@@ -677,6 +749,18 @@ typedef struct factory_instance {
 	uint8_t *keyagg_snapshots;
 	size_t   keyagg_snapshots_len;
 
+	/* Phase 3: LSP-side join lifecycle queue. Only populated for factories
+	 * where is_lsp == true. Persisted alongside other factory state via
+	 * ss_save_factory. See factory_join_t for the lifecycle states.
+	 *
+	 * Verbose plugin_log on every state transition serves as the v1
+	 * audit trail (structured audit log is a separate Task #59).
+	 *
+	 * TODO(privacy): every write site must be reviewed pre-mainnet for
+	 * what data can be hashed/dropped. */
+	factory_join_t join_queue[MAX_JOIN_QUEUE];
+	size_t         n_join_queue;
+
 } factory_instance_t;
 
 /* Global plugin state */
@@ -707,6 +791,14 @@ typedef struct superscalar_state {
 	uint32_t factory_counter;
 	bool has_counter_loaded;	/* distinguishes "no counter yet" (fresh
 					 * plugin) from "counter is 0" after load */
+
+	/* Phase 3: client-side outgoing join attempts. Persisted under the
+	 * datastore key "superscalar/outgoing_joins" so wallet restarts
+	 * don't lose pending-rotation memberships. See outgoing_join_t.
+	 *
+	 * TODO(privacy): pre-mainnet, decide retention for completed entries. */
+	outgoing_join_t outgoing_joins[MAX_OUTGOING_JOINS];
+	size_t          n_outgoing_joins;
 } superscalar_state_t;
 
 /* State management functions */
