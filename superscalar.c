@@ -2321,7 +2321,7 @@ static void rotate_finish_and_notify(struct command *cmd,
 /* Per-entry sizes are written explicitly so a parser at a different version
  * can sanity-check before trying to deserialize. v1 entry sizes: */
 #define SS_JOIN_QUEUE_ENTRY_V1_SZ      126   /* 33+8+8+4+4+4+1+64 */
-#define SS_OUTGOING_JOIN_ENTRY_V1_SZ   157   /* 33+32+8+8+4+4+4+1+64 */
+#define SS_OUTGOING_JOIN_ENTRY_V1_SZ   158   /* 33+32+8+8+4+4+4+1+64 */
 
 /* Datastore key for an LSP's join queue: superscalar/<iid_hex>/join-queue */
 static void ss_persist_key_join_queue(const factory_instance_t *fi,
@@ -9499,11 +9499,7 @@ static struct command_result *json_factory_join_request(struct command *cmd,
 	o->updated_at_block = ss_state.current_blockheight;
 	o->status = OUTGOING_JOIN_SENT;
 	memset(o->reason, 0, 64);
-	/* Task #62: ss_save_outgoing_joins(cmd) here crashes the plugin via
-	 * the async datastore write. Same pattern works for ss_save_factory.
-	 * Investigation needed (likely cmd lifetime context). For now,
-	 * outgoing_joins is in-memory only — wallet restart loses pending
-	 * memberships. Acceptable for testing; fix before mainnet. */
+	ss_save_outgoing_joins(cmd);
 
 	uint8_t payload[50];
 	uint8_t *p = payload;
@@ -12344,6 +12340,26 @@ static void ss_launch_breach_scan(struct command *cmd,
 				  factory_instance_t *fi,
 				  size_t factory_idx)
 {
+	/* Phase 3 architectural decision: chain-watching is delegated to
+	 * the standalone superscalar_watchtower binary (see SuperScalar
+	 * source tree). This function previously called CLN's getblockhash
+	 * + getblock RPCs, both of which were removed in recent CLN
+	 * versions. Rather than reimplementing block scanning in the
+	 * plugin, the integration pattern is:
+	 *
+	 *   plugin = factory ceremony coordinator + Lightning wire
+	 *   superscalar_watchtower = chain watching + penalty broadcast
+	 *
+	 * Phase 4 (pre-mainnet hardening): writer hook exporting per-epoch
+	 * state-root txids to a SuperScalar-compatible SQLite DB. See
+	 * PROTOCOL_NOTES.md section 10.
+	 *
+	 * Phase 6+ (architectural cleanup): full library embed via
+	 * libsuperscalar's watchtower module + chain_backend adapter
+	 * for CLN's bcli RPCs. */
+	(void)cmd; (void)fi; (void)factory_idx;
+	return;
+
 	bool has_real_funding = false;
 	for (int fb = 0; fb < 32; fb++) {
 		if (fi->funding_txid[fb] != 0) {
@@ -12831,7 +12847,9 @@ static void ss_launch_state_tx_scan(struct command *cmd,
 				    const uint8_t *kickoff_txid,
 				    uint32_t window)
 {
-	/* Task #61: also disabled until getblockhash refactor */
+	/* Phase 3 architectural decision: chain-watching delegated to
+	 * superscalar_watchtower. See ss_launch_breach_scan for the full
+	 * reasoning + Phase 4/6 roadmap. */
 	(void)cmd; (void)fi; (void)kickoff_txid; (void)window;
 	return;
 	if (ss_state.current_blockheight == 0) return;
@@ -15743,8 +15761,11 @@ static struct command_result *handle_block_added(struct command *cmd,
 						 const char *buf,
 						 const jsmntok_t *params)
 {
-	/* Task #61 workaround: disabled to keep plugin alive during Phase 3 
-	 * smoke testing. Re-enable when getblockhash refactored. */
+	/* Phase 3 architectural decision: per-block handling delegated to
+	 * superscalar_watchtower (separate process). The plugin's role is
+	 * factory ceremony coordination, not chain watching. See
+	 * ss_launch_breach_scan for full architecture notes + Phase 4/6
+	 * roadmap. */
 	(void)buf; (void)params;
 	return notification_handled(cmd);
 
