@@ -443,6 +443,38 @@ static uint64_t ss_fresh_request_id(void)
 	return id ? id : 1;
 }
 
+/* Structured audit log helper. Emits a single-line JSON object as the
+ * message body of an ordinary plugin_log call:
+ *
+ *   {"audit":"<event>",<caller json fragment>}
+ *
+ * Downstream log ingest (loki/elastic/etc.) can recognize lines whose
+ * body parses as JSON with an "audit" key and route them to a
+ * dedicated audit index. Free-form plugin_log calls are preserved for
+ * developer diagnostics; this helper is reserved for events relevant
+ * to ops/forensics (slot exhaustion, rate-limit rejections, join
+ * lifecycle transitions, timeouts).
+ *
+ * Caller writes the inner k:v fragment. All migration in this codebase
+ * is us-writes-both, so injection from untrusted strings is not a
+ * concern; if a future caller needs to embed peer-controlled data, it
+ * must escape JSON quotes first. */
+static void ss_audit_log(enum log_level lvl, const char *event,
+                         const char *fmt, ...)
+{
+	char body[1024];
+	va_list ap;
+	va_start(ap, fmt);
+	int n = vsnprintf(body, sizeof(body), fmt, ap);
+	va_end(ap);
+	if (n < 0) n = 0;
+	if ((size_t)n >= sizeof(body)) n = sizeof(body) - 1;
+	body[n] = '\0';
+	plugin_log(plugin_handle, lvl,
+	           "{\"audit\":\"%s\",%s}", event, body);
+}
+
+
 /* Kept for backward compatibility — will be deleted once all callers
  * use ss_fresh_request_id. Currently unused after this commit. */
 static uint64_t ss_browse_next_request_id = 1;
@@ -464,6 +496,10 @@ static int ss_browse_alloc_slot(void)
 			plugin_log(plugin_handle, LOG_UNUSUAL,
 				   "browse: timing out stuck request_id=%llu",
 				   (unsigned long long)stuck_id);
+			ss_audit_log(LOG_UNUSUAL, "request_timeout",
+				     "\"rpc\":\"factory-browse-host\","
+				     "\"request_id\":%llu",
+				     (unsigned long long)stuck_id);
 			if (stuck) {
 				struct command_result *_cfail = command_fail(stuck, LIGHTNINGD,
 					"factory-browse-host: timeout waiting for peer response (req_id=%llu)",
@@ -525,6 +561,10 @@ static int ss_join_alloc_slot(void)
 			plugin_log(plugin_handle, LOG_UNUSUAL,
 				   "join: timing out stuck request_id=%llu",
 				   (unsigned long long)stuck_id);
+			ss_audit_log(LOG_UNUSUAL, "request_timeout",
+				     "\"rpc\":\"factory-join-request\","
+				     "\"request_id\":%llu",
+				     (unsigned long long)stuck_id);
 			if (stuck) {
 				struct command_result *_cf = command_fail(stuck,
 					LIGHTNINGD,
@@ -8835,6 +8875,15 @@ realloc_all_nonces_done:
 				   (unsigned long long)req_id,
 				   (unsigned long long)contribution_sats,
 				   target_fi->n_join_queue);
+			ss_audit_log(LOG_INFORM, "join_status",
+				     "\"peer\":\"%s\",\"req_id\":%llu,"
+				     "\"transition\":\"->ACCEPTED\","
+				     "\"contribution_sats\":%llu,"
+				     "\"queue_size\":%zu",
+				     peer_id,
+				     (unsigned long long)req_id,
+				     (unsigned long long)contribution_sats,
+				     target_fi->n_join_queue);
 			ss_save_factory(cmd, target_fi);
 		}
 
@@ -9382,6 +9431,10 @@ static struct command_result *browse_preflight_ok(struct command *cmd,
 
 	int slot = ss_browse_alloc_slot();
 	if (slot < 0) {
+		ss_audit_log(LOG_UNUSUAL, "slot_exhausted",
+			     "\"rpc\":\"factory-browse-host\","
+			     "\"peer\":\"%s\",\"max\":%d",
+			     ctx->node_id_str, SS_BROWSE_MAX_PENDING);
 		return command_fail(cmd, LIGHTNINGD,
 			"factory-browse-host: too many pending requests "
 			"(max %d). Try again later.",
@@ -9612,6 +9665,9 @@ static struct command_result *join_preflight_ok(struct command *cmd,
 	/* Allocate slot for response correlation */
 	int slot = ss_join_alloc_slot();
 	if (slot < 0) {
+		ss_audit_log(LOG_UNUSUAL, "slot_exhausted",
+			     "\"rpc\":\"factory-join-request\","
+			     "\"max\":%d", SS_JOIN_MAX_PENDING);
 		return command_fail(cmd, LIGHTNINGD,
 			"factory-join-request: too many pending requests "
 			"(max %d). Try again later.", SS_JOIN_MAX_PENDING);
@@ -9706,6 +9762,9 @@ static struct command_result *json_factory_join_request(struct command *cmd,
 	/* Hardening Task #67: per-peer slot cap + rate limit */
 	const char *limit_err = ss_peer_check_limits(lsp_pk);
 	if (limit_err) {
+		ss_audit_log(LOG_UNUSUAL, "peer_limit_reject",
+			     "\"rpc\":\"factory-join-request\","
+			     "\"reason\":\"%s\"", limit_err);
 		return command_fail(cmd, LIGHTNINGD,
 			"factory-join-request: %s", limit_err);
 	}
