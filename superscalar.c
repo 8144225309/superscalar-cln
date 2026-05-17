@@ -2461,7 +2461,7 @@ static void ss_save_outgoing_joins(struct command *cmd)
 	if (len > 0 && buf) {
 		jsonrpc_set_datastore_binary(cmd, SS_OUTGOING_JOINS_KEY,
 			buf, len, "create-or-replace",
-			rpc_done, rpc_err, NULL);
+			rpc_done, rpc_err, &ss_state);
 		free(buf);
 		plugin_log(plugin_handle, LOG_DBG,
 			   "Persisted outgoing_joins (%zu entries, %zu bytes)",
@@ -2473,7 +2473,7 @@ static void ss_save_outgoing_joins(struct command *cmd)
 		uint8_t empty[3] = { SS_JOIN_SCHEMA_V1, 0, 0 };
 		jsonrpc_set_datastore_binary(cmd, SS_OUTGOING_JOINS_KEY,
 			empty, 3, "create-or-replace",
-			rpc_done, rpc_err, NULL);
+			rpc_done, rpc_err, &ss_state);
 	}
 }
 
@@ -8694,8 +8694,7 @@ realloc_all_nonces_done:
 			case JOIN_STATUS_ALREADY_MEMBER:
 				oj->status = OUTGOING_JOIN_ALREADY_MEMBER; break;
 			}
-			/* Task #61 sibling: ss_save_outgoing_joins disabled (crashes on call). */
-	/* ss_save_outgoing_joins(cmd); */
+			/* Task #62: ss_save_outgoing_joins disabled — see json_factory_join_request comment */
 			plugin_log(plugin_handle, LOG_INFORM,
 				   "join: updated outgoing join req_id=%llu "
 				   "status=%d reason='%s'",
@@ -9414,8 +9413,7 @@ static struct command_result *join_preflight_ok(struct command *cmd,
 	plugin_log(plugin_handle, LOG_INFORM,
 		   "DEBUG: about to save outgoing joins n=%zu",
 		   ss_state.n_outgoing_joins);
-	/* Task #61 sibling: ss_save_outgoing_joins disabled (crashes on call). */
-	/* ss_save_outgoing_joins(cmd); */
+	/* Task #62: ss_save_outgoing_joins disabled — see json_factory_join_request comment */
 	plugin_log(plugin_handle, LOG_INFORM,
 		   "DEBUG: saved outgoing joins, about to send wire");
 
@@ -9501,7 +9499,11 @@ static struct command_result *json_factory_join_request(struct command *cmd,
 	o->updated_at_block = ss_state.current_blockheight;
 	o->status = OUTGOING_JOIN_SENT;
 	memset(o->reason, 0, 64);
-	/* Task #61 sibling: ss_save_outgoing_joins disabled for now */
+	/* Task #62: ss_save_outgoing_joins(cmd) here crashes the plugin via
+	 * the async datastore write. Same pattern works for ss_save_factory.
+	 * Investigation needed (likely cmd lifetime context). For now,
+	 * outgoing_joins is in-memory only — wallet restart loses pending
+	 * memberships. Acceptable for testing; fix before mainnet. */
 
 	uint8_t payload[50];
 	uint8_t *p = payload;
@@ -9582,8 +9584,7 @@ static struct command_result *json_factory_cancel_join(struct command *cmd,
 	o->updated_at_block = ss_state.current_blockheight;
 	strncpy((char *)o->reason, "user cancelled", sizeof(o->reason) - 1);
 	o->reason[sizeof(o->reason) - 1] = 0;
-	/* Task #61 sibling: ss_save_outgoing_joins disabled (crashes on call). */
-	/* ss_save_outgoing_joins(cmd); */
+	/* Task #62: ss_save_outgoing_joins disabled — see json_factory_join_request comment */
 
 	plugin_log(plugin_handle, LOG_INFORM,
 		   "factory-cancel-join: cancelled join req_id=%llu to %s",
