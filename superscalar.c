@@ -3676,12 +3676,53 @@ static void continue_after_funding(struct command *cmd,
 	ss_save_factory(cmd, fi);
 }
 
+/* Phase 4: passive last_seen tracking. Updates every factory's join_queue
+ * entry whose client_node_id matches the BOLT-8 sender. Called from the
+ * top of dispatch_superscalar_submsg so ANY wire message from a known
+ * client refreshes their last_seen_block. Replaces a dedicated heartbeat
+ * submsg — CLN BOLT-8 ping already covers wire-level liveness; this
+ * adds factory-state-level freshness without new wire traffic. */
+static void ss_update_peer_last_seen(const uint8_t peer_pk[33])
+{
+	for (size_t fi_idx = 0; fi_idx < ss_state.n_factories; fi_idx++) {
+		factory_instance_t *fi = ss_state.factories[fi_idx];
+		if (!fi || !fi->is_lsp) continue;
+		for (size_t i = 0; i < fi->n_join_queue; i++) {
+			if (memcmp(fi->join_queue[i].client_node_id,
+				   peer_pk, 33) == 0) {
+				fi->join_queue[i].last_seen_block =
+					ss_state.current_blockheight;
+			}
+		}
+	}
+}
+
 static void dispatch_superscalar_submsg(struct command *cmd,
 					const char *peer_id,
 					u16 submsg_id,
 					const u8 *data, size_t len)
 {
 	factory_instance_t *fi = NULL;
+
+	/* Phase 4: passive last_seen tracking. Update last_seen_block on every
+	 * factory's join_queue entry that matches this peer. Cheap O(F*Q) scan
+	 * — F factories × Q queue entries per factory. F is small (1-10 for
+	 * typical LSP), Q caps at MAX_JOIN_QUEUE=256. */
+	{
+		uint8_t peer_pk_seen[33];
+		if (strlen(peer_id) == 66) {
+			bool ok = true;
+			for (int k = 0; k < 33 && ok; k++) {
+				unsigned int by;
+				if (sscanf(peer_id + k*2, "%2x", &by) != 1)
+					ok = false;
+				else
+					peer_pk_seen[k] = (uint8_t)by;
+			}
+			if (ok)
+				ss_update_peer_last_seen(peer_pk_seen);
+		}
+	}
 
 	/* Extract instance_id from submessage (first 32 bytes).
 	 * Don't strip it — handlers that use nonce_bundle_deserialize
@@ -9834,6 +9875,9 @@ static struct command_result *json_factory_incoming_joins(struct command *cmd,
 				     j->accepted_at_block);
 			json_add_u32(js, "decided_at_block",
 				     j->decided_at_block);
+			if (j->last_seen_block)
+				json_add_u32(js, "last_seen_block",
+					     j->last_seen_block);
 			if (j->reason[0])
 				json_add_string(js, "reason",
 						(const char *)j->reason);
