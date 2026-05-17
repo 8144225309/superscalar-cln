@@ -11177,6 +11177,86 @@ static struct command_result *json_factory_metrics(struct command *cmd,
 	json_object_end(js);
 	json_object_end(js);
 
+	/* Phase 4 / Task #68: slot-table + peer-table stats for dashboard */
+	json_object_start(js, "slots");
+	{
+		unsigned int browse_used = 0, join_used = 0;
+		time_t now = time(NULL);
+		(void)now;
+		for (int i = 0; i < SS_BROWSE_MAX_PENDING; i++)
+			if (ss_browse_pending[i].request_id != 0) browse_used++;
+		for (int i = 0; i < SS_JOIN_MAX_PENDING; i++)
+			if (ss_join_pending[i].request_id != 0) join_used++;
+		json_add_u32(js, "browse_used", browse_used);
+		json_add_u32(js, "browse_total", SS_BROWSE_MAX_PENDING);
+		json_add_u32(js, "join_used", join_used);
+		json_add_u32(js, "join_total", SS_JOIN_MAX_PENDING);
+	}
+	json_object_end(js);
+
+	json_object_start(js, "peer_table");
+	{
+		unsigned int peers_tracked = 0;
+		unsigned int peers_with_active_slots = 0;
+		for (int i = 0; i < SS_PEER_TABLE_SIZE; i++) {
+			if (!ss_peer_table[i].in_use) continue;
+			peers_tracked++;
+			if (ss_peer_table[i].concurrent_slots > 0)
+				peers_with_active_slots++;
+		}
+		json_add_u32(js, "peers_tracked", peers_tracked);
+		json_add_u32(js, "peers_with_active_slots", peers_with_active_slots);
+		json_add_u32(js, "table_capacity", SS_PEER_TABLE_SIZE);
+	}
+	json_object_end(js);
+
+	json_object_start(js, "join_queue_summary");
+	{
+		unsigned int total_queued = 0, total_accepted = 0;
+		unsigned int total_signed = 0, total_rejected = 0;
+		unsigned int total_cancelled = 0;
+		for (size_t fi_idx = 0; fi_idx < ss_state.n_factories; fi_idx++) {
+			factory_instance_t *fi = ss_state.factories[fi_idx];
+			if (!fi || !fi->is_lsp) continue;
+			for (size_t j = 0; j < fi->n_join_queue; j++) {
+				switch (fi->join_queue[j].status) {
+				case JOIN_STATUS_QUEUED: total_queued++; break;
+				case JOIN_STATUS_ACCEPTED: total_accepted++; break;
+				case JOIN_STATUS_SIGNED: total_signed++; break;
+				case JOIN_STATUS_REJECTED: total_rejected++; break;
+				case JOIN_STATUS_CANCELLED: total_cancelled++; break;
+				default: break;
+				}
+			}
+		}
+		json_add_u32(js, "queued", total_queued);
+		json_add_u32(js, "accepted", total_accepted);
+		json_add_u32(js, "signed", total_signed);
+		json_add_u32(js, "rejected", total_rejected);
+		json_add_u32(js, "cancelled", total_cancelled);
+	}
+	json_object_end(js);
+
+	json_object_start(js, "outgoing_joins_summary");
+	{
+		unsigned int total_sent = 0, total_queued_out = 0;
+		unsigned int total_accepted_out = 0, total_other = 0;
+		for (size_t i = 0; i < ss_state.n_outgoing_joins; i++) {
+			switch (ss_state.outgoing_joins[i].status) {
+			case OUTGOING_JOIN_SENT: total_sent++; break;
+			case OUTGOING_JOIN_QUEUED: total_queued_out++; break;
+			case OUTGOING_JOIN_ACCEPTED: total_accepted_out++; break;
+			default: total_other++; break;
+			}
+		}
+		json_add_u32(js, "sent", total_sent);
+		json_add_u32(js, "queued", total_queued_out);
+		json_add_u32(js, "accepted", total_accepted_out);
+		json_add_u32(js, "other", total_other);
+		json_add_u32(js, "total", (unsigned)ss_state.n_outgoing_joins);
+	}
+	json_object_end(js);
+
 	return command_finished(cmd, js);
 	#undef LIFECYCLE_SLOTS
 }
