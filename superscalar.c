@@ -13,6 +13,7 @@
 #include <bitcoin/privkey.h>
 #include <common/addr.h>
 #include <common/features.h>
+#include <common/memleak.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
@@ -319,6 +320,40 @@ static int ss_browse_find_slot(uint64_t request_id)
 		if (ss_browse_pending[i].request_id == request_id) return i;
 	}
 	return -1;
+}
+
+/* Bug B fix: active slot reaper. Registered as a global_timer at plugin
+ * init, fires every 5s. Scans the pending-slot table for entries whose
+ * deadline has passed and fails their associated RPC commands with a
+ * timeout error. Without this active tick, the only reaper is the
+ * lazy-reap in ss_browse_alloc_slot — so a single stuck browse RPC
+ * stays stuck forever (until another browse runs). */
+static struct command_result *ss_browse_reap_tick(struct command *timer_cmd,
+						  void *unused)
+{
+	time_t now = time(NULL);
+	for (int i = 0; i < SS_BROWSE_MAX_PENDING; i++) {
+		if (ss_browse_pending[i].request_id == 0) continue;
+		if (now <= ss_browse_pending[i].deadline) continue;
+		struct command *stuck = ss_browse_pending[i].cmd;
+		uint64_t stuck_id = ss_browse_pending[i].request_id;
+		ss_browse_pending[i].request_id = 0;
+		ss_browse_pending[i].cmd = NULL;
+		plugin_log(plugin_handle, LOG_UNUSUAL,
+			   "browse: reaper timing out stuck req_id=%llu",
+			   (unsigned long long)stuck_id);
+		if (stuck) {
+			struct command_result *_cf = command_fail(stuck,
+				LIGHTNINGD,
+				"factory-browse-host: timeout waiting for "
+				"peer response (req_id=%llu)",
+				(unsigned long long)stuck_id);
+			(void)_cf;
+		}
+	}
+	notleak(global_timer(plugin_handle, time_from_sec(5),
+			     ss_browse_reap_tick, NULL));
+	return timer_complete(timer_cmd);
 }
 
 /* --------------------------------------------------------------------- *
@@ -764,6 +799,11 @@ static struct command_result *rpc_err(struct command *cmd,
 				      const char *buf,
 				      const jsmntok_t *result,
 				      void *arg);
+static struct command_result *rpc_err_browse(struct command *cmd,
+					     const char *method,
+					     const char *buf,
+					     const jsmntok_t *result,
+					     void *arg);
 
 /* Per-client context for async fundchannel_start → fundchannel_complete chain.
  * Carries the factory pointer and the specific client index so callbacks
@@ -1068,6 +1108,57 @@ static void send_factory_msg(struct command *cmd, const char *peer_id,
 
 	struct out_req *req = jsonrpc_request_start(cmd,
 		"sendcustommsg", rpc_done, rpc_err, cmd);
+	json_add_string(req->js, "node_id", peer_id);
+	json_add_string(req->js, "msg", hex);
+	send_outreq(req);
+	free(wire);
+}
+
+/* Bug A fix: browse variant of send_factory_msg. Identical wire formatting
+ * but plumbs rpc_err_browse as the failure callback so synchronous
+ * sendcustommsg errors (peer not connected, unknown node, etc.) fail the
+ * original RPC immediately instead of leaving it pending. */
+static void send_factory_msg_browse(struct command *cmd, const char *peer_id,
+				    uint16_t ss_submsg, const uint8_t *data,
+				    size_t data_len)
+{
+	size_t inner_len = 2 + data_len;
+	size_t varint_size = (inner_len < 253) ? 1 : 3;
+	size_t tlv1024_len = 3 + varint_size + inner_len;
+	size_t wire_len = 4 + 34 + tlv1024_len;
+
+	uint8_t *wire = calloc(1, wire_len);
+	wire[0] = (FACTORY_MSG_TYPE >> 8) & 0xFF;
+	wire[1] = FACTORY_MSG_TYPE & 0xFF;
+	wire[2] = 0x00; wire[3] = 0x04;
+
+	uint8_t *p = wire + 4;
+	*p++ = 0x00;
+	*p++ = 32;
+	memcpy(p, SUPERSCALAR_PROTOCOL_ID, 32); p += 32;
+
+	*p++ = 0xfd;
+	*p++ = 0x04; *p++ = 0x00;
+	if (inner_len < 253) {
+		*p++ = (uint8_t)inner_len;
+	} else {
+		*p++ = 0xfd;
+		*p++ = (inner_len >> 8) & 0xFF;
+		*p++ = inner_len & 0xFF;
+	}
+	*p++ = (ss_submsg >> 8) & 0xFF;
+	*p++ = ss_submsg & 0xFF;
+	if (data_len > 0)
+		memcpy(p, data, data_len);
+	p += data_len;
+
+	size_t actual_len = (size_t)(p - wire);
+	char *hex = tal_arr(cmd, char, actual_len * 2 + 1);
+	for (size_t h = 0; h < actual_len; h++)
+		sprintf(hex + h*2, "%02x", wire[h]);
+
+	struct out_req *req = jsonrpc_request_start(cmd,
+		"sendcustommsg", rpc_done, rpc_err_browse, cmd);
 	json_add_string(req->js, "node_id", peer_id);
 	json_add_string(req->js, "msg", hex);
 	send_outreq(req);
@@ -1584,6 +1675,36 @@ static struct command_result *rpc_err(struct command *cmd,
 			   "RPC %s failed (no message)", method);
 	}
 	return command_still_pending(cmd);
+}
+
+/* Bug A fix: browse-specific error callback. The generic rpc_err returns
+ * command_still_pending which is correct for ceremony state machines
+ * (they get resolved later by an incoming wire message) but wrong for
+ * one-shot browse RPCs that have no follow-up path. */
+static struct command_result *rpc_err_browse(struct command *cmd,
+					     const char *method,
+					     const char *buf,
+					     const jsmntok_t *result,
+					     void *arg)
+{
+	for (int i = 0; i < SS_BROWSE_MAX_PENDING; i++) {
+		if (ss_browse_pending[i].cmd == cmd) {
+			uint64_t freed_id = ss_browse_pending[i].request_id;
+			ss_browse_pending[i].request_id = 0;
+			ss_browse_pending[i].cmd = NULL;
+			plugin_log(plugin_handle, LOG_DBG,
+				   "browse: freed slot for failed RPC "
+				   "(req_id=%llu)",
+				   (unsigned long long)freed_id);
+			break;
+		}
+	}
+	const jsmntok_t *msg_tok = json_get_member(buf, result, "message");
+	const char *errmsg = msg_tok
+		? json_strdup(cmd, buf, msg_tok)
+		: "sendcustommsg failed (no error message)";
+	return command_fail(cmd, LIGHTNINGD,
+			    "factory-browse-host: %s", errmsg);
 }
 
 /* Callback after fundchannel_complete succeeds */
@@ -8124,6 +8245,93 @@ static struct command_result *handle_openchannel(struct command *cmd,
 
 /* factory-create RPC — LSP creates a new factory (Phase 1)
  * Takes client node IDs and creates the DW tree. */
+/* Bug C fix: context carried across the listpeers preflight callback */
+struct browse_preflight_ctx {
+	const char *node_id_str;
+	uint32_t since_block;
+};
+
+/* Bug C fix: listpeers preflight succeeded. Check the peer is actually
+ * connected before allocating a slot and sending the wire request. */
+static struct command_result *browse_preflight_ok(struct command *cmd,
+						  const char *method,
+						  const char *buf,
+						  const jsmntok_t *result,
+						  void *arg)
+{
+	struct browse_preflight_ctx *ctx = arg;
+
+	const jsmntok_t *peers_tok = json_get_member(buf, result, "peers");
+	if (!peers_tok || peers_tok->type != JSMN_ARRAY ||
+	    peers_tok->size == 0) {
+		return command_fail(cmd, LIGHTNINGD,
+			"factory-browse-host: not connected to %s. "
+			"Run `lightning-cli connect <node_id>@<host>:<port>` first.",
+			ctx->node_id_str);
+	}
+
+	/* First (and only) peer in the array */
+	const jsmntok_t *peer_tok = peers_tok + 1;
+	const jsmntok_t *conn_tok = json_get_member(buf, peer_tok,
+						   "connected");
+	bool connected = false;
+	if (!conn_tok || !json_to_bool(buf, conn_tok, &connected) ||
+	    !connected) {
+		return command_fail(cmd, LIGHTNINGD,
+			"factory-browse-host: peer %s known but not currently "
+			"connected. Run `lightning-cli connect "
+			"<node_id>@<host>:<port>` to reconnect.",
+			ctx->node_id_str);
+	}
+
+	int slot = ss_browse_alloc_slot();
+	if (slot < 0) {
+		return command_fail(cmd, LIGHTNINGD,
+			"factory-browse-host: too many pending requests "
+			"(max %d). Try again later.",
+			SS_BROWSE_MAX_PENDING);
+	}
+
+	uint64_t req_id = ss_browse_next_request_id++;
+	ss_browse_pending[slot].request_id = req_id;
+	ss_browse_pending[slot].cmd = cmd;
+	ss_browse_pending[slot].deadline = time(NULL) + SS_BROWSE_TIMEOUT_SECS;
+
+	uint8_t payload[12];
+	uint8_t *p = payload;
+	for (int i = 7; i >= 0; i--) *p++ = (uint8_t)(req_id >> (i*8));
+	for (int i = 3; i >= 0; i--)
+		*p++ = (uint8_t)(ctx->since_block >> (i*8));
+
+	send_factory_msg_browse(cmd, ctx->node_id_str,
+				SS_SUBMSG_FACTORY_INFO_REQUEST,
+				payload, sizeof(payload));
+
+	plugin_log(plugin_handle, LOG_INFORM,
+		   "factory-browse-host: sent FACTORY_INFO_REQUEST to %s "
+		   "(req_id=%llu since_block=%u)",
+		   ctx->node_id_str, (unsigned long long)req_id,
+		   ctx->since_block);
+
+	return command_still_pending(cmd);
+}
+
+static struct command_result *browse_preflight_err(struct command *cmd,
+						   const char *method,
+						   const char *buf,
+						   const jsmntok_t *result,
+						   void *arg)
+{
+	struct browse_preflight_ctx *ctx = arg;
+	const jsmntok_t *msg_tok = json_get_member(buf, result, "message");
+	const char *errmsg = msg_tok
+		? json_strdup(cmd, buf, msg_tok)
+		: "listpeers failed";
+	return command_fail(cmd, LIGHTNINGD,
+		"factory-browse-host: peer connectivity check failed for %s: %s",
+		ctx->node_id_str, errmsg);
+}
+
 static struct command_result *json_factory_browse_host(struct command *cmd,
 						       const char *buf,
 						       const jsmntok_t *params)
@@ -8137,32 +8345,20 @@ static struct command_result *json_factory_browse_host(struct command *cmd,
 		   NULL))
 		return command_param_failed();
 
-	int slot = ss_browse_alloc_slot();
-	if (slot < 0) {
-		return command_fail(cmd, LIGHTNINGD,
-			"factory-browse-host: too many pending requests (max %d). Try again later.",
-			SS_BROWSE_MAX_PENDING);
-	}
+	/* Bug C fix: preflight listpeers check before allocating a slot.
+	 * Avoids sending into the void when the target peer is unknown
+	 * or disconnected, and gives the user a clear, fast error
+	 * instead of a hanging RPC. */
+	struct browse_preflight_ctx *ctx =
+		tal(cmd, struct browse_preflight_ctx);
+	ctx->node_id_str = tal_strdup(ctx, node_id_str);
+	ctx->since_block = since_block_opt ? *since_block_opt : 0;
 
-	uint64_t req_id = ss_browse_next_request_id++;
-	ss_browse_pending[slot].request_id = req_id;
-	ss_browse_pending[slot].cmd = cmd;
-	ss_browse_pending[slot].deadline = time(NULL) + SS_BROWSE_TIMEOUT_SECS;
-
-	uint8_t payload[12];
-	uint8_t *p = payload;
-	for (int i = 7; i >= 0; i--) *p++ = (uint8_t)(req_id >> (i*8));
-	uint32_t since_block = since_block_opt ? *since_block_opt : 0;
-	for (int i = 3; i >= 0; i--) *p++ = (uint8_t)(since_block >> (i*8));
-
-	send_factory_msg(cmd, node_id_str, SS_SUBMSG_FACTORY_INFO_REQUEST,
-			 payload, sizeof(payload));
-
-	plugin_log(plugin_handle, LOG_INFORM,
-		   "factory-browse-host: sent FACTORY_INFO_REQUEST to %s (req_id=%llu since_block=%u)",
-		   node_id_str, (unsigned long long)req_id, since_block);
-
-	return command_still_pending(cmd);
+	struct out_req *req = jsonrpc_request_start(cmd, "listpeers",
+						    browse_preflight_ok,
+						    browse_preflight_err, ctx);
+	json_add_string(req->js, "id", ctx->node_id_str);
+	return send_outreq(req);
 }
 
 static struct command_result *json_factory_create(struct command *cmd,
@@ -15115,6 +15311,16 @@ static const char *init(struct command *init_cmd,
 			}
 		}
 	}
+
+	/* Bug B fix: register the browse-slot reaper timer. Fires every 5s
+	 * to fail any stuck factory-browse-host RPCs whose deadline has
+	 * passed. Without this, RPCs whose sendcustommsg succeeded but
+	 * whose peer never responds hang forever (no other reaper path
+	 * unless another browse RPC arrives). */
+	notleak(global_timer(plugin_handle, time_from_sec(5),
+			     ss_browse_reap_tick, NULL));
+	plugin_log(plugin_handle, LOG_INFORM,
+		   "browse: slot reaper timer registered (5s tick)");
 
 	plugin_log(plugin_handle, LOG_INFORM,
 		   "SuperScalar factory plugin initialized "
