@@ -277,6 +277,10 @@ static const uint8_t SUPERSCALAR_PROTOCOL_ID[32] = {
  * --------------------------------------------------------------------- */
 #define SS_BROWSE_MAX_PENDING		16
 #define SS_BROWSE_TIMEOUT_SECS		30
+/* Runtime-mutable copy set by --superscalar-browse-timeout-secs.
+ * Default mirrors the compile-time constant; operators can lower for
+ * impatient UIs or raise for high-latency networks. */
+static u32 ss_browse_timeout_secs = SS_BROWSE_TIMEOUT_SECS;
 struct ss_browse_pending_slot {
 	uint64_t request_id;
 	struct command *cmd;
@@ -492,6 +496,9 @@ static int ss_browse_find_slot(uint64_t request_id)
  * ============================================================================ */
 #define SS_JOIN_MAX_PENDING		16
 #define SS_JOIN_TIMEOUT_SECS		30
+/* Runtime-mutable copy set by --superscalar-join-timeout-secs.
+ * See note on ss_browse_timeout_secs. */
+static u32 ss_join_timeout_secs = SS_JOIN_TIMEOUT_SECS;
 struct ss_join_pending_slot {
 	uint64_t request_id;
 	struct command *cmd;
@@ -9384,7 +9391,7 @@ static struct command_result *browse_preflight_ok(struct command *cmd,
 	uint64_t req_id = ss_fresh_request_id();
 	ss_browse_pending[slot].request_id = req_id;
 	ss_browse_pending[slot].cmd = cmd;
-	ss_browse_pending[slot].deadline = time(NULL) + SS_BROWSE_TIMEOUT_SECS;
+	ss_browse_pending[slot].deadline = time(NULL) + ss_browse_timeout_secs;
 
 	uint8_t payload[12];
 	uint8_t *p = payload;
@@ -9612,7 +9619,7 @@ static struct command_result *join_preflight_ok(struct command *cmd,
 	uint64_t req_id = ss_fresh_request_id();
 	ss_join_pending[slot].request_id = req_id;
 	ss_join_pending[slot].cmd = cmd;
-	ss_join_pending[slot].deadline = time(NULL) + SS_JOIN_TIMEOUT_SECS;
+	ss_join_pending[slot].deadline = time(NULL) + ss_join_timeout_secs;
 
 	/* Add persistent outgoing_join_t entry */
 	/* TODO(privacy): retention review pre-mainnet */
@@ -9710,7 +9717,7 @@ static struct command_result *json_factory_join_request(struct command *cmd,
 	uint64_t req_id = ss_fresh_request_id();
 	ss_join_pending[slot].request_id = req_id;
 	ss_join_pending[slot].cmd = cmd;
-	ss_join_pending[slot].deadline = time(NULL) + SS_JOIN_TIMEOUT_SECS;
+	ss_join_pending[slot].deadline = time(NULL) + ss_join_timeout_secs;
 	memcpy(ss_join_pending[slot].peer_id, lsp_pk, 33);
 	ss_peer_usage_commit_slot(lsp_pk);
 
@@ -19583,5 +19590,17 @@ int main(int argc, char *argv[])
 		    notifs, ARRAY_SIZE(notifs),
 		    hooks, ARRAY_SIZE(hooks),
 		    NULL, 0,
+		    plugin_option("superscalar-browse-timeout-secs",
+				  "int",
+				  "Seconds before a pending factory-browse-host "
+				  "request times out and is reaped. Default 30.",
+				  u32_option, u32_jsonfmt,
+				  &ss_browse_timeout_secs),
+		    plugin_option("superscalar-join-timeout-secs",
+				  "int",
+				  "Seconds before a pending factory-join-request "
+				  "times out and is reaped. Default 30.",
+				  u32_option, u32_jsonfmt,
+				  &ss_join_timeout_secs),
 		    NULL);
 }
