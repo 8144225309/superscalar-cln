@@ -288,6 +288,12 @@ struct ss_browse_pending_slot {
 	uint8_t peer_id[33];        /* for per-peer cap release */
 };
 static struct ss_browse_pending_slot ss_browse_pending[SS_BROWSE_MAX_PENDING];
+
+/* Forward decl: ss_audit_log is defined below ss_fresh_request_id, but the
+ * peer-table helpers (which appear above the helper definition) call it. */
+static void ss_audit_log(enum log_level lvl, const char *event,
+                         const char *fmt, ...);
+
 /* ============================================================================
  * Per-peer rate limit + slot cap tracking (hardening: DoS resistance)
  *
@@ -306,6 +312,10 @@ static struct ss_browse_pending_slot ss_browse_pending[SS_BROWSE_MAX_PENDING];
 #define SS_PEER_MAX_CONCURRENT       2
 #define SS_PEER_RATE_LIMIT          10
 #define SS_PEER_RATE_WINDOW_SECS    60
+/* Soft-ban (#71): N fails within window triggers M-second ban. */
+#define SS_PEER_MAX_FAILS            5
+#define SS_PEER_FAIL_WINDOW_SECS    60
+#define SS_PEER_SOFT_BAN_SECS      300
 
 struct ss_peer_usage {
 	uint8_t node_id[33];
@@ -314,6 +324,12 @@ struct ss_peer_usage {
 	time_t window_start;        /* start of current rate-limit window */
 	int requests_in_window;     /* requests counted in current window */
 	time_t last_seen;           /* LRU tracking for eviction */
+	/* Soft-ban (#71): fails counted within fail_window_start..+SECS;
+	 * crossing SS_PEER_MAX_FAILS sets ban_until = now + SOFT_BAN_SECS.
+	 * 0 ban_until means not banned. */
+	int fail_count;
+	time_t fail_window_start;
+	time_t ban_until;
 };
 
 static struct ss_peer_usage ss_peer_table[SS_PEER_TABLE_SIZE];
@@ -342,6 +358,9 @@ static struct ss_peer_usage *ss_peer_usage_get(const uint8_t node_id[33])
 			ss_peer_table[i].window_start = now;
 			ss_peer_table[i].requests_in_window = 0;
 			ss_peer_table[i].last_seen = now;
+			ss_peer_table[i].fail_count = 0;
+			ss_peer_table[i].fail_window_start = now;
+			ss_peer_table[i].ban_until = 0;
 			return &ss_peer_table[i];
 		}
 	}
@@ -364,6 +383,9 @@ static struct ss_peer_usage *ss_peer_usage_get(const uint8_t node_id[33])
 		ss_peer_table[oldest_idx].window_start = now;
 		ss_peer_table[oldest_idx].requests_in_window = 0;
 		ss_peer_table[oldest_idx].last_seen = now;
+		ss_peer_table[oldest_idx].fail_count = 0;
+		ss_peer_table[oldest_idx].fail_window_start = now;
+		ss_peer_table[oldest_idx].ban_until = 0;
 		return &ss_peer_table[oldest_idx];
 	}
 
@@ -388,12 +410,44 @@ static const char *ss_peer_check_limits(const uint8_t node_id[33])
 		u->requests_in_window = 0;
 	}
 
+	/* Soft-ban check (#71). Returns the static "banned" string while
+	 * within ban_until; auto-clears when window expires. */
+	if (u->ban_until > 0) {
+		if (now < u->ban_until)
+			return "peer is soft-banned (too many recent failures)";
+		u->ban_until = 0;
+		u->fail_count = 0;
+		u->fail_window_start = now;
+	}
+
 	if (u->concurrent_slots >= SS_PEER_MAX_CONCURRENT)
 		return "peer has too many concurrent requests (max 2)";
 	if (u->requests_in_window >= SS_PEER_RATE_LIMIT)
 		return "peer exceeded rate limit (max 10 requests/minute)";
 
 	return NULL;
+}
+
+/* Record a soft-ban-eligible failure for the given peer. Resets the
+ * fail-window if it has elapsed; increments fail_count; triggers a
+ * ban if count >= SS_PEER_MAX_FAILS. Idempotent if peer table is
+ * saturated (no-op). */
+static void ss_peer_record_fail(const uint8_t node_id[33])
+{
+	struct ss_peer_usage *u = ss_peer_usage_get(node_id);
+	if (!u) return;
+	time_t now = time(NULL);
+	if (now - u->fail_window_start >= SS_PEER_FAIL_WINDOW_SECS) {
+		u->fail_window_start = now;
+		u->fail_count = 0;
+	}
+	u->fail_count++;
+	if (u->fail_count >= SS_PEER_MAX_FAILS && u->ban_until == 0) {
+		u->ban_until = now + SS_PEER_SOFT_BAN_SECS;
+		ss_audit_log(LOG_UNUSUAL, "peer_soft_banned",
+			     "\"fail_count\":%d,\"ban_secs\":%d",
+			     u->fail_count, SS_PEER_SOFT_BAN_SECS);
+	}
 }
 
 /* Commit a slot allocation. Caller must have already called check_limits
@@ -9762,6 +9816,7 @@ static struct command_result *json_factory_join_request(struct command *cmd,
 	/* Hardening Task #67: per-peer slot cap + rate limit */
 	const char *limit_err = ss_peer_check_limits(lsp_pk);
 	if (limit_err) {
+		ss_peer_record_fail(lsp_pk);
 		ss_audit_log(LOG_UNUSUAL, "peer_limit_reject",
 			     "\"rpc\":\"factory-join-request\","
 			     "\"reason\":\"%s\"", limit_err);
