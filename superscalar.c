@@ -308,6 +308,40 @@ static void ss_audit_log(enum log_level lvl, const char *event,
  * many distinct peers, the table is evicted in FIFO order; legitimate
  * peers may briefly bypass the cap. Acceptable for v1.
  * ============================================================================ */
+/* ============================================================================
+ * SuperScalar JSON-RPC error codes (Task #69).
+ *
+ * CLN uses errcode_t int; we allocate the 2200-2299 range for
+ * plugin-specific codes so clients can switch on them instead of
+ * regexing the message string. Codes are stable: do NOT renumber.
+ *
+ * Parameter-validation errors continue to use JSONRPC2_INVALID_PARAMS
+ * (CLN-defined, -32602). The codes below are for post-parse semantic
+ * failures (peer rate limited, slot pool exhausted, etc.).
+ *
+ * Wallet adoption: clients should map unrecognized codes to "unknown
+ * server error" rather than failing — the code list will grow.
+ * ============================================================================ */
+#define SS_ERR_INTERNAL                  2200
+/* Per-peer DoS protection */
+#define SS_ERR_PEER_RATE_LIMIT           2210
+#define SS_ERR_PEER_CONCURRENT_LIMIT     2211
+#define SS_ERR_PEER_SOFT_BANNED          2212
+#define SS_ERR_PEER_TABLE_FULL           2213
+/* Slot pool exhaustion */
+#define SS_ERR_SLOT_EXHAUSTED            2220
+/* Peer connectivity */
+#define SS_ERR_PEER_NOT_CONNECTED        2230
+#define SS_ERR_PEER_NOT_BLIP56           2231
+/* Factory state */
+#define SS_ERR_UNKNOWN_FACTORY           2240
+#define SS_ERR_FACTORY_QUEUE_FULL        2241
+#define SS_ERR_DUPLICATE_JOIN            2242
+#define SS_ERR_OUTGOING_JOINS_FULL       2243
+#define SS_ERR_INSTANCE_ID_INVALID       2244
+/* Wire/timing */
+#define SS_ERR_REQUEST_TIMEOUT           2250
+
 #define SS_PEER_TABLE_SIZE          64
 #define SS_PEER_MAX_CONCURRENT       2
 #define SS_PEER_RATE_LIMIT          10
@@ -9489,7 +9523,7 @@ static struct command_result *browse_preflight_ok(struct command *cmd,
 			     "\"rpc\":\"factory-browse-host\","
 			     "\"peer\":\"%s\",\"max\":%d",
 			     ctx->node_id_str, SS_BROWSE_MAX_PENDING);
-		return command_fail(cmd, LIGHTNINGD,
+		return command_fail(cmd, SS_ERR_SLOT_EXHAUSTED,
 			"factory-browse-host: too many pending requests "
 			"(max %d). Try again later.",
 			SS_BROWSE_MAX_PENDING);
@@ -9698,7 +9732,7 @@ static struct command_result *join_preflight_ok(struct command *cmd,
 		     o->status == OUTGOING_JOIN_QUEUED ||
 		     o->status == OUTGOING_JOIN_ACCEPTED ||
 		     o->status == OUTGOING_JOIN_SIGNED)) {
-			return command_fail(cmd, LIGHTNINGD,
+			return command_fail(cmd, SS_ERR_DUPLICATE_JOIN,
 				"factory-join-request: already have an active "
 				"join for this factory (status=%s, "
 				"request_id=%llu). Cancel it first with "
@@ -9710,7 +9744,7 @@ static struct command_result *join_preflight_ok(struct command *cmd,
 
 	/* Check we have room in outgoing_joins */
 	if (ss_state.n_outgoing_joins >= MAX_OUTGOING_JOINS) {
-		return command_fail(cmd, LIGHTNINGD,
+		return command_fail(cmd, SS_ERR_OUTGOING_JOINS_FULL,
 			"factory-join-request: outgoing joins full "
 			"(max %d). Cancel or wait for existing ones.",
 			MAX_OUTGOING_JOINS);
@@ -9722,7 +9756,7 @@ static struct command_result *join_preflight_ok(struct command *cmd,
 		ss_audit_log(LOG_UNUSUAL, "slot_exhausted",
 			     "\"rpc\":\"factory-join-request\","
 			     "\"max\":%d", SS_JOIN_MAX_PENDING);
-		return command_fail(cmd, LIGHTNINGD,
+		return command_fail(cmd, SS_ERR_SLOT_EXHAUSTED,
 			"factory-join-request: too many pending requests "
 			"(max %d). Try again later.", SS_JOIN_MAX_PENDING);
 	}
@@ -9811,7 +9845,7 @@ static struct command_result *json_factory_join_request(struct command *cmd,
 		return command_fail(cmd, LIGHTNINGD, "instance_id must be 64-char hex");
 
 	if (ss_state.n_outgoing_joins >= MAX_OUTGOING_JOINS)
-		return command_fail(cmd, LIGHTNINGD, "outgoing joins full");
+		return command_fail(cmd, SS_ERR_OUTGOING_JOINS_FULL, "outgoing joins full");
 
 	/* Hardening Task #67: per-peer slot cap + rate limit */
 	const char *limit_err = ss_peer_check_limits(lsp_pk);
@@ -9820,13 +9854,13 @@ static struct command_result *json_factory_join_request(struct command *cmd,
 		ss_audit_log(LOG_UNUSUAL, "peer_limit_reject",
 			     "\"rpc\":\"factory-join-request\","
 			     "\"reason\":\"%s\"", limit_err);
-		return command_fail(cmd, LIGHTNINGD,
+		return command_fail(cmd, SS_ERR_PEER_RATE_LIMIT,
 			"factory-join-request: %s", limit_err);
 	}
 
 	int slot = ss_join_alloc_slot();
 	if (slot < 0)
-		return command_fail(cmd, LIGHTNINGD, "too many pending requests");
+		return command_fail(cmd, SS_ERR_SLOT_EXHAUSTED, "too many pending requests");
 
 	uint64_t req_id = ss_fresh_request_id();
 	ss_join_pending[slot].request_id = req_id;
@@ -17662,7 +17696,7 @@ static struct command_result *json_factory_initiate_exit(struct command *cmd,
 	if (strlen(inst_hex) != 64)
 		return command_fail(cmd, LIGHTNINGD, "Bad instance_id");
 	if (strlen(client_hex) != 66)
-		return command_fail(cmd, LIGHTNINGD, "Bad client_id (66 hex chars)");
+		return command_fail(cmd, SS_ERR_INSTANCE_ID_INVALID, "Bad client_id (66 hex chars)");
 
 	uint8_t instance_id[32];
 	for (int j = 0; j < 32; j++) {
