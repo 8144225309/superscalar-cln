@@ -10518,6 +10518,447 @@ static struct command_result *json_factory_kick_joiner(struct command *cmd,
 	return command_finished(cmd, js);
 }
 
+/* PR 3b: extracted MuSig2 kickoff. Called by json_factory_create
+ * (legacy synchronous flow) and by json_factory_trigger_ceremony
+ * (new decoupled flow). Builds the libsuperscalar factory_t handle,
+ * derives placeholder client pubkeys, builds the DW tree, configures
+ * per-leaf amounts from allocations, generates LSP MuSig2 nonces, and
+ * broadcasts FACTORY_PROPOSE (0x0100) to every client.
+ *
+ * Caller must set fi->funding_amount_sats, fi->n_clients, fi->clients[],
+ * fi->arity_mode, and fi->instance_id before calling.
+ *
+ * Returns NULL on success (FACTORY_PROPOSE broadcasts queued). On
+ * failure, returns the command_fail() result to be propagated. */
+static struct command_result *ss_kickoff_factory_signing(
+	struct command *cmd, factory_instance_t *fi)
+{
+	secp256k1_context *secp_ctx = global_secp_ctx;
+
+/* Initialize the factory via libsuperscalar */
+
+/* Build pubkey array: [LSP, client0, client1, ...] */
+{
+	factory_t *factory = calloc(1, sizeof(factory_t));
+	size_t n_total = 1 + fi->n_clients;
+	secp256k1_pubkey *pubkeys = calloc(n_total,
+					   sizeof(secp256k1_pubkey));
+
+	/* Pubkeys for tree construction.
+	 * LSP (k=0): real factory key (HSM-derived or demo XOR).
+	 * Clients (k≥1): placeholder keys — used only for tree
+	 * topology, replaced by real pubkeys after NONCE_BUNDLE
+	 * collection. All nodes produce identical placeholder keys
+	 * for client slots since derive_placeholder_seckey is
+	 * deterministic (instance_id + slot only). */
+	for (size_t k = 0; k < n_total; k++) {
+		unsigned char sk[32];
+		if (k == 0)
+			derive_factory_seckey(sk, fi->instance_id, 0);
+		else
+			derive_placeholder_seckey(sk, fi->instance_id, (int)k);
+		if (!secp256k1_ec_pubkey_create(secp_ctx,
+						&pubkeys[k], sk)) {
+			return command_fail(cmd, LIGHTNINGD,
+					    "Bad derived pubkey");
+		}
+	}
+
+	/* Initialize factory with derived pubkeys */
+	factory_init_from_pubkeys(factory, secp_ctx,
+				  pubkeys, n_total,
+				  DW_STEP_BLOCKS,
+				  16); /* states_per_layer */
+
+	/* Phase 3c3: wire the fee estimator so tree TXs carry
+	 * P2A anchors (activates Phase 3c2/3c2.5 CPFP). */
+	ss_factory_wire_fee_estimator(fi, factory);
+
+	factory_set_arity(factory, ss_effective_arity(fi));
+
+	/* Set funding — use a plausible P2TR scriptpubkey.
+	 * Real funding comes from the on-chain UTXO backing
+	 * the factory. For now use synthetic data. */
+	uint8_t synth_txid[32];
+	for (int j = 0; j < 32; j++) synth_txid[j] = j + 1;
+	/* P2TR scriptpubkey: OP_1 <32-byte x-only key> */
+	uint8_t synth_spk[34];
+	synth_spk[0] = 0x51; /* OP_1 */
+	synth_spk[1] = 0x20; /* PUSH 32 */
+	/* Use the aggregate key as the taproot key */
+	memset(synth_spk + 2, 0xAA, 32);
+	factory_set_funding(factory, synth_txid, 0,
+			    fi->funding_amount_sats, synth_spk, 34);
+
+	/* Set lifecycle so DW nodes get CLTV timeout script leaves.
+	 * This enables the timeout spend path (safety valve for
+	 * client unilateral exit if LSP vanishes after expiry). */
+	factory_set_lifecycle(factory,
+		ss_state.current_blockheight,
+		4320,   /* active period: ~30 days */
+		432);   /* dying period: ~3 days */
+
+	/* Derive L-stock revocation secrets BEFORE building the tree so
+	 * build_l_stock_spk() produces hashlocked P2TR outputs from
+	 * epoch 0 onward. This matters because the L-stock output keys
+	 * are committed when the tree is built; setting secrets later
+	 * would leave epoch-0 L-stock as bare-key (recoverable only by
+	 * LSP with no hashlock). Deterministic derivation from HSM
+	 * guarantees identical secrets after any restart. */
+	if (ss_state.has_master_key) {
+		static unsigned char secrets[256][32];
+		derive_l_stock_secrets(secrets, 256, fi->instance_id);
+		factory_set_flat_secrets(factory,
+			(const unsigned char (*)[32])secrets, 256);
+	}
+
+	/* Build the DW tree */
+	int rc = factory_build_tree(factory);
+	if (rc == 0) {
+		plugin_log(plugin_handle, LOG_BROKEN,
+			   "factory_build_tree failed: %d", rc);
+		free(factory);
+		free(pubkeys);
+		return command_fail(cmd, LIGHTNINGD,
+				    "Failed to build factory tree");
+	}
+
+	plugin_log(plugin_handle, LOG_INFORM,
+		   "Factory tree built: %zu participants",
+		   n_total);
+
+	/* Configure per-leaf amounts: each client gets either their
+	 * explicit allocation_sats, or an even share if 0.
+	 * L-stock (LSP liquidity) is the last output on each leaf. */
+	{
+		uint64_t total = fi->funding_amount_sats;
+		uint64_t lstock_pct = 20;
+		uint64_t lstock_total = total * lstock_pct / 100;
+		uint64_t client_total = total - lstock_total;
+		uint64_t default_per_client =
+			client_total / (n_total - 1);
+
+		for (int ls = 0; ls < factory->n_leaf_nodes; ls++) {
+			size_t leaf_ni = factory->leaf_node_indices[ls];
+			factory_node_t *ln = &factory->nodes[leaf_ni];
+			size_t n_clients_on_leaf = 0;
+			for (size_t s = 0; s < ln->n_signers; s++)
+				if (ln->signer_indices[s] != 0)
+					n_clients_on_leaf++;
+
+			size_t n_outputs = n_clients_on_leaf + 1;
+			uint64_t *amts = calloc(n_outputs, sizeof(uint64_t));
+			if (amts) {
+				/* Walk signers for this leaf, map
+				 * participant_idx -> client_idx, pick
+				 * allocation_sats (or default). */
+				size_t out_idx = 0;
+				uint64_t client_sum = 0;
+				for (size_t s = 0; s < ln->n_signers; s++) {
+					int pidx = ln->signer_indices[s];
+					if (pidx == 0) continue; /* skip LSP */
+					size_t ci = (size_t)(pidx - 1);
+					uint64_t a = (ci < fi->n_clients &&
+						      fi->clients[ci].allocation_sats > 0)
+						? fi->clients[ci].allocation_sats
+						: default_per_client;
+					amts[out_idx++] = a;
+					client_sum += a;
+				}
+				/* Library requires sum(amts) == sum(current node
+				 * outputs), NOT ln->input_amount (which excludes the
+				 * tree-fee deduction the library has already applied).
+				 * Read current_total from outputs to satisfy the
+				 * conservation check in factory_set_leaf_amounts. */
+				uint64_t current_total = 0;
+				for (size_t o = 0; o < ln->n_outputs; o++)
+					current_total += ln->outputs[o].amount_sats;
+				if (client_sum + 546 > current_total) {
+					plugin_log(plugin_handle, LOG_UNUSUAL,
+						   "Leaf %d: allocations sum %"PRIu64
+						   " leaves L-stock below dust "
+						   "(current_total=%"PRIu64
+						   "); skipping rewrite",
+						   ls, client_sum, current_total);
+					free(amts);
+					continue;
+				}
+				amts[n_clients_on_leaf] = current_total - client_sum;
+
+				if (factory_set_leaf_amounts(factory, ls,
+							    amts, n_outputs))
+					plugin_log(plugin_handle, LOG_INFORM,
+						   "Leaf %d: %zu clients, "
+						   "L-stock=%"PRIu64" sats",
+						   ls, n_clients_on_leaf,
+						   amts[n_clients_on_leaf]);
+				free(amts);
+			}
+		}
+	}
+
+	/* L-stock secrets were set before build_tree when the HSM is
+	 * available (see above). Non-HSM fallback handled here —
+	 * generates random secrets that will NOT survive restart.
+	 * This path is for dev/test only. */
+	if (!ss_state.has_master_key
+	    && factory_generate_flat_secrets(factory, 256)) {
+		factory_set_l_stock_hashes(factory,
+			(const unsigned char (*)[32])factory->l_stock_hashes,
+			factory->n_l_stock_hashes);
+		plugin_log(plugin_handle, LOG_UNUSUAL,
+			   "Generated %zu L-stock hashes from urandom "
+			   "(no HSM — secrets will be lost on restart)",
+			   factory->n_l_stock_hashes);
+	} else if (factory->n_revocation_secrets > 0) {
+		plugin_log(plugin_handle, LOG_INFORM,
+			   "Using %zu HSM-derived L-stock secrets",
+			   factory->n_revocation_secrets);
+	}
+
+	/* Store factory handle + populate metadata from tree */
+	fi->lib_factory = factory;
+	fi->n_tree_nodes = (uint32_t)factory->n_nodes;
+	fi->max_epochs = factory->counter.total_states;
+	fi->creation_block = ss_state.current_blockheight;
+	fi->expiry_block = factory->cltv_timeout > 0
+		? factory->cltv_timeout
+		: ss_state.current_blockheight + 4320; /* ~30 days */
+
+	/* Compute HTLC safety parameter from DW tree depth.
+	 * This is the minimum time needed to force-close the
+	 * factory before an HTLC times out. */
+	fi->early_warning_time = compute_early_warning_time(
+		fi->n_clients, ss_effective_arity(fi));
+
+	/* Initialize signing sessions */
+	rc = factory_sessions_init(factory);
+	if (rc == 0) {
+		plugin_log(plugin_handle, LOG_BROKEN,
+			   "factory_sessions_init failed");
+		free(factory);
+		free(pubkeys);
+		return command_fail(cmd, LIGHTNINGD,
+				    "Failed to init signing sessions");
+	}
+
+	/* Generate nonces using nonce pool.
+	 * Need a keypair for the LSP (participant 0). */
+	{
+		unsigned char lsp_seckey[32];
+		secp256k1_keypair lsp_keypair;
+
+		/* Derive LSP seckey deterministically (participant 0) */
+		derive_factory_seckey(lsp_seckey, fi->instance_id, 0);
+		if (!secp256k1_keypair_create(secp_ctx, &lsp_keypair,
+					      lsp_seckey)) {
+			return command_fail(cmd, LIGHTNINGD,
+					    "Failed to create LSP keypair");
+		}
+
+		/* Store seckey for signing phase */
+		memcpy(fi->our_seckey, lsp_seckey, 32);
+		fi->our_participant_idx = 0;
+		fi->n_secnonces = 0;
+
+		/* Count nodes where LSP is a signer */
+		size_t lsp_node_count = factory_count_nodes_for_participant(
+			factory, 0);
+
+		/* Heap-allocate pool so secnonces survive this scope */
+		musig_nonce_pool_t *pool = calloc(1, sizeof(musig_nonce_pool_t));
+		if (!musig_nonce_pool_generate(secp_ctx, pool,
+					       lsp_node_count,
+					       lsp_seckey,
+					       &pubkeys[0],
+					       NULL)) {
+			free(pool);
+			free(pubkeys);
+			return command_fail(cmd, LIGHTNINGD,
+					    "Failed to generate nonce pool");
+		}
+		fi->nonce_pool = pool;
+
+		/* Extract nonces for each node.
+		 * Heap-allocate: with 1024 entries nonce_bundle_t is ~79KB */
+		nonce_bundle_t *nb = calloc(1, sizeof(nonce_bundle_t));
+		if (!nb) {
+			free(pool);
+			free(pubkeys);
+			return command_fail(cmd, LIGHTNINGD,
+					    "OOM allocating nonce bundle");
+		}
+		memcpy(nb->instance_id, fi->instance_id, 32);
+		nb->n_participants = n_total;
+		nb->n_nodes = factory->n_nodes;
+		nb->n_entries = 0;
+		/* Tier 2.6: propagate our arity choice so the client
+		 * builds an identical tree. 0 = auto (legacy). */
+		nb->arity_mode = fi->arity_mode;
+
+		plugin_log(plugin_handle, LOG_INFORM,
+			   "factory-create: n_nodes=%zu lsp_node_count=%zu",
+			   (size_t)factory->n_nodes, lsp_node_count);
+
+		/* Include all pubkeys so client can reconstruct */
+		for (size_t pk = 0; pk < n_total && pk < MAX_PARTICIPANTS; pk++) {
+			size_t pklen = 33;
+			secp256k1_ec_pubkey_serialize(secp_ctx,
+				nb->pubkeys[pk], &pklen,
+				&pubkeys[pk],
+				SECP256K1_EC_COMPRESSED);
+		}
+
+		size_t pool_entry = 0;
+		for (size_t ni = 0; ni < factory->n_nodes; ni++) {
+			int slot = factory_find_signer_slot(
+				factory, ni, 0);
+			if (slot < 0) continue;
+
+			if (nb->n_entries >= MAX_NONCE_ENTRIES ||
+			    fi->n_secnonces >= MAX_NONCE_ENTRIES) {
+				plugin_log(plugin_handle, LOG_BROKEN,
+					   "Nonce entries exceeded MAX_NONCE_ENTRIES"
+					   " (%d) at node %zu — increase limit",
+					   MAX_NONCE_ENTRIES, ni);
+				break;
+			}
+
+			secp256k1_musig_secnonce *secnonce;
+			secp256k1_musig_pubnonce pubnonce;
+
+			if (!musig_nonce_pool_next(pool,
+						   &secnonce,
+						   &pubnonce)) {
+				plugin_log(plugin_handle, LOG_BROKEN,
+					   "Nonce pool exhausted at node %zu",
+					   ni);
+				break;
+			}
+
+			/* Track pool index → node mapping */
+			fi->secnonce_pool_idx[fi->n_secnonces] = pool_entry;
+			fi->secnonce_node_idx[fi->n_secnonces] = ni;
+			fi->n_secnonces++;
+			pool_entry++;
+
+			/* Set on the factory session */
+			factory_session_set_nonce(factory, ni,
+						  (size_t)slot,
+						  &pubnonce);
+
+			/* Serialize for sending */
+			musig_pubnonce_serialize(secp_ctx,
+				nb->entries[nb->n_entries].pubnonce,
+				&pubnonce);
+			nb->entries[nb->n_entries].node_idx = ni;
+			nb->entries[nb->n_entries].signer_slot = slot;
+			nb->n_entries++;
+		}
+
+		/* Cache LSP's nonce entries for ALL_NONCES round. */
+		if (fi->cached_nonces) free(fi->cached_nonces);
+		fi->cached_nonces_cap = MAX_NONCE_ENTRIES;
+		fi->cached_nonces = calloc(fi->cached_nonces_cap,
+			sizeof(nonce_entry_t));
+		fi->n_cached_nonces = 0;
+		if (fi->cached_nonces && nb->n_entries <= fi->cached_nonces_cap) {
+			memcpy(fi->cached_nonces, nb->entries,
+			       nb->n_entries * sizeof(nonce_entry_t));
+			fi->n_cached_nonces = nb->n_entries;
+		}
+
+		plugin_log(plugin_handle, LOG_INFORM,
+			   "MuSig2 nonces: %zu entries for %zu nodes",
+			   nb->n_entries,
+			   (size_t)factory->n_nodes);
+
+		/* Serialize the nonce bundle */
+		uint8_t *nbuf = calloc(1, MAX_WIRE_BUF);
+		size_t blen = nonce_bundle_serialize(nb, nbuf,
+						     MAX_WIRE_BUF);
+		free(nb);
+
+		plugin_log(plugin_handle, LOG_INFORM,
+			   "Nonce bundle serialized: %zu bytes",
+			   blen);
+
+		fi->ceremony = CEREMONY_PROPOSED;
+
+		/* Send FACTORY_PROPOSE to each client.
+		 * Payload format:
+		 *   nonce_bundle || famt(8) || pidx(4)
+		 *                [|| alloc[n_alloc](n*8) || n_alloc(1)]
+		 * The allocations suffix is optional: n_alloc==0 means
+		 * recipients fall back to even-split. */
+		uint8_t n_alloc = 0;
+		for (size_t ci = 0; ci < fi->n_clients; ci++) {
+			if (fi->clients[ci].allocation_sats > 0) {
+				n_alloc = (uint8_t)fi->n_clients;
+				break;
+			}
+		}
+		size_t alloc_bytes = (size_t)n_alloc * 8;
+		size_t extra = 1 + alloc_bytes; /* always send n_alloc byte */
+
+		for (size_t ci = 0; ci < fi->n_clients; ci++) {
+			char client_hex[67];
+			for (int h = 0; h < 33; h++)
+				sprintf(client_hex + h*2, "%02x",
+					fi->clients[ci].node_id[h]);
+
+			uint32_t pidx = (uint32_t)(ci + 1);
+			uint8_t *cbuf = calloc(1, blen + 12 + extra);
+			memcpy(cbuf, nbuf, blen);
+			uint64_t famt = fi->funding_amount_sats;
+			cbuf[blen]     = (famt >> 56) & 0xFF;
+			cbuf[blen + 1] = (famt >> 48) & 0xFF;
+			cbuf[blen + 2] = (famt >> 40) & 0xFF;
+			cbuf[blen + 3] = (famt >> 32) & 0xFF;
+			cbuf[blen + 4] = (famt >> 24) & 0xFF;
+			cbuf[blen + 5] = (famt >> 16) & 0xFF;
+			cbuf[blen + 6] = (famt >>  8) & 0xFF;
+			cbuf[blen + 7] = famt & 0xFF;
+			cbuf[blen + 8]  = (pidx >> 24) & 0xFF;
+			cbuf[blen + 9]  = (pidx >> 16) & 0xFF;
+			cbuf[blen + 10] = (pidx >> 8)  & 0xFF;
+			cbuf[blen + 11] = pidx & 0xFF;
+
+			{
+				size_t off = blen + 12;
+				for (uint8_t ai = 0; ai < n_alloc; ai++) {
+					uint64_t v = fi->clients[ai].allocation_sats;
+					cbuf[off + 0] = (v >> 56) & 0xFF;
+					cbuf[off + 1] = (v >> 48) & 0xFF;
+					cbuf[off + 2] = (v >> 40) & 0xFF;
+					cbuf[off + 3] = (v >> 32) & 0xFF;
+					cbuf[off + 4] = (v >> 24) & 0xFF;
+					cbuf[off + 5] = (v >> 16) & 0xFF;
+					cbuf[off + 6] = (v >>  8) & 0xFF;
+					cbuf[off + 7] = v & 0xFF;
+					off += 8;
+				}
+				cbuf[off] = n_alloc; /* 0 when no allocs */
+			}
+
+			send_factory_msg(cmd, client_hex,
+				SS_SUBMSG_FACTORY_PROPOSE,
+				cbuf, blen + 12 + extra);
+			free(cbuf);
+
+			plugin_log(plugin_handle, LOG_INFORM,
+				   "Sent FACTORY_PROPOSE to client %zu "
+				   "(%zu bytes, participant_idx=%u, n_alloc=%u)",
+				   ci, blen + 12 + extra, pidx, n_alloc);
+		}
+		free(nbuf);
+	}
+
+	free(pubkeys);
+}
+	return NULL;
+}
+
 static struct command_result *json_factory_create(struct command *cmd,
 						  const char *buf,
 						  const jsmntok_t *params)
@@ -10728,428 +11169,17 @@ static struct command_result *json_factory_create(struct command *cmd,
 		return command_finished(cmd, response);
 	}
 
-	/* Initialize the factory via libsuperscalar */
-	secp_ctx = global_secp_ctx;
+	/* PR 3b: set funding_amount_sats before the kickoff helper.
+	 * (Previously the kickoff block set it inline; the helper no
+	 * longer does so since the trigger path already sets it during
+	 * defer_signing.) */
+	fi->funding_amount_sats = *funding_sats;
 
-	/* Build pubkey array: [LSP, client0, client1, ...] */
+	/* PR 3b: kickoff extracted into ss_kickoff_factory_signing.
+	 * Same helper is called by json_factory_trigger_ceremony below. */
 	{
-		factory_t *factory = calloc(1, sizeof(factory_t));
-		size_t n_total = 1 + fi->n_clients;
-		secp256k1_pubkey *pubkeys = calloc(n_total,
-						   sizeof(secp256k1_pubkey));
-
-		/* Pubkeys for tree construction.
-		 * LSP (k=0): real factory key (HSM-derived or demo XOR).
-		 * Clients (k≥1): placeholder keys — used only for tree
-		 * topology, replaced by real pubkeys after NONCE_BUNDLE
-		 * collection. All nodes produce identical placeholder keys
-		 * for client slots since derive_placeholder_seckey is
-		 * deterministic (instance_id + slot only). */
-		for (size_t k = 0; k < n_total; k++) {
-			unsigned char sk[32];
-			if (k == 0)
-				derive_factory_seckey(sk, fi->instance_id, 0);
-			else
-				derive_placeholder_seckey(sk, fi->instance_id, (int)k);
-			if (!secp256k1_ec_pubkey_create(secp_ctx,
-							&pubkeys[k], sk)) {
-				return command_fail(cmd, LIGHTNINGD,
-						    "Bad derived pubkey");
-			}
-		}
-
-		/* Initialize factory with derived pubkeys */
-		factory_init_from_pubkeys(factory, secp_ctx,
-					  pubkeys, n_total,
-					  DW_STEP_BLOCKS,
-					  16); /* states_per_layer */
-
-		/* Phase 3c3: wire the fee estimator so tree TXs carry
-		 * P2A anchors (activates Phase 3c2/3c2.5 CPFP). */
-		ss_factory_wire_fee_estimator(fi, factory);
-
-		factory_set_arity(factory, ss_effective_arity(fi));
-
-		/* Set funding — use a plausible P2TR scriptpubkey.
-		 * Real funding comes from the on-chain UTXO backing
-		 * the factory. For now use synthetic data. */
-		uint8_t synth_txid[32];
-		for (int j = 0; j < 32; j++) synth_txid[j] = j + 1;
-		/* P2TR scriptpubkey: OP_1 <32-byte x-only key> */
-		uint8_t synth_spk[34];
-		synth_spk[0] = 0x51; /* OP_1 */
-		synth_spk[1] = 0x20; /* PUSH 32 */
-		/* Use the aggregate key as the taproot key */
-		memset(synth_spk + 2, 0xAA, 32);
-		factory_set_funding(factory, synth_txid, 0,
-				    *funding_sats, synth_spk, 34);
-
-		/* Set lifecycle so DW nodes get CLTV timeout script leaves.
-		 * This enables the timeout spend path (safety valve for
-		 * client unilateral exit if LSP vanishes after expiry). */
-		factory_set_lifecycle(factory,
-			ss_state.current_blockheight,
-			4320,   /* active period: ~30 days */
-			432);   /* dying period: ~3 days */
-
-		/* Derive L-stock revocation secrets BEFORE building the tree so
-		 * build_l_stock_spk() produces hashlocked P2TR outputs from
-		 * epoch 0 onward. This matters because the L-stock output keys
-		 * are committed when the tree is built; setting secrets later
-		 * would leave epoch-0 L-stock as bare-key (recoverable only by
-		 * LSP with no hashlock). Deterministic derivation from HSM
-		 * guarantees identical secrets after any restart. */
-		if (ss_state.has_master_key) {
-			static unsigned char secrets[256][32];
-			derive_l_stock_secrets(secrets, 256, fi->instance_id);
-			factory_set_flat_secrets(factory,
-				(const unsigned char (*)[32])secrets, 256);
-		}
-
-		/* Build the DW tree */
-		int rc = factory_build_tree(factory);
-		if (rc == 0) {
-			plugin_log(plugin_handle, LOG_BROKEN,
-				   "factory_build_tree failed: %d", rc);
-			free(factory);
-			free(pubkeys);
-			return command_fail(cmd, LIGHTNINGD,
-					    "Failed to build factory tree");
-		}
-
-		plugin_log(plugin_handle, LOG_INFORM,
-			   "Factory tree built: %zu participants",
-			   n_total);
-
-		/* Configure per-leaf amounts: each client gets either their
-		 * explicit allocation_sats, or an even share if 0.
-		 * L-stock (LSP liquidity) is the last output on each leaf. */
-		{
-			uint64_t total = *funding_sats;
-			uint64_t lstock_pct = 20;
-			uint64_t lstock_total = total * lstock_pct / 100;
-			uint64_t client_total = total - lstock_total;
-			uint64_t default_per_client =
-				client_total / (n_total - 1);
-
-			for (int ls = 0; ls < factory->n_leaf_nodes; ls++) {
-				size_t leaf_ni = factory->leaf_node_indices[ls];
-				factory_node_t *ln = &factory->nodes[leaf_ni];
-				size_t n_clients_on_leaf = 0;
-				for (size_t s = 0; s < ln->n_signers; s++)
-					if (ln->signer_indices[s] != 0)
-						n_clients_on_leaf++;
-
-				size_t n_outputs = n_clients_on_leaf + 1;
-				uint64_t *amts = calloc(n_outputs, sizeof(uint64_t));
-				if (amts) {
-					/* Walk signers for this leaf, map
-					 * participant_idx -> client_idx, pick
-					 * allocation_sats (or default). */
-					size_t out_idx = 0;
-					uint64_t client_sum = 0;
-					for (size_t s = 0; s < ln->n_signers; s++) {
-						int pidx = ln->signer_indices[s];
-						if (pidx == 0) continue; /* skip LSP */
-						size_t ci = (size_t)(pidx - 1);
-						uint64_t a = (ci < fi->n_clients &&
-							      fi->clients[ci].allocation_sats > 0)
-							? fi->clients[ci].allocation_sats
-							: default_per_client;
-						amts[out_idx++] = a;
-						client_sum += a;
-					}
-					/* Library requires sum(amts) == sum(current node
-					 * outputs), NOT ln->input_amount (which excludes the
-					 * tree-fee deduction the library has already applied).
-					 * Read current_total from outputs to satisfy the
-					 * conservation check in factory_set_leaf_amounts. */
-					uint64_t current_total = 0;
-					for (size_t o = 0; o < ln->n_outputs; o++)
-						current_total += ln->outputs[o].amount_sats;
-					if (client_sum + 546 > current_total) {
-						plugin_log(plugin_handle, LOG_UNUSUAL,
-							   "Leaf %d: allocations sum %"PRIu64
-							   " leaves L-stock below dust "
-							   "(current_total=%"PRIu64
-							   "); skipping rewrite",
-							   ls, client_sum, current_total);
-						free(amts);
-						continue;
-					}
-					amts[n_clients_on_leaf] = current_total - client_sum;
-
-					if (factory_set_leaf_amounts(factory, ls,
-								    amts, n_outputs))
-						plugin_log(plugin_handle, LOG_INFORM,
-							   "Leaf %d: %zu clients, "
-							   "L-stock=%"PRIu64" sats",
-							   ls, n_clients_on_leaf,
-							   amts[n_clients_on_leaf]);
-					free(amts);
-				}
-			}
-		}
-
-		/* L-stock secrets were set before build_tree when the HSM is
-		 * available (see above). Non-HSM fallback handled here —
-		 * generates random secrets that will NOT survive restart.
-		 * This path is for dev/test only. */
-		if (!ss_state.has_master_key
-		    && factory_generate_flat_secrets(factory, 256)) {
-			factory_set_l_stock_hashes(factory,
-				(const unsigned char (*)[32])factory->l_stock_hashes,
-				factory->n_l_stock_hashes);
-			plugin_log(plugin_handle, LOG_UNUSUAL,
-				   "Generated %zu L-stock hashes from urandom "
-				   "(no HSM — secrets will be lost on restart)",
-				   factory->n_l_stock_hashes);
-		} else if (factory->n_revocation_secrets > 0) {
-			plugin_log(plugin_handle, LOG_INFORM,
-				   "Using %zu HSM-derived L-stock secrets",
-				   factory->n_revocation_secrets);
-		}
-
-		/* Store factory handle + populate metadata from tree */
-		fi->lib_factory = factory;
-		fi->n_tree_nodes = (uint32_t)factory->n_nodes;
-		fi->max_epochs = factory->counter.total_states;
-		fi->funding_amount_sats = *funding_sats;
-		fi->creation_block = ss_state.current_blockheight;
-		fi->expiry_block = factory->cltv_timeout > 0
-			? factory->cltv_timeout
-			: ss_state.current_blockheight + 4320; /* ~30 days */
-
-		/* Compute HTLC safety parameter from DW tree depth.
-		 * This is the minimum time needed to force-close the
-		 * factory before an HTLC times out. */
-		fi->early_warning_time = compute_early_warning_time(
-			fi->n_clients, ss_effective_arity(fi));
-
-		/* Initialize signing sessions */
-		rc = factory_sessions_init(factory);
-		if (rc == 0) {
-			plugin_log(plugin_handle, LOG_BROKEN,
-				   "factory_sessions_init failed");
-			free(factory);
-			free(pubkeys);
-			return command_fail(cmd, LIGHTNINGD,
-					    "Failed to init signing sessions");
-		}
-
-		/* Generate nonces using nonce pool.
-		 * Need a keypair for the LSP (participant 0). */
-		{
-			unsigned char lsp_seckey[32];
-			secp256k1_keypair lsp_keypair;
-
-			/* Derive LSP seckey deterministically (participant 0) */
-			derive_factory_seckey(lsp_seckey, fi->instance_id, 0);
-			if (!secp256k1_keypair_create(secp_ctx, &lsp_keypair,
-						      lsp_seckey)) {
-				return command_fail(cmd, LIGHTNINGD,
-						    "Failed to create LSP keypair");
-			}
-
-			/* Store seckey for signing phase */
-			memcpy(fi->our_seckey, lsp_seckey, 32);
-			fi->our_participant_idx = 0;
-			fi->n_secnonces = 0;
-
-			/* Count nodes where LSP is a signer */
-			size_t lsp_node_count = factory_count_nodes_for_participant(
-				factory, 0);
-
-			/* Heap-allocate pool so secnonces survive this scope */
-			musig_nonce_pool_t *pool = calloc(1, sizeof(musig_nonce_pool_t));
-			if (!musig_nonce_pool_generate(secp_ctx, pool,
-						       lsp_node_count,
-						       lsp_seckey,
-						       &pubkeys[0],
-						       NULL)) {
-				free(pool);
-				free(pubkeys);
-				return command_fail(cmd, LIGHTNINGD,
-						    "Failed to generate nonce pool");
-			}
-			fi->nonce_pool = pool;
-
-			/* Extract nonces for each node.
-			 * Heap-allocate: with 1024 entries nonce_bundle_t is ~79KB */
-			nonce_bundle_t *nb = calloc(1, sizeof(nonce_bundle_t));
-			if (!nb) {
-				free(pool);
-				free(pubkeys);
-				return command_fail(cmd, LIGHTNINGD,
-						    "OOM allocating nonce bundle");
-			}
-			memcpy(nb->instance_id, fi->instance_id, 32);
-			nb->n_participants = n_total;
-			nb->n_nodes = factory->n_nodes;
-			nb->n_entries = 0;
-			/* Tier 2.6: propagate our arity choice so the client
-			 * builds an identical tree. 0 = auto (legacy). */
-			nb->arity_mode = fi->arity_mode;
-
-			plugin_log(plugin_handle, LOG_INFORM,
-				   "factory-create: n_nodes=%zu lsp_node_count=%zu",
-				   (size_t)factory->n_nodes, lsp_node_count);
-
-			/* Include all pubkeys so client can reconstruct */
-			for (size_t pk = 0; pk < n_total && pk < MAX_PARTICIPANTS; pk++) {
-				size_t pklen = 33;
-				secp256k1_ec_pubkey_serialize(secp_ctx,
-					nb->pubkeys[pk], &pklen,
-					&pubkeys[pk],
-					SECP256K1_EC_COMPRESSED);
-			}
-
-			size_t pool_entry = 0;
-			for (size_t ni = 0; ni < factory->n_nodes; ni++) {
-				int slot = factory_find_signer_slot(
-					factory, ni, 0);
-				if (slot < 0) continue;
-
-				if (nb->n_entries >= MAX_NONCE_ENTRIES ||
-				    fi->n_secnonces >= MAX_NONCE_ENTRIES) {
-					plugin_log(plugin_handle, LOG_BROKEN,
-						   "Nonce entries exceeded MAX_NONCE_ENTRIES"
-						   " (%d) at node %zu — increase limit",
-						   MAX_NONCE_ENTRIES, ni);
-					break;
-				}
-
-				secp256k1_musig_secnonce *secnonce;
-				secp256k1_musig_pubnonce pubnonce;
-
-				if (!musig_nonce_pool_next(pool,
-							   &secnonce,
-							   &pubnonce)) {
-					plugin_log(plugin_handle, LOG_BROKEN,
-						   "Nonce pool exhausted at node %zu",
-						   ni);
-					break;
-				}
-
-				/* Track pool index → node mapping */
-				fi->secnonce_pool_idx[fi->n_secnonces] = pool_entry;
-				fi->secnonce_node_idx[fi->n_secnonces] = ni;
-				fi->n_secnonces++;
-				pool_entry++;
-
-				/* Set on the factory session */
-				factory_session_set_nonce(factory, ni,
-							  (size_t)slot,
-							  &pubnonce);
-
-				/* Serialize for sending */
-				musig_pubnonce_serialize(secp_ctx,
-					nb->entries[nb->n_entries].pubnonce,
-					&pubnonce);
-				nb->entries[nb->n_entries].node_idx = ni;
-				nb->entries[nb->n_entries].signer_slot = slot;
-				nb->n_entries++;
-			}
-
-			/* Cache LSP's nonce entries for ALL_NONCES round. */
-			if (fi->cached_nonces) free(fi->cached_nonces);
-			fi->cached_nonces_cap = MAX_NONCE_ENTRIES;
-			fi->cached_nonces = calloc(fi->cached_nonces_cap,
-				sizeof(nonce_entry_t));
-			fi->n_cached_nonces = 0;
-			if (fi->cached_nonces && nb->n_entries <= fi->cached_nonces_cap) {
-				memcpy(fi->cached_nonces, nb->entries,
-				       nb->n_entries * sizeof(nonce_entry_t));
-				fi->n_cached_nonces = nb->n_entries;
-			}
-
-			plugin_log(plugin_handle, LOG_INFORM,
-				   "MuSig2 nonces: %zu entries for %zu nodes",
-				   nb->n_entries,
-				   (size_t)factory->n_nodes);
-
-			/* Serialize the nonce bundle */
-			uint8_t *nbuf = calloc(1, MAX_WIRE_BUF);
-			size_t blen = nonce_bundle_serialize(nb, nbuf,
-							     MAX_WIRE_BUF);
-			free(nb);
-
-			plugin_log(plugin_handle, LOG_INFORM,
-				   "Nonce bundle serialized: %zu bytes",
-				   blen);
-
-			fi->ceremony = CEREMONY_PROPOSED;
-
-			/* Send FACTORY_PROPOSE to each client.
-			 * Payload format:
-			 *   nonce_bundle || famt(8) || pidx(4)
-			 *                [|| alloc[n_alloc](n*8) || n_alloc(1)]
-			 * The allocations suffix is optional: n_alloc==0 means
-			 * recipients fall back to even-split. */
-			uint8_t n_alloc = 0;
-			for (size_t ci = 0; ci < fi->n_clients; ci++) {
-				if (fi->clients[ci].allocation_sats > 0) {
-					n_alloc = (uint8_t)fi->n_clients;
-					break;
-				}
-			}
-			size_t alloc_bytes = (size_t)n_alloc * 8;
-			size_t extra = 1 + alloc_bytes; /* always send n_alloc byte */
-
-			for (size_t ci = 0; ci < fi->n_clients; ci++) {
-				char client_hex[67];
-				for (int h = 0; h < 33; h++)
-					sprintf(client_hex + h*2, "%02x",
-						fi->clients[ci].node_id[h]);
-
-				uint32_t pidx = (uint32_t)(ci + 1);
-				uint8_t *cbuf = calloc(1, blen + 12 + extra);
-				memcpy(cbuf, nbuf, blen);
-				uint64_t famt = fi->funding_amount_sats;
-				cbuf[blen]     = (famt >> 56) & 0xFF;
-				cbuf[blen + 1] = (famt >> 48) & 0xFF;
-				cbuf[blen + 2] = (famt >> 40) & 0xFF;
-				cbuf[blen + 3] = (famt >> 32) & 0xFF;
-				cbuf[blen + 4] = (famt >> 24) & 0xFF;
-				cbuf[blen + 5] = (famt >> 16) & 0xFF;
-				cbuf[blen + 6] = (famt >>  8) & 0xFF;
-				cbuf[blen + 7] = famt & 0xFF;
-				cbuf[blen + 8]  = (pidx >> 24) & 0xFF;
-				cbuf[blen + 9]  = (pidx >> 16) & 0xFF;
-				cbuf[blen + 10] = (pidx >> 8)  & 0xFF;
-				cbuf[blen + 11] = pidx & 0xFF;
-
-				{
-					size_t off = blen + 12;
-					for (uint8_t ai = 0; ai < n_alloc; ai++) {
-						uint64_t v = fi->clients[ai].allocation_sats;
-						cbuf[off + 0] = (v >> 56) & 0xFF;
-						cbuf[off + 1] = (v >> 48) & 0xFF;
-						cbuf[off + 2] = (v >> 40) & 0xFF;
-						cbuf[off + 3] = (v >> 32) & 0xFF;
-						cbuf[off + 4] = (v >> 24) & 0xFF;
-						cbuf[off + 5] = (v >> 16) & 0xFF;
-						cbuf[off + 6] = (v >>  8) & 0xFF;
-						cbuf[off + 7] = v & 0xFF;
-						off += 8;
-					}
-					cbuf[off] = n_alloc; /* 0 when no allocs */
-				}
-
-				send_factory_msg(cmd, client_hex,
-					SS_SUBMSG_FACTORY_PROPOSE,
-					cbuf, blen + 12 + extra);
-				free(cbuf);
-
-				plugin_log(plugin_handle, LOG_INFORM,
-					   "Sent FACTORY_PROPOSE to client %zu "
-					   "(%zu bytes, participant_idx=%u, n_alloc=%u)",
-					   ci, blen + 12 + extra, pidx, n_alloc);
-			}
-			free(nbuf);
-		}
-
-		free(pubkeys);
+		struct command_result *kres = ss_kickoff_factory_signing(cmd, fi);
+		if (kres) return kres;
 	}
 
 	{
@@ -11303,6 +11333,21 @@ static struct command_result *json_factory_trigger_ceremony(
 
 	/* Transition state. */
 	fi->lifecycle = FACTORY_LIFECYCLE_CEREMONY_RUNNING;
+
+	/* PR 3b: kick off MuSig2 by calling the shared helper. This builds
+	 * the tree, generates LSP nonces, and broadcasts FACTORY_PROPOSE
+	 * (0x0100) to each client. The existing wire protocol drives the
+	 * rest of the dance (NONCE_BUNDLE -> ALL_NONCES -> PSIG_BUNDLE ->
+	 * FACTORY_READY). CEREMONY_START sent above serves as a heads-up
+	 * notification; participants will receive FACTORY_PROPOSE next. */
+	{
+		struct command_result *kres = ss_kickoff_factory_signing(cmd, fi);
+		if (kres) {
+			/* Revert lifecycle on failure so re-trigger is possible. */
+			fi->lifecycle = FACTORY_LIFECYCLE_AWAITING_JOINS;
+			return kres;
+		}
+	}
 	/* Stash ceremony_id in unused field for now (a typed lib SQLite
 	 * row will replace this in a follow-up). We persist via ss_save_factory
 	 * which currently serializes the whole struct; ceremony_id will land
@@ -11335,9 +11380,9 @@ static struct command_result *json_factory_trigger_ceremony(
 	json_add_u32(response, "deadline_block", deadline_block);
 	json_add_string(response, "lifecycle", "ceremony_running");
 	json_add_string(response, "next_step",
-			"PR 3 foundation: CEREMONY_START sent. MuSig2 "
-			"kickoff via existing NONCE_BUNDLE flow is "
-			"follow-up scope (PR 3b).");
+			"CEREMONY_START sent + FACTORY_PROPOSE broadcast. "
+			"MuSig2 dance now in progress; watch for FACTORY_READY "
+			"on each participant.");
 	return command_finished(cmd, response);
 }
 
