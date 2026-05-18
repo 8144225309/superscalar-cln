@@ -2893,6 +2893,27 @@ static void ss_save_factory(struct command *cmd, factory_instance_t *fi)
 	if (len > 0 && buf) {
 		jsonrpc_set_datastore_binary(cmd, key, buf, len,
 			"create-or-replace", rpc_done, rpc_err, fi);
+		/* Task #72: dual-write meta blob to soupwallet plugin. */
+		{
+			char wiid[65];
+			for (int j = 0; j < 32; j++)
+				sprintf(wiid + j*2, "%02x", fi->instance_id[j]);
+			wiid[64] = 0;
+			char wkey[160];
+			snprintf(wkey, sizeof wkey, "factory_blob:%s:meta", wiid);
+			char *blob_hex = malloc(len * 2 + 1);
+			if (blob_hex) {
+				for (size_t bi = 0; bi < len; bi++)
+					sprintf(blob_hex + bi*2, "%02x", buf[bi]);
+				blob_hex[len * 2] = 0;
+				struct out_req *wreq = jsonrpc_request_start(cmd,
+					"wallet-set-setting", rpc_done, rpc_err, NULL);
+				json_add_string(wreq->js, "setting_key", wkey);
+				json_add_string(wreq->js, "setting_value", blob_hex);
+				send_outreq(wreq);
+				free(blob_hex);
+			}
+		}
 		free(buf);
 	}
 
@@ -2903,6 +2924,27 @@ static void ss_save_factory(struct command *cmd, factory_instance_t *fi)
 		if (len > 0 && buf) {
 			jsonrpc_set_datastore_binary(cmd, key, buf, len,
 				"create-or-replace", rpc_done, rpc_err, fi);
+		/* Task #72: dual-write channels blob to soupwallet plugin. */
+		{
+			char wiid[65];
+			for (int j = 0; j < 32; j++)
+				sprintf(wiid + j*2, "%02x", fi->instance_id[j]);
+			wiid[64] = 0;
+			char wkey[160];
+			snprintf(wkey, sizeof wkey, "factory_blob:%s:channels", wiid);
+			char *blob_hex = malloc(len * 2 + 1);
+			if (blob_hex) {
+				for (size_t bi = 0; bi < len; bi++)
+					sprintf(blob_hex + bi*2, "%02x", buf[bi]);
+				blob_hex[len * 2] = 0;
+				struct out_req *wreq = jsonrpc_request_start(cmd,
+					"wallet-set-setting", rpc_done, rpc_err, NULL);
+				json_add_string(wreq->js, "setting_key", wkey);
+				json_add_string(wreq->js, "setting_value", blob_hex);
+				send_outreq(wreq);
+				free(blob_hex);
+			}
+		}
 			free(buf);
 		}
 	}
@@ -2915,6 +2957,28 @@ static void ss_save_factory(struct command *cmd, factory_instance_t *fi)
 		if (len > 0 && buf) {
 			jsonrpc_set_datastore_binary(cmd, key, buf, len,
 				"create-or-replace", rpc_done, rpc_err, fi);
+			/* Task #72: dual-write breach blob to wallet plugin. */
+			{
+				char wiid[65];
+				for (int j = 0; j < 32; j++)
+					sprintf(wiid + j*2, "%02x", fi->instance_id[j]);
+				wiid[64] = 0;
+				char wkey[160];
+				snprintf(wkey, sizeof wkey, "factory_blob:%s:breach:%u",
+					 wiid, fi->breach_data[i].epoch);
+				char *blob_hex = malloc(len * 2 + 1);
+				if (blob_hex) {
+					for (size_t bi = 0; bi < len; bi++)
+						sprintf(blob_hex + bi*2, "%02x", buf[bi]);
+					blob_hex[len * 2] = 0;
+					struct out_req *wreq = jsonrpc_request_start(cmd,
+						"wallet-set-setting", rpc_done, rpc_err, NULL);
+					json_add_string(wreq->js, "setting_key", wkey);
+					json_add_string(wreq->js, "setting_value", blob_hex);
+					send_outreq(wreq);
+					free(blob_hex);
+				}
+			}
 			free(buf);
 		}
 	}
@@ -2937,6 +3001,28 @@ static void ss_save_factory(struct command *cmd, factory_instance_t *fi)
 			ss_persist_key_breach_index(fi, key, sizeof(key));
 			jsonrpc_set_datastore_binary(cmd, key, bi_buf, bi_len,
 				"create-or-replace", rpc_done, rpc_err, fi);
+			/* Task #72: dual-write breach-index blob to wallet plugin. */
+			{
+				char wiid[65];
+				for (int j = 0; j < 32; j++)
+					sprintf(wiid + j*2, "%02x", fi->instance_id[j]);
+				wiid[64] = 0;
+				char wkey[160];
+				snprintf(wkey, sizeof wkey,
+					 "factory_blob:%s:breach-index", wiid);
+				char *blob_hex = malloc(bi_len * 2 + 1);
+				if (blob_hex) {
+					for (size_t bi = 0; bi < bi_len; bi++)
+						sprintf(blob_hex + bi*2, "%02x", bi_buf[bi]);
+					blob_hex[bi_len * 2] = 0;
+					struct out_req *wreq = jsonrpc_request_start(cmd,
+						"wallet-set-setting", rpc_done, rpc_err, NULL);
+					json_add_string(wreq->js, "setting_key", wkey);
+					json_add_string(wreq->js, "setting_value", blob_hex);
+					send_outreq(wreq);
+					free(blob_hex);
+				}
+			}
 			free(bi_buf);
 		}
 	}
@@ -2985,6 +3071,27 @@ static void ss_save_factory(struct command *cmd, factory_instance_t *fi)
 		if (len > 0 && buf) {
 			jsonrpc_set_datastore_binary(cmd, key, buf, len,
 				"create-or-replace", rpc_done, rpc_err, fi);
+		/* Task #72: dual-write signed-txs blob to soupwallet plugin. */
+		{
+			char wiid[65];
+			for (int j = 0; j < 32; j++)
+				sprintf(wiid + j*2, "%02x", fi->instance_id[j]);
+			wiid[64] = 0;
+			char wkey[160];
+			snprintf(wkey, sizeof wkey, "factory_blob:%s:signed-txs", wiid);
+			char *blob_hex = malloc(len * 2 + 1);
+			if (blob_hex) {
+				for (size_t bi = 0; bi < len; bi++)
+					sprintf(blob_hex + bi*2, "%02x", buf[bi]);
+				blob_hex[len * 2] = 0;
+				struct out_req *wreq = jsonrpc_request_start(cmd,
+					"wallet-set-setting", rpc_done, rpc_err, NULL);
+				json_add_string(wreq->js, "setting_key", wkey);
+				json_add_string(wreq->js, "setting_value", blob_hex);
+				send_outreq(wreq);
+				free(blob_hex);
+			}
+		}
 			free(buf);
 		}
 	}
@@ -2997,6 +3104,27 @@ static void ss_save_factory(struct command *cmd, factory_instance_t *fi)
 		if (len > 0 && buf) {
 			jsonrpc_set_datastore_binary(cmd, key, buf, len,
 				"create-or-replace", rpc_done, rpc_err, fi);
+		/* Task #72: dual-write dist-tx blob to soupwallet plugin. */
+		{
+			char wiid[65];
+			for (int j = 0; j < 32; j++)
+				sprintf(wiid + j*2, "%02x", fi->instance_id[j]);
+			wiid[64] = 0;
+			char wkey[160];
+			snprintf(wkey, sizeof wkey, "factory_blob:%s:dist-tx", wiid);
+			char *blob_hex = malloc(len * 2 + 1);
+			if (blob_hex) {
+				for (size_t bi = 0; bi < len; bi++)
+					sprintf(blob_hex + bi*2, "%02x", buf[bi]);
+				blob_hex[len * 2] = 0;
+				struct out_req *wreq = jsonrpc_request_start(cmd,
+					"wallet-set-setting", rpc_done, rpc_err, NULL);
+				json_add_string(wreq->js, "setting_key", wkey);
+				json_add_string(wreq->js, "setting_value", blob_hex);
+				send_outreq(wreq);
+				free(blob_hex);
+			}
+		}
 			free(buf);
 		}
 	}
