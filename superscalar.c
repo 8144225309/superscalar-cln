@@ -23,6 +23,7 @@
 #include <secp256k1_extrakeys.h>
 
 #include "ceremony.h"
+#include "ceremony_wire.h"
 #include "factory_state.h"
 #include "nonce_exchange.h"
 #include "persist.h"
@@ -4127,7 +4128,18 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 	    && submsg_id != SS_SUBMSG_FACTORY_INFO_RESPONSE
 	    && submsg_id != SS_SUBMSG_JOIN_REQUEST
 	    && submsg_id != SS_SUBMSG_JOIN_RESPONSE
-	    && submsg_id != SS_SUBMSG_JOIN_CANCEL) {
+	    && submsg_id != SS_SUBMSG_JOIN_CANCEL
+	    /* PR 3 ceremony submsgs (0x0145-0x014C) start with an 8-byte
+	     * ceremony_id, not the 32-byte factory_instance_id. They do
+	     * their own factory lookup inside the case. */
+	    && submsg_id != SS_SUBMSG_CEREMONY_START
+	    && submsg_id != SS_SUBMSG_CEREMONY_NONCE_REPLY
+	    && submsg_id != SS_SUBMSG_CEREMONY_PARTIAL_SIG_REQ
+	    && submsg_id != SS_SUBMSG_CEREMONY_PARTIAL_SIG
+	    && submsg_id != SS_SUBMSG_CEREMONY_RESULT
+	    && submsg_id != SS_SUBMSG_CEREMONY_ABORT
+	    && submsg_id != SS_SUBMSG_CEREMONY_STATUS_QUERY
+	    && submsg_id != SS_SUBMSG_CEREMONY_STATUS_REPLY) {
 		fi = ss_factory_find(&ss_state, data);
 		if (!fi) {
 			plugin_log(plugin_handle, LOG_UNUSUAL,
@@ -9428,6 +9440,111 @@ realloc_all_nonces_done:
 		break;
 	}
 
+	/* PR 3: CEREMONY_START — client-side receipt of "LSP wants to
+	 * sign". Decodes the ceremony_id and factory_instance_id, looks
+	 * up the local factory_instance_t, transitions to CEREMONY_RUNNING,
+	 * and caches the ceremony_id so subsequent MuSig2 messages can
+	 * be matched.
+	 *
+	 * PR 3 foundation note: the lsp_nonce field is zeroed in this PR
+	 * (the existing FACTORY_PROPOSE 0x0100 flow still carries the
+	 * real MuSig2 nonces). When PR 3b retires FACTORY_PROPOSE in
+	 * favor of CEREMONY_START as the MuSig2 round-1 carrier, the
+	 * client-side handler here will read lsp_nonce and start its own
+	 * nonce generation. */
+	case SS_SUBMSG_CEREMONY_START: {
+		struct ss_ceremony_start_msg start_msg;
+		if (!ss_decode_ceremony_start(data, len, &start_msg)) {
+			plugin_log(plugin_handle, LOG_UNUSUAL,
+				   "CEREMONY_START from %s: malformed payload "
+				   "(len=%zu)",
+				   peer_id, len);
+			break;
+		}
+
+		/* Look up factory by instance_id */
+		factory_instance_t *target_fi =
+			ss_factory_find(&ss_state, start_msg.factory_instance_id);
+		if (!target_fi) {
+			plugin_log(plugin_handle, LOG_UNUSUAL,
+				   "CEREMONY_START from %s: unknown factory_instance_id "
+				   "%02x%02x%02x%02x... (ceremony will be ignored; "
+				   "consider sending REFUSE_UNKNOWN_FACTORY when "
+				   "NONCE_REPLY response path is wired)",
+				   peer_id,
+				   start_msg.factory_instance_id[0],
+				   start_msg.factory_instance_id[1],
+				   start_msg.factory_instance_id[2],
+				   start_msg.factory_instance_id[3]);
+			break;
+		}
+
+		/* Sanity: type byte should be INITIAL for v1 INITIAL ceremonies.
+		 * Other types (ROTATE/FORCE_OUT/ABORT) are deferred. */
+		if (start_msg.type != SS_CEREMONY_TYPE_INITIAL) {
+			plugin_log(plugin_handle, LOG_UNUSUAL,
+				   "CEREMONY_START from %s: type=0x%02x not yet "
+				   "supported (v1 supports INITIAL=0x01 only)",
+				   peer_id, start_msg.type);
+			break;
+		}
+
+		char cid_hex[17];
+		for (int i = 0; i < 8; i++)
+			sprintf(cid_hex + i*2, "%02x", start_msg.ceremony_id[i]);
+		cid_hex[16] = 0;
+
+		ss_audit_log(LOG_INFORM, "ceremony_start_received",
+			     "\"peer\":\"%.16s\","
+			     "\"iid_prefix\":\"%02x%02x%02x%02x\","
+			     "\"ceremony_id_hex\":\"%s\","
+			     "\"type\":\"INITIAL\","
+			     "\"deadline_block\":%u",
+			     peer_id,
+			     target_fi->instance_id[0],
+			     target_fi->instance_id[1],
+			     target_fi->instance_id[2],
+			     target_fi->instance_id[3],
+			     cid_hex,
+			     start_msg.deadline_block);
+
+		/* Transition client-side lifecycle. If we were AWAITING_JOINS
+		 * (deferred client) move to CEREMONY_RUNNING. If we were INIT
+		 * (legacy flow already started) leave it alone — the existing
+		 * FACTORY_PROPOSE will drive the rest. */
+		if (factory_is_awaiting_signing(target_fi->lifecycle))
+			target_fi->lifecycle = FACTORY_LIFECYCLE_CEREMONY_RUNNING;
+
+		/* Cache ceremony_id on the factory so subsequent ceremony
+		 * submsgs (NONCE_REPLY, PARTIAL_SIG, etc.) can match this
+		 * ceremony. Stored in factory_instance_t.active_ceremony_id;
+		 * see factory_state.h. PR 3 foundation: field added below. */
+		memcpy(target_fi->active_ceremony_id, start_msg.ceremony_id, 8);
+		target_fi->active_ceremony_deadline_block = start_msg.deadline_block;
+
+		ss_save_factory(cmd, target_fi);
+		break;
+	}
+
+	/* PR 3: remaining ceremony submsgs (NONCE_REPLY, PARTIAL_SIG_REQ,
+	 * PARTIAL_SIG, RESULT, ABORT, STATUS_QUERY, STATUS_REPLY) are
+	 * decoded-and-logged only in this PR. Full handlers land in PR 3b
+	 * when the MuSig2 round-1/round-2 plumbing is wired to the new
+	 * wire and the lib SQLite persist_t is open. */
+	case SS_SUBMSG_CEREMONY_NONCE_REPLY:
+	case SS_SUBMSG_CEREMONY_PARTIAL_SIG_REQ:
+	case SS_SUBMSG_CEREMONY_PARTIAL_SIG:
+	case SS_SUBMSG_CEREMONY_RESULT:
+	case SS_SUBMSG_CEREMONY_ABORT:
+	case SS_SUBMSG_CEREMONY_STATUS_QUERY:
+	case SS_SUBMSG_CEREMONY_STATUS_REPLY:
+		plugin_log(plugin_handle, LOG_DBG,
+			   "Ceremony submsg 0x%04x from %s (len=%zu) — "
+			   "handler is PR 3b scope; received but not yet "
+			   "processed",
+			   submsg_id, peer_id, len);
+		break;
+
 	default:
 		plugin_log(plugin_handle, LOG_DBG,
 			   "Unknown submsg 0x%04x from %s (len=%zu)",
@@ -10414,14 +10531,22 @@ static struct command_result *json_factory_create(struct command *cmd,
 	const jsmntok_t *allocations_tok = NULL;
 	const char *arity_mode_str = NULL;
 	u32 *feerate_perkw_opt = NULL;
+	/* PR 3: defer_signing=true creates the factory in AWAITING_JOINS state
+	 * without running MuSig2. Operator then accumulates joiners via the
+	 * factory-join-request flow and fires factory-trigger-ceremony when
+	 * ready. Default false preserves the legacy synchronous behavior. */
+	bool *defer_signing_opt = NULL;
 	if (!param(cmd, buf, params,
 		   p_req("funding_sats", param_u64, &funding_sats),
 		   p_req("clients", param_array, &clients_tok),
 		   p_opt("allocations", param_array, &allocations_tok),
 		   p_opt("arity_mode", param_string, &arity_mode_str),
 		   p_opt("feerate_perkw", param_u32, &feerate_perkw_opt),
+		   p_opt("defer_signing", param_bool, &defer_signing_opt),
 		   NULL))
 		return command_param_failed();
+
+	bool defer_signing = defer_signing_opt && *defer_signing_opt;
 
 	/* Tier 2.6: optional arity selection. Default "auto" preserves
 	 * legacy ss_choose_arity behavior. "arity_ps" selects pseudo-Spilman
@@ -10563,6 +10688,45 @@ static struct command_result *json_factory_create(struct command *cmd,
 	plugin_log(plugin_handle, LOG_INFORM,
 		   "factory-create: %zu clients, %"PRIu64" sats",
 		   fi->n_clients, *funding_sats);
+
+	/* PR 3: defer_signing branch. Stash the funding amount on the
+	 * factory_instance_t (we keep it in a field that gets persisted
+	 * via ss_save_factory so factory-trigger-ceremony can pick it up
+	 * later), transition lifecycle to AWAITING_JOINS, persist, and
+	 * return — skip the MuSig2 setup entirely. The trigger RPC will
+	 * resume the MuSig2 dance from this point. */
+	if (defer_signing) {
+		fi->funding_amount_sats = *funding_sats;
+		fi->lifecycle = FACTORY_LIFECYCLE_AWAITING_JOINS;
+
+		ss_audit_log(LOG_INFORM, "factory_create_deferred",
+			     "\"iid_prefix\":\"%02x%02x%02x%02x\","
+			     "\"funding_sats\":%"PRIu64","
+			     "\"n_clients\":%zu,"
+			     "\"arity_mode\":%u,"
+			     "\"feerate_perkw\":%u",
+			     fi->instance_id[0], fi->instance_id[1],
+			     fi->instance_id[2], fi->instance_id[3],
+			     *funding_sats, fi->n_clients,
+			     parsed_arity_mode,
+			     fi->requested_feerate_perkw);
+
+		ss_save_factory(cmd, fi);
+
+		struct json_stream *response = jsonrpc_stream_success(cmd);
+		char iid_hex[65];
+		for (int i = 0; i < 32; i++)
+			sprintf(iid_hex + i*2, "%02x", fi->instance_id[i]);
+		iid_hex[64] = 0;
+		json_add_string(response, "factory_instance_id_hex", iid_hex);
+		json_add_string(response, "lifecycle", "awaiting_joins");
+		json_add_u64(response, "funding_sats", *funding_sats);
+		json_add_u64(response, "n_clients", fi->n_clients);
+		json_add_string(response, "next_step",
+				"call factory-trigger-ceremony with this "
+				"factory_instance_id_hex when ready to sign");
+		return command_finished(cmd, response);
+	}
 
 	/* Initialize the factory via libsuperscalar */
 	secp_ctx = global_secp_ctx;
@@ -10999,6 +11163,182 @@ static struct command_result *json_factory_create(struct command *cmd,
 		json_add_string(js, "ceremony", "init");
 		return command_finished(cmd, js);
 	}
+}
+
+/* PR 3: factory-trigger-ceremony RPC.
+ *
+ * Operates on a factory created with defer_signing=true (lifecycle=
+ * AWAITING_JOINS or READY_TO_TRIGGER). Generates a fresh ceremony_id,
+ * sends CEREMONY_START (0x0145) to each participant, transitions
+ * lifecycle to CEREMONY_RUNNING, persists.
+ *
+ * After this RPC returns, the LSP operator (or a follow-up RPC) is
+ * expected to kick off the MuSig2 setup using the existing factory-
+ * create code path's NONCE_BUNDLE flow. That kickoff is the scope of
+ * PR 3b; for now this RPC fires CEREMONY_START as a heads-up and
+ * transitions state. The participants treat CEREMONY_START as a "wake
+ * up, you're about to be asked to sign" notification — they cache the
+ * ceremony_id and prepare to receive the MuSig2 messages.
+ *
+ * Params:
+ *   factory_instance_id_hex (required) — 64-char hex of the deferred factory
+ *   force (optional bool, default false) — skip min-clients-to-start check
+ *   deadline_block (optional u32) — defaults to current_blockheight + 144 (~24h)
+ *
+ * Returns:
+ *   ceremony_id_hex — 16-char hex of the generated ceremony_id
+ *   n_participants — count of CEREMONY_START messages sent
+ *   lifecycle — "ceremony_running"
+ */
+static struct command_result *json_factory_trigger_ceremony(
+	struct command *cmd, const char *buf, const jsmntok_t *params)
+{
+	const char *iid_hex_param;
+	bool *force_opt = NULL;
+	u32 *deadline_block_opt = NULL;
+
+	if (!param(cmd, buf, params,
+		   p_req("factory_instance_id_hex", param_string, &iid_hex_param),
+		   p_opt("force", param_bool, &force_opt),
+		   p_opt("deadline_block", param_u32, &deadline_block_opt),
+		   NULL))
+		return command_param_failed();
+
+	if (strlen(iid_hex_param) != 64)
+		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+				    "factory_instance_id_hex must be 64 hex chars (got %zu)",
+				    strlen(iid_hex_param));
+
+	uint8_t target_iid[32];
+	for (int i = 0; i < 32; i++) {
+		unsigned int byte;
+		if (sscanf(iid_hex_param + i*2, "%02x", &byte) != 1)
+			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+					    "factory_instance_id_hex invalid hex at offset %d", i*2);
+		target_iid[i] = (uint8_t)byte;
+	}
+
+	/* Look up the factory */
+	factory_instance_t *fi = NULL;
+	for (size_t i = 0; i < ss_state.n_factories; i++) {
+		if (memcmp(ss_state.factories[i]->instance_id, target_iid, 32) == 0) {
+			fi = ss_state.factories[i];
+			break;
+		}
+	}
+	if (!fi)
+		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+				    "factory %s not found", iid_hex_param);
+
+	if (!fi->is_lsp)
+		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+				    "factory-trigger-ceremony: only LSPs can trigger "
+				    "ceremonies (this factory is is_lsp=false)");
+
+	if (!factory_is_awaiting_signing(fi->lifecycle))
+		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+				    "factory lifecycle is %d, expected "
+				    "AWAITING_JOINS(9) or READY_TO_TRIGGER(10); "
+				    "factory-trigger-ceremony only valid on "
+				    "deferred-signing factories",
+				    (int)fi->lifecycle);
+
+	bool force = force_opt && *force_opt;
+	if (!force && fi->n_clients < 2)
+		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+				    "factory has %zu clients; need at least 2 "
+				    "to start a ceremony (or pass force=true to "
+				    "override)",
+				    fi->n_clients);
+
+	/* Generate ceremony_id (8 random bytes for v1 — future PRs derive
+	 * deterministically from instance_id+counter once we open the lib
+	 * SQLite handle and can read ceremonies.ceremony_counter). */
+	uint8_t ceremony_id[8];
+	for (int i = 0; i < 8; i++)
+		ceremony_id[i] = (uint8_t)(random() & 0xFF);
+
+	uint32_t deadline_block = deadline_block_opt
+		? *deadline_block_opt
+		: ss_state.current_blockheight + 144;
+
+	/* Build the CEREMONY_START payload using ceremony_wire codec.
+	 * lsp_nonce is zeroed for PR 3 foundation — the real LSP pubnonce
+	 * is generated during MuSig2 setup (existing FACTORY_PROPOSE flow).
+	 * Participants treat zero lsp_nonce as "MuSig2 nonces will arrive
+	 * via the existing NONCE_BUNDLE submsg (0x0101)". PR 3b switches
+	 * the wire over so lsp_nonce here carries the real LSP pubnonce
+	 * and FACTORY_PROPOSE retires. */
+	struct ss_ceremony_start_msg start_msg = {0};
+	memcpy(start_msg.ceremony_id, ceremony_id, 8);
+	start_msg.type = SS_CEREMONY_TYPE_INITIAL;
+	memcpy(start_msg.factory_instance_id, fi->instance_id, 32);
+	memset(start_msg.parent_ceremony_id, 0, 8); /* INITIAL has no parent */
+	start_msg.deadline_block = deadline_block;
+	start_msg.deadline_epoch_secs = (uint64_t)time(NULL) + (deadline_block - ss_state.current_blockheight) * 600;
+	/* lsp_nonce stays zero — see comment above */
+	start_msg.tx_templates = NULL;
+	start_msg.tx_templates_len = 0;
+
+	uint8_t start_buf[SS_CEREMONY_START_FIXED_LEN];
+	size_t start_len = ss_encode_ceremony_start(start_buf,
+						    sizeof(start_buf),
+						    &start_msg);
+	if (start_len == 0)
+		return command_fail(cmd, LIGHTNINGD,
+				    "ss_encode_ceremony_start failed (internal)");
+
+	/* Send CEREMONY_START to each client. fire-and-forget. */
+	size_t sent = 0;
+	for (size_t i = 0; i < fi->n_clients; i++) {
+		char peer_hex[67];
+		for (int j = 0; j < 33; j++)
+			sprintf(peer_hex + j*2, "%02x", fi->clients[i].node_id[j]);
+		peer_hex[66] = 0;
+		send_factory_msg(cmd, peer_hex,
+				 SS_SUBMSG_CEREMONY_START,
+				 start_buf, start_len);
+		sent++;
+	}
+
+	/* Transition state. */
+	fi->lifecycle = FACTORY_LIFECYCLE_CEREMONY_RUNNING;
+	/* Stash ceremony_id in unused field for now (a typed lib SQLite
+	 * row will replace this in a follow-up). We persist via ss_save_factory
+	 * which currently serializes the whole struct; ceremony_id will land
+	 * via that path if we add the field, or we punt persistence to PR 3b
+	 * once persist_t is open. */
+	ss_save_factory(cmd, fi);
+
+	char cid_hex[17];
+	for (int i = 0; i < 8; i++)
+		sprintf(cid_hex + i*2, "%02x", ceremony_id[i]);
+	cid_hex[16] = 0;
+
+	ss_audit_log(LOG_INFORM, "ceremony_triggered",
+		     "\"iid_prefix\":\"%02x%02x%02x%02x\","
+		     "\"ceremony_id_hex\":\"%s\","
+		     "\"type\":\"INITIAL\","
+		     "\"n_participants\":%zu,"
+		     "\"deadline_block\":%u,"
+		     "\"force\":%s",
+		     fi->instance_id[0], fi->instance_id[1],
+		     fi->instance_id[2], fi->instance_id[3],
+		     cid_hex, sent, deadline_block,
+		     force ? "true" : "false");
+
+	struct json_stream *response = jsonrpc_stream_success(cmd);
+	json_add_string(response, "factory_instance_id_hex", iid_hex_param);
+	json_add_string(response, "ceremony_id_hex", cid_hex);
+	json_add_string(response, "ceremony_type", "INITIAL");
+	json_add_u64(response, "n_participants", sent);
+	json_add_u32(response, "deadline_block", deadline_block);
+	json_add_string(response, "lifecycle", "ceremony_running");
+	json_add_string(response, "next_step",
+			"PR 3 foundation: CEREMONY_START sent. MuSig2 "
+			"kickoff via existing NONCE_BUNDLE flow is "
+			"follow-up scope (PR 3b).");
+	return command_finished(cmd, response);
 }
 
 /* factory-list RPC — show all factory instances */
@@ -20034,6 +20374,10 @@ static const struct plugin_command commands[] = {
 	{
 		"factory-create",
 		json_factory_create,
+	},
+	{
+		"factory-trigger-ceremony",
+		json_factory_trigger_ceremony,
 	},
 	{
 		"factory-list",

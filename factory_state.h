@@ -64,6 +64,29 @@ typedef enum {
 						   * recover via the existing
 						   * CLTV unilateral exit at
 						   * factory expiry. */
+
+	/* PR 3: Decoupled INITIAL ceremony states. The legacy factory-create
+	 * RPC runs MuSig2 synchronously and goes straight from INIT to ACTIVE.
+	 * The new create-then-trigger model exposes the intermediate states
+	 * so an LSP can accumulate joiners (via factory-join-request) before
+	 * an explicit factory-trigger-ceremony call kicks off signing.
+	 *
+	 * State flow (LSP side):
+	 *   INIT -> AWAITING_JOINS                  (factory-create with defer_signing=true)
+	 *   AWAITING_JOINS -> READY_TO_TRIGGER      (min_clients_to_start reached;
+	 *                                            advisory only, RPC checks pool)
+	 *   AWAITING_JOINS -> CEREMONY_RUNNING      (factory-trigger-ceremony fires,
+	 *                                            CEREMONY_START sent to participants)
+	 *   CEREMONY_RUNNING -> ACTIVE              (existing MuSig2 flow signs, tree ready)
+	 *
+	 * State flow (client side):
+	 *   INIT -> CEREMONY_RUNNING                (received CEREMONY_START from LSP)
+	 *   CEREMONY_RUNNING -> ACTIVE              (existing FACTORY_READY arrival)
+	 *
+	 * Legacy factory-create without defer_signing skips these states entirely. */
+	FACTORY_LIFECYCLE_AWAITING_JOINS = 9,
+	FACTORY_LIFECYCLE_READY_TO_TRIGGER = 10,
+	FACTORY_LIFECYCLE_CEREMONY_RUNNING = 11,
 } factory_lifecycle_t;
 
 /* Helper: a factory in any closed terminal state should not be scanned,
@@ -76,6 +99,22 @@ static inline bool factory_is_closed(factory_lifecycle_t l) {
 	    || l == FACTORY_LIFECYCLE_CLOSED_UNILATERAL
 	    || l == FACTORY_LIFECYCLE_CLOSED_BREACHED
 	    || l == FACTORY_LIFECYCLE_ABORTED;
+}
+
+/* PR 3: factory is in the deferred-signing pre-ceremony window — created
+ * but not yet signing. factory-join-request additions are allowed here;
+ * factory-trigger-ceremony is allowed here. */
+static inline bool factory_is_awaiting_signing(factory_lifecycle_t l) {
+	return l == FACTORY_LIFECYCLE_AWAITING_JOINS
+	    || l == FACTORY_LIFECYCLE_READY_TO_TRIGGER;
+}
+
+/* PR 3: factory has an active ceremony in flight (either legacy-INIT
+ * inline signing, or the new CEREMONY_RUNNING). Used to gate concurrent
+ * operations and metrics. */
+static inline bool factory_ceremony_in_flight(factory_lifecycle_t l) {
+	return l == FACTORY_LIFECYCLE_INIT
+	    || l == FACTORY_LIFECYCLE_CEREMONY_RUNNING;
 }
 
 /* Phase 2a: values for factory_instance_t.closed_by. Stored as uint8_t
@@ -771,6 +810,17 @@ typedef struct factory_instance {
 	 * what data can be hashed/dropped. */
 	factory_join_t join_queue[MAX_JOIN_QUEUE];
 	size_t         n_join_queue;
+
+	/* PR 3: active ceremony tracking for the decoupled INITIAL flow.
+	 * All zero when no ceremony is in flight. Set by factory-trigger-
+	 * ceremony (LSP) or by receipt of CEREMONY_START (client). Cleared
+	 * by CEREMONY_RESULT (success) or CEREMONY_ABORT (failure).
+	 *
+	 * v1 keeps a single active ceremony per factory; multi-ceremony
+	 * concurrency arrives in v2 alongside the lib SQLite tables for
+	 * crash recovery. */
+	uint8_t  active_ceremony_id[8];
+	uint32_t active_ceremony_deadline_block;
 
 } factory_instance_t;
 
