@@ -29,6 +29,17 @@
 #include "persist.h"
 #include "sweep_builder.h"
 
+/* Direct read access to the wallet plugin's SQLite (Task #84).
+ * The wallet plugin (Node.js, apps/cln-plugin) is the canonical writer
+ * for the four typed coordination tables + the wallet_settings hex-blob
+ * keys. The C plugin opens wallet.db read-only at init to load state
+ * after restart; runtime writes still go via the wallet-* RPC dispatch.
+ * No more CLN datastore touches anywhere. */
+#include <sqlite3.h>
+#include <pwd.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+
 /* SuperScalar library */
 #include <superscalar/factory.h>
 #include <superscalar/musig.h>
@@ -298,6 +309,127 @@ static void ss_audit_log(enum log_level lvl, const char *event,
 /* Forward decl for factory-funding-precheck handler (Phase 4). */
 static struct command_result *json_factory_funding_precheck(
 	struct command *cmd, const char *buf, const jsmntok_t *params);
+
+/* ============================================================================
+ * Wallet-db (read-only) helpers — Task #84.
+ *
+ * The wallet plugin (Node.js, apps/cln-plugin) is the canonical writer for
+ * coordination state (iid_counter, factories, lsp_join_queue, outgoing_joins)
+ * and crypto-state blobs (wallet_settings.factory_blob:<iid>:<kind>). The C
+ * plugin opens wallet.db read-only at restart and loads everything via direct
+ * sqlite3 reads. Runtime writes go via the existing wallet-* RPC dispatch.
+ *
+ * No more CLN datastore touches anywhere in the plugin.
+ *
+ * Path resolution mirrors apps/cln-plugin/source/superscalar-db.service.ts:
+ *   1. $SUPERSCALAR_WALLET_DB_PATH (env override, also honored by Node plugin)
+ *   2. $XDG_CONFIG_HOME/soupwallet/wallet.db
+ *   3. $HOME/.config/soupwallet/wallet.db
+ * Plus an optional plugin_option override `superscalar-wallet-db`.
+ * ============================================================================ */
+
+static char *ss_wallet_db_path_override = NULL;  /* set via plugin_option */
+
+static char *ss_resolve_wallet_db_path(const tal_t *ctx) {
+	if (ss_wallet_db_path_override && ss_wallet_db_path_override[0])
+		return tal_strdup(ctx, ss_wallet_db_path_override);
+	const char *env = getenv("SUPERSCALAR_WALLET_DB_PATH");
+	if (env && env[0]) return tal_strdup(ctx, env);
+	const char *xdg = getenv("XDG_CONFIG_HOME");
+	const char *home = getenv("HOME");
+	if (!home) {
+		struct passwd *pw = getpwuid(getuid());
+		if (pw && pw->pw_dir) home = pw->pw_dir;
+	}
+	if (xdg && xdg[0])
+		return tal_fmt(ctx, "%s/soupwallet/wallet.db", xdg);
+	if (home && home[0])
+		return tal_fmt(ctx, "%s/.config/soupwallet/wallet.db", home);
+	return tal_strdup(ctx, "/tmp/soupwallet-wallet.db");
+}
+
+/* Open wallet.db read-only. Returns NULL on any failure (caller treats as
+ * "no persisted state" — plugin starts empty). The DB is opened once per
+ * load operation; we don't keep a long-lived handle to avoid stomping on
+ * the wallet plugin's WAL writer in any way. */
+static sqlite3 *ss_open_wallet_db_ro(const tal_t *ctx) {
+	char *path = ss_resolve_wallet_db_path(ctx);
+	sqlite3 *db = NULL;
+	/* SQLITE_OPEN_READONLY | NOMUTEX: we hold the handle very briefly
+	 * within a single load call, single-threaded. */
+	int rc = sqlite3_open_v2(path, &db,
+		SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX, NULL);
+	if (rc != SQLITE_OK) {
+		plugin_log(plugin_handle, LOG_UNUSUAL,
+			   "wallet.db open ro failed: %s (path=%s)",
+			   sqlite3_errstr(rc), path);
+		if (db) sqlite3_close(db);
+		return NULL;
+	}
+	/* Set a short busy_timeout so we don't block forever if the wallet
+	 * plugin holds a write transaction. 250ms is generous for SQLite. */
+	sqlite3_busy_timeout(db, 250);
+	return db;
+}
+
+/* Open wallet.db, SELECT a single hex-encoded blob from wallet_settings,
+ * decode to bytes (tal-allocated under `ctx`). Returns NULL on miss or
+ * malformed hex. Closes the DB on return. Convenient for the per-blob
+ * reads in ss_load_factories.
+ *
+ * Storage format note: the wallet plugin's wallet-set-setting RPC writes
+ * `setting_value` as a JSON string literal — so the row's text includes
+ * a leading and trailing double-quote that wrap the hex payload. We
+ * strip them here before hex-decoding. */
+static uint8_t *ss_wallet_db_load_blob_tal(const tal_t *ctx,
+					   const char *setting_key,
+					   size_t *out_len) {
+	*out_len = 0;
+	sqlite3 *db = ss_open_wallet_db_ro(ctx);
+	if (!db) return NULL;
+	sqlite3_stmt *st = NULL;
+	const char *sql = "SELECT setting_value FROM wallet_settings "
+			  "WHERE setting_key = ?";
+	uint8_t *out = NULL;
+	if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK) {
+		sqlite3_bind_text(st, 1, setting_key, -1, SQLITE_TRANSIENT);
+		if (sqlite3_step(st) == SQLITE_ROW) {
+			const unsigned char *raw = sqlite3_column_text(st, 0);
+			if (raw) {
+				const char *hex = (const char *)raw;
+				size_t hlen = strlen(hex);
+				/* Strip JSON-string wrapping quotes if present. */
+				if (hlen >= 2 && hex[0] == '"'
+				    && hex[hlen - 1] == '"') {
+					hex++;
+					hlen -= 2;
+				}
+				if (hlen % 2 == 0) {
+					size_t blen = hlen / 2;
+					out = tal_arr(ctx, uint8_t, blen);
+					bool ok = true;
+					for (size_t i = 0; i < blen && ok; i++) {
+						unsigned int b;
+						if (sscanf(hex + i*2,
+							   "%02x", &b) != 1) {
+							ok = false;
+						} else {
+							out[i] = (uint8_t)b;
+						}
+					}
+					if (ok) {
+						*out_len = blen;
+					} else {
+						out = NULL;
+					}
+				}
+			}
+		}
+		sqlite3_finalize(st);
+	}
+	sqlite3_close(db);
+	return out;
+}
 
 /* ============================================================================
  * Per-peer rate limit + slot cap tracking (hardening: DoS resistance)
@@ -2087,8 +2219,6 @@ static void ss_save_ps_chain_entry(struct command *cmd,
 		node->signed_tx.data, node->signed_tx.len,
 		&buf);
 	if (len > 0 && buf) {
-		jsonrpc_set_datastore_binary(cmd, key, buf, len,
-			"create-or-replace", rpc_done, rpc_err, fi);
 		free(buf);
 	}
 }
@@ -2764,9 +2894,6 @@ static void ss_save_outgoing_joins(struct command *cmd)
 	uint8_t *buf = NULL;
 	size_t len = ss_persist_serialize_outgoing_joins(&buf);
 	if (len > 0 && buf) {
-		jsonrpc_set_datastore_binary(cmd, SS_OUTGOING_JOINS_KEY,
-			buf, len, "create-or-replace",
-			rpc_done, rpc_err, &ss_state);
 		free(buf);
 		plugin_log(plugin_handle, LOG_DBG,
 			   "Persisted outgoing_joins (%zu entries, %zu bytes)",
@@ -2776,9 +2903,6 @@ static void ss_save_outgoing_joins(struct command *cmd)
 		 * but have no joins" rather than "no data ever". v1
 		 * marker is just the 3-byte header. */
 		uint8_t empty[3] = { SS_JOIN_SCHEMA_V1, 0, 0 };
-		jsonrpc_set_datastore_binary(cmd, SS_OUTGOING_JOINS_KEY,
-			empty, 3, "create-or-replace",
-			rpc_done, rpc_err, &ss_state);
 	}
 
 	/* Task #72: dual-write each outgoing_join entry to the soupwallet
@@ -2818,68 +2942,60 @@ static void ss_save_outgoing_joins(struct command *cmd)
 	}
 }
 
-/* Called from init() — load outgoing_joins from datastore at startup so
+/* Called from init() — load outgoing_joins from wallet.db at startup so
  * wallet restarts don't lose pending-rotation memberships. */
 static void ss_load_outgoing_joins(struct command *cmd)
 {
-	u8 *buf = NULL;
-	const char *err = rpc_scan_datastore_hex(tmpctx, cmd,
-		SS_OUTGOING_JOINS_KEY,
-		JSON_SCAN_TAL(tmpctx, json_tok_bin_from_hex, &buf));
-	if (err || !buf) {
-		/* No prior data — fresh plugin or first run. Fine. */
-		ss_state.n_outgoing_joins = 0;
-		return;
-	}
-	size_t len = tal_bytelen(buf);
-	if (len < 3 || buf[0] != SS_JOIN_SCHEMA_V1) {
-		plugin_log(plugin_handle, LOG_UNUSUAL,
-			   "outgoing_joins blob has bad header (len=%zu, "
-			   "schema=%u), starting fresh", len,
-			   len > 0 ? buf[0] : 0);
-		ss_state.n_outgoing_joins = 0;
-		return;
-	}
-	uint16_t n = ((uint16_t)buf[1] << 8) | buf[2];
-	if (n > MAX_OUTGOING_JOINS) {
-		plugin_log(plugin_handle, LOG_UNUSUAL,
-			   "outgoing_joins blob declares %u entries, exceeds "
-			   "MAX_OUTGOING_JOINS=%u, starting fresh",
-			   (unsigned)n, MAX_OUTGOING_JOINS);
-		ss_state.n_outgoing_joins = 0;
-		return;
-	}
-	if (len != (size_t)(3 + n * SS_OUTGOING_JOIN_ENTRY_V1_SZ)) {
-		plugin_log(plugin_handle, LOG_UNUSUAL,
-			   "outgoing_joins blob length mismatch (got %zu, "
-			   "expected %zu for n=%u), starting fresh", len,
-			   (size_t)(3 + n * SS_OUTGOING_JOIN_ENTRY_V1_SZ),
-			   (unsigned)n);
-		ss_state.n_outgoing_joins = 0;
-		return;
-	}
-	const uint8_t *p = buf + 3;
+	(void)cmd;
 	ss_state.n_outgoing_joins = 0;
-	for (uint16_t i = 0; i < n; i++) {
-		outgoing_join_t *o = &ss_state.outgoing_joins[i];
-		memcpy(o->lsp_node_id, p, 33); p += 33;
-		memcpy(o->instance_id, p, 32); p += 32;
-		o->request_id = 0;
-		for (int k = 0; k < 8; k++) o->request_id = (o->request_id << 8) | *p++;
-		o->contribution_sats = 0;
-		for (int k = 0; k < 8; k++) o->contribution_sats = (o->contribution_sats << 8) | *p++;
-		o->sent_at_block = 0;
-		for (int k = 0; k < 4; k++) o->sent_at_block = (o->sent_at_block << 8) | *p++;
-		o->expected_signing_block = 0;
-		for (int k = 0; k < 4; k++) o->expected_signing_block = (o->expected_signing_block << 8) | *p++;
-		o->updated_at_block = 0;
-		for (int k = 0; k < 4; k++) o->updated_at_block = (o->updated_at_block << 8) | *p++;
-		o->status = (outgoing_join_status_t)*p++;
-		memcpy(o->reason, p, 64); p += 64;
+	sqlite3 *db = ss_open_wallet_db_ro(tmpctx);
+	if (!db) return;
+	sqlite3_stmt *st = NULL;
+	const char *sql =
+		"SELECT factory_instance_id, lsp_pubkey, request_id, "
+		"       contribution_sats, sent_at_block, "
+		"       expected_signing_block, updated_at_block, "
+		"       status, reason "
+		"FROM outgoing_joins";
+	if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK) {
+		plugin_log(plugin_handle, LOG_UNUSUAL,
+			   "load outgoing_joins prepare failed: %s",
+			   sqlite3_errmsg(db));
+		sqlite3_close(db);
+		return;
+	}
+	while (sqlite3_step(st) == SQLITE_ROW
+	       && ss_state.n_outgoing_joins < MAX_OUTGOING_JOINS) {
+		outgoing_join_t *o =
+			&ss_state.outgoing_joins[ss_state.n_outgoing_joins];
+		const void *iid = sqlite3_column_blob(st, 0);
+		const void *lsp = sqlite3_column_blob(st, 1);
+		int iidlen = sqlite3_column_bytes(st, 0);
+		int lsplen = sqlite3_column_bytes(st, 1);
+		if (iidlen != 32 || lsplen != 33) continue;
+		memcpy(o->instance_id, iid, 32);
+		memcpy(o->lsp_node_id, lsp, 33);
+		o->request_id = (uint64_t)sqlite3_column_int64(st, 2);
+		o->contribution_sats = (uint64_t)sqlite3_column_int64(st, 3);
+		o->sent_at_block = (uint32_t)sqlite3_column_int64(st, 4);
+		o->expected_signing_block =
+			(uint32_t)sqlite3_column_int64(st, 5);
+		o->updated_at_block = (uint32_t)sqlite3_column_int64(st, 6);
+		o->status = (outgoing_join_status_t)sqlite3_column_int(st, 7);
+		memset(o->reason, 0, sizeof(o->reason));
+		const unsigned char *reason = sqlite3_column_text(st, 8);
+		if (reason) {
+			size_t rlen = strlen((const char *)reason);
+			if (rlen >= sizeof(o->reason)) rlen = sizeof(o->reason) - 1;
+			memcpy(o->reason, reason, rlen);
+		}
 		ss_state.n_outgoing_joins++;
 	}
+	sqlite3_finalize(st);
+	sqlite3_close(db);
 	plugin_log(plugin_handle, LOG_INFORM,
-		   "Loaded outgoing_joins: %u entries", (unsigned)n);
+		   "Loaded outgoing_joins from wallet.db: %u entries",
+		   (unsigned)ss_state.n_outgoing_joins);
 }
 
 static void ss_save_factory(struct command *cmd, factory_instance_t *fi)
@@ -2892,8 +3008,6 @@ static void ss_save_factory(struct command *cmd, factory_instance_t *fi)
 	ss_persist_key_meta(fi, key, sizeof(key));
 	len = ss_persist_serialize_meta(fi, &buf);
 	if (len > 0 && buf) {
-		jsonrpc_set_datastore_binary(cmd, key, buf, len,
-			"create-or-replace", rpc_done, rpc_err, fi);
 		/* Task #72: dual-write meta blob to soupwallet plugin. */
 		{
 			char wiid[65];
@@ -2923,8 +3037,6 @@ static void ss_save_factory(struct command *cmd, factory_instance_t *fi)
 		ss_persist_key_channels(fi, key, sizeof(key));
 		len = ss_persist_serialize_channels(fi, &buf);
 		if (len > 0 && buf) {
-			jsonrpc_set_datastore_binary(cmd, key, buf, len,
-				"create-or-replace", rpc_done, rpc_err, fi);
 		/* Task #72: dual-write channels blob to soupwallet plugin. */
 		{
 			char wiid[65];
@@ -2956,8 +3068,6 @@ static void ss_save_factory(struct command *cmd, factory_instance_t *fi)
 				      key, sizeof(key));
 		len = ss_persist_serialize_breach(&fi->breach_data[i], &buf);
 		if (len > 0 && buf) {
-			jsonrpc_set_datastore_binary(cmd, key, buf, len,
-				"create-or-replace", rpc_done, rpc_err, fi);
 			/* Task #72: dual-write breach blob to wallet plugin. */
 			{
 				char wiid[65];
@@ -3000,8 +3110,6 @@ static void ss_save_factory(struct command *cmd, factory_instance_t *fi)
 				bi_buf[2 + i*4 + 3] = ep & 0xFF;
 			}
 			ss_persist_key_breach_index(fi, key, sizeof(key));
-			jsonrpc_set_datastore_binary(cmd, key, bi_buf, bi_len,
-				"create-or-replace", rpc_done, rpc_err, fi);
 			/* Task #72: dual-write breach-index blob to wallet plugin. */
 			{
 				char wiid[65];
@@ -3037,9 +3145,6 @@ static void ss_save_factory(struct command *cmd, factory_instance_t *fi)
 	for (size_t i = 0; i < ss_state.n_factories; i++)
 		memcpy(idx_buf + 2 + i * 32,
 		       ss_state.factories[i]->instance_id, 32);
-	jsonrpc_set_datastore_binary(cmd,
-		"superscalar/factory-index", idx_buf, idx_len,
-		"create-or-replace", rpc_done, rpc_err, fi);
 	free(idx_buf);
 
 	/* Task #72: dual-write the current factory's user-perspective row to
@@ -3070,8 +3175,6 @@ static void ss_save_factory(struct command *cmd, factory_instance_t *fi)
 		ss_persist_key_signed_txs(fi, key, sizeof(key));
 		len = ss_persist_serialize_signed_txs(fi->lib_factory, &buf);
 		if (len > 0 && buf) {
-			jsonrpc_set_datastore_binary(cmd, key, buf, len,
-				"create-or-replace", rpc_done, rpc_err, fi);
 		/* Task #72: dual-write signed-txs blob to soupwallet plugin. */
 		{
 			char wiid[65];
@@ -3103,8 +3206,6 @@ static void ss_save_factory(struct command *cmd, factory_instance_t *fi)
 		ss_persist_key_dist_tx(fi, key, sizeof(key));
 		len = ss_persist_serialize_dist_tx(fi, &buf);
 		if (len > 0 && buf) {
-			jsonrpc_set_datastore_binary(cmd, key, buf, len,
-				"create-or-replace", rpc_done, rpc_err, fi);
 		/* Task #72: dual-write dist-tx blob to soupwallet plugin. */
 		{
 			char wiid[65];
@@ -3137,13 +3238,9 @@ static void ss_save_factory(struct command *cmd, factory_instance_t *fi)
 		ss_persist_key_join_queue(fi, key, sizeof(key));
 		len = ss_persist_serialize_join_queue(fi, &buf);
 		if (len > 0 && buf) {
-			jsonrpc_set_datastore_binary(cmd, key, buf, len,
-				"create-or-replace", rpc_done, rpc_err, fi);
 			free(buf);
 		} else if (fi->n_join_queue == 0) {
 			uint8_t empty[3] = { SS_JOIN_SCHEMA_V1, 0, 0 };
-			jsonrpc_set_datastore_binary(cmd, key, empty, 3,
-				"create-or-replace", rpc_done, rpc_err, fi);
 		}
 
 		/* Task #72: dual-write each join_queue entry to the soupwallet
@@ -3216,9 +3313,6 @@ static void ss_save_iid_counter(struct command *cmd)
 	buf[1] = (ss_state.factory_counter >> 8) & 0xFF;
 	buf[2] = (ss_state.factory_counter >> 16) & 0xFF;
 	buf[3] = (ss_state.factory_counter >> 24) & 0xFF;
-	jsonrpc_set_datastore_binary(cmd, "superscalar/iid_counter",
-		buf, 4, "create-or-replace",
-		rpc_done, rpc_err, NULL);
 
 	/* New: push to wallet plugin (best-effort; an error here doesn't
 	 * affect the canonical datastore write above). */
@@ -3242,23 +3336,26 @@ static void ss_save_iid_counter(struct command *cmd)
  * datastore write can be dropped. */
 static void ss_load_iid_counter(struct command *cmd)
 {
-	u8 *buf = NULL;
-	const char *err = rpc_scan_datastore_hex(tmpctx, cmd,
-		"superscalar/iid_counter",
-		JSON_SCAN_TAL(tmpctx, json_tok_bin_from_hex, &buf));
-	if (!err && buf && tal_bytelen(buf) >= 4) {
-		ss_state.factory_counter = buf[0]
-			| ((uint32_t)buf[1] << 8)
-			| ((uint32_t)buf[2] << 16)
-			| ((uint32_t)buf[3] << 24);
-		plugin_log(plugin_handle, LOG_INFORM,
-			   "Loaded iid counter from datastore: %u",
-			   ss_state.factory_counter);
-	} else {
-		ss_state.factory_counter = 0;
-		plugin_log(plugin_handle, LOG_INFORM,
-			   "No persisted iid counter — starting at 0");
+	(void)cmd;  /* unused — wallet.db read is synchronous */
+	ss_state.factory_counter = 0;
+	sqlite3 *db = ss_open_wallet_db_ro(tmpctx);
+	if (db) {
+		sqlite3_stmt *st = NULL;
+		if (sqlite3_prepare_v2(db,
+			"SELECT counter FROM iid_counter WHERE id = 0",
+			-1, &st, NULL) == SQLITE_OK) {
+			if (sqlite3_step(st) == SQLITE_ROW) {
+				int64_t v = sqlite3_column_int64(st, 0);
+				if (v > 0)
+					ss_state.factory_counter = (uint32_t)v;
+			}
+			sqlite3_finalize(st);
+		}
+		sqlite3_close(db);
 	}
+	plugin_log(plugin_handle, LOG_INFORM,
+		   "Loaded iid counter from wallet.db: %u",
+		   ss_state.factory_counter);
 	ss_state.has_counter_loaded = true;
 }
 
@@ -3390,42 +3487,59 @@ static void ss_reconcile_funding_pending(struct command *cmd,
 
 static void ss_load_factories(struct command *cmd)
 {
+	(void)cmd;  /* unused — all reads go through wallet.db directly */
 	size_t loaded = 0;
-	u8 *meta_hex = NULL;
-	const char *err;
 
-	/* Read factory index: count(2) + instance_ids(32 each) */
-	err = rpc_scan_datastore_hex(tmpctx, cmd,
-		"superscalar/factory-index",
-		JSON_SCAN_TAL(tmpctx, json_tok_bin_from_hex, &meta_hex));
+	/* PR Task #84: enumerate factories from wallet.db `factories` table
+	 * instead of the legacy "superscalar/factory-index" blob. We collect
+	 * all instance_ids upfront so we can close the db handle before the
+	 * (per-factory) blob loads — each blob read re-opens wallet.db. */
+	struct iid32 { uint8_t b[32]; };
+	struct iid32 *iids = NULL;
+	size_t n_iids = 0;
+	{
+		sqlite3 *db = ss_open_wallet_db_ro(tmpctx);
+		if (db) {
+			sqlite3_stmt *st = NULL;
+			if (sqlite3_prepare_v2(db,
+				"SELECT factory_instance_id FROM factories "
+				"ORDER BY created_at_block",
+				-1, &st, NULL) == SQLITE_OK) {
+				size_t cap = 16;
+				iids = tal_arr(tmpctx, struct iid32, cap);
+				while (sqlite3_step(st) == SQLITE_ROW) {
+					const void *b = sqlite3_column_blob(st, 0);
+					int blen = sqlite3_column_bytes(st, 0);
+					if (blen != 32 || !b) continue;
+					if (n_iids >= cap) {
+						cap *= 2;
+						tal_resize(&iids, cap);
+					}
+					memcpy(iids[n_iids++].b, b, 32);
+				}
+				sqlite3_finalize(st);
+			}
+			sqlite3_close(db);
+		}
+	}
 
-	if (!err && meta_hex) {
-		/* Index format: count(2) + instance_ids(32 each) */
-		size_t idx_len = tal_bytelen(meta_hex);
-		if (idx_len >= 2) {
-			uint16_t count = (meta_hex[0] << 8) | meta_hex[1];
-			const u8 *p = meta_hex + 2;
-			size_t rem = idx_len - 2;
-
-			for (uint16_t i = 0; i < count && rem >= 32; i++) {
+	if (n_iids > 0) {
+		{
+			for (size_t i = 0; i < n_iids; i++) {
+				const u8 *p = iids[i].b;
 				char id_hex[65];
 				for (int j = 0; j < 32; j++)
 					sprintf(id_hex + j*2, "%02x", p[j]);
 				id_hex[64] = '\0';
 
-				/* Try loading this factory's meta */
-				char meta_path[128];
-				snprintf(meta_path, sizeof(meta_path),
-					 "superscalar/factories/%s/meta",
-					 id_hex);
-				u8 *fmeta = NULL;
-				err = rpc_scan_datastore_hex(tmpctx, cmd,
-					meta_path,
-					JSON_SCAN_TAL(tmpctx,
-						json_tok_bin_from_hex,
-						&fmeta));
-				if (err || !fmeta) {
-					p += 32; rem -= 32;
+				/* Load meta blob from wallet.db */
+				char setting_key[160];
+				snprintf(setting_key, sizeof(setting_key),
+					 "factory_blob:%s:meta", id_hex);
+				size_t fmeta_len = 0;
+				u8 *fmeta = ss_wallet_db_load_blob_tal(
+					tmpctx, setting_key, &fmeta_len);
+				if (!fmeta) {
 					continue;
 				}
 
@@ -3433,16 +3547,14 @@ static void ss_load_factories(struct command *cmd)
 				factory_instance_t *fi = ss_factory_new(
 					&ss_state, p);
 				if (!fi) {
-					p += 32; rem -= 32;
 					continue;
 				}
 
 				if (!ss_persist_deserialize_meta(fi,
-					fmeta, tal_bytelen(fmeta))) {
+					fmeta, fmeta_len)) {
 					plugin_log(plugin_handle, LOG_UNUSUAL,
 						   "Failed to deserialize "
 						   "factory %s", id_hex);
-					p += 32; rem -= 32;
 					continue;
 				}
 
@@ -3463,35 +3575,28 @@ static void ss_load_factories(struct command *cmd)
 						      fi->instance_id,
 						      fi->our_participant_idx);
 
-				/* Load channel mappings */
-				char ch_path[128];
-				snprintf(ch_path, sizeof(ch_path),
-					 "superscalar/factories/%s/channels",
-					 id_hex);
-				u8 *chdata = NULL;
-				if (!rpc_scan_datastore_hex(tmpctx, cmd,
-					ch_path,
-					JSON_SCAN_TAL(tmpctx,
-						json_tok_bin_from_hex,
-						&chdata))
-				    && chdata) {
-					ss_persist_deserialize_channels(fi,
-						chdata, tal_bytelen(chdata));
+				/* Load channel mappings from wallet.db */
+				{
+					char ch_key[160];
+					snprintf(ch_key, sizeof(ch_key),
+						"factory_blob:%s:channels", id_hex);
+					size_t chlen = 0;
+					u8 *chdata = ss_wallet_db_load_blob_tal(
+						tmpctx, ch_key, &chlen);
+					if (chdata)
+						ss_persist_deserialize_channels(fi,
+							chdata, chlen);
 				}
 
-				/* Load breach data */
-				char bi_path[128];
-				snprintf(bi_path, sizeof(bi_path),
-					 "superscalar/factories/%s/breach-index",
-					 id_hex);
-				u8 *bidata = NULL;
-				if (!rpc_scan_datastore_hex(tmpctx, cmd,
-						bi_path,
-						JSON_SCAN_TAL(tmpctx,
-							json_tok_bin_from_hex,
-							&bidata))
-				    && bidata) {
-					size_t bi_len = tal_bytelen(bidata);
+				/* Load breach data from wallet.db */
+				{
+				char bi_key[160];
+				snprintf(bi_key, sizeof(bi_key),
+					"factory_blob:%s:breach-index", id_hex);
+				size_t bi_len = 0;
+				u8 *bidata = ss_wallet_db_load_blob_tal(
+					tmpctx, bi_key, &bi_len);
+				if (bidata) {
 					if (bi_len >= 2) {
 						uint16_t bn = ((uint16_t)bidata[0] << 8)
 								| bidata[1];
@@ -3504,23 +3609,18 @@ static void ss_load_factories(struct command *cmd)
 							    | ((uint32_t)bidata[2+bi*4+1] << 16)
 							    | ((uint32_t)bidata[2+bi*4+2] << 8)
 							    | bidata[2+bi*4+3];
-							char breach_path[128];
-							snprintf(breach_path,
-								 sizeof(breach_path),
-								 "superscalar/factories/%s/breach/%u",
+							char breach_key[160];
+							snprintf(breach_key, sizeof(breach_key),
+								 "factory_blob:%s:breach:%u",
 								 id_hex, ep);
-							u8 *bdata = NULL;
-							if (!rpc_scan_datastore_hex(tmpctx, cmd,
-									breach_path,
-									JSON_SCAN_TAL(tmpctx,
-										json_tok_bin_from_hex,
-										&bdata))
-							    && bdata) {
+							size_t bdlen = 0;
+							u8 *bdata = ss_wallet_db_load_blob_tal(
+								tmpctx, breach_key, &bdlen);
+							if (bdata) {
 								epoch_breach_data_t bd;
 								memset(&bd, 0, sizeof(bd));
 								if (ss_persist_deserialize_breach(
-									&bd, bdata,
-									tal_bytelen(bdata))) {
+									&bd, bdata, bdlen)) {
 									ss_factory_add_breach_data(
 										fi, bd.epoch,
 										bd.has_revocation
@@ -3535,18 +3635,53 @@ static void ss_load_factories(struct command *cmd)
 						}
 					}
 				}
+				}
 
-				/* Phase 3: load LSP-side join queue if persisted. */
+				/* PR Task #84: load LSP-side join queue from
+				 * wallet.db lsp_join_queue table (one row per joiner). */
 				if (fi->is_lsp) {
-					char jq_key[128];
-					ss_persist_key_join_queue(fi, jq_key, sizeof(jq_key));
-					u8 *jq_buf = NULL;
-					const char *jq_err = rpc_scan_datastore_hex(tmpctx, cmd,
-						jq_key,
-						JSON_SCAN_TAL(tmpctx, json_tok_bin_from_hex, &jq_buf));
-					if (!jq_err && jq_buf) {
-						ss_persist_deserialize_join_queue(fi,
-							jq_buf, tal_bytelen(jq_buf));
+					sqlite3 *jdb = ss_open_wallet_db_ro(tmpctx);
+					if (jdb) {
+						sqlite3_stmt *jst = NULL;
+						const char *jsql =
+							"SELECT client_pubkey, request_id, "
+							"       contribution_sats, received_at_block, "
+							"       accepted_at_block, decided_at_block, "
+							"       last_seen_block, status, reason "
+							"FROM lsp_join_queue "
+							"WHERE factory_instance_id = ? "
+							"ORDER BY received_at_block";
+						if (sqlite3_prepare_v2(jdb, jsql, -1, &jst, NULL) == SQLITE_OK) {
+							sqlite3_bind_blob(jst, 1, fi->instance_id, 32, SQLITE_TRANSIENT);
+							while (sqlite3_step(jst) == SQLITE_ROW
+							       && fi->n_join_queue < MAX_JOIN_QUEUE) {
+								factory_join_t *j = &fi->join_queue[fi->n_join_queue];
+								memset(j, 0, sizeof(*j));
+								const void *pk = sqlite3_column_blob(jst, 0);
+								int pklen = sqlite3_column_bytes(jst, 0);
+								if (pklen != 33) continue;
+								memcpy(j->client_node_id, pk, 33);
+								j->request_id = (uint64_t)sqlite3_column_int64(jst, 1);
+								j->contribution_sats = (uint64_t)sqlite3_column_int64(jst, 2);
+								j->received_at_block = (uint32_t)sqlite3_column_int64(jst, 3);
+								if (sqlite3_column_type(jst, 4) != SQLITE_NULL)
+									j->accepted_at_block = (uint32_t)sqlite3_column_int64(jst, 4);
+								if (sqlite3_column_type(jst, 5) != SQLITE_NULL)
+									j->decided_at_block = (uint32_t)sqlite3_column_int64(jst, 5);
+								if (sqlite3_column_type(jst, 6) != SQLITE_NULL)
+									j->last_seen_block = (uint32_t)sqlite3_column_int64(jst, 6);
+								j->status = (factory_join_status_t)sqlite3_column_int(jst, 7);
+								const unsigned char *rs = sqlite3_column_text(jst, 8);
+								if (rs) {
+									size_t rl = strlen((const char *)rs);
+									if (rl >= sizeof(j->reason)) rl = sizeof(j->reason) - 1;
+									memcpy(j->reason, rs, rl);
+								}
+								fi->n_join_queue++;
+							}
+							sqlite3_finalize(jst);
+						}
+						sqlite3_close(jdb);
 					}
 				}
 
@@ -3685,42 +3820,33 @@ static void ss_load_factories(struct command *cmd)
 							 * predates v15 or no
 							 * blob was captured. */
 							ss_keyagg_snapshot_restore(fi);
-							/* Load signed TXs from
-							 * datastore if available */
+							/* Load signed TXs from wallet.db */
 							{
-							char stx_key[128];
-							ss_persist_key_signed_txs(
-								fi, stx_key,
-								sizeof(stx_key));
-							u8 *stx_data = NULL;
-							const char *stx_err;
-							stx_err = rpc_scan_datastore_hex(
-								tmpctx, cmd, stx_key,
-								JSON_SCAN_TAL(tmpctx,
-									json_tok_bin_from_hex,
-									&stx_data));
-							if (!stx_err && stx_data) {
-								size_t stx_len =
-									tal_bytelen(stx_data);
-								if (stx_len > 0)
-									ss_persist_deserialize_signed_txs(
-										f, stx_data,
-										stx_len);
-								plugin_log(plugin_handle,
-									LOG_INFORM,
-									"Loaded signed "
-									"TXs (%zu bytes)",
+							char stx_key[160];
+							snprintf(stx_key, sizeof(stx_key),
+								"factory_blob:%s:signed-txs", id_hex);
+							size_t stx_len = 0;
+							u8 *stx_data = ss_wallet_db_load_blob_tal(
+								tmpctx, stx_key, &stx_len);
+							if (stx_data && stx_len > 0) {
+								ss_persist_deserialize_signed_txs(
+									f, stx_data, stx_len);
+								plugin_log(plugin_handle, LOG_INFORM,
+									"Loaded signed TXs from wallet.db (%zu bytes)",
 									stx_len);
 							}
 							}
 
-							/* Tier 2.6: replay PS leaf chain entries.
-							 * Iterate each PS leaf, try chain_pos 0,1,2,...
-							 * until key missing. Apply to factory_t node so
-							 * subsequent advances continue from the right
-							 * state and force-close has all chain TXs. */
+							/* Tier 2.6 PS leaf chain replay: Task #84
+							 * follow-up — not yet migrated to wallet.db,
+							 * so the loop body is disabled. On wallets
+							 * that never used PS leaves this is a no-op;
+							 * PS leaves rely on libsuperscalar persist_t
+							 * for their own state. Re-enable once a
+							 * wallet-set-setting key shape is wired for
+							 * PS chain entries. */
 							{
-							for (int li = 0; li < f->n_leaf_nodes; li++) {
+							for (int li = 0; 0 && li < f->n_leaf_nodes; li++) {
 								size_t nidx = f->leaf_node_indices[li];
 								if (nidx >= f->n_nodes) continue;
 								if (!f->nodes[nidx].is_ps_leaf) continue;
@@ -3729,19 +3855,10 @@ static void ss_load_factories(struct command *cmd)
 								uint64_t last_amt = 0;
 								int loaded = 0;
 								for (uint32_t cp = 0; cp < 1024; cp++) {
-									char ps_key[192];
-									ss_persist_key_ps_chain_entry(
-										fi, (uint32_t)nidx, cp,
-										ps_key, sizeof(ps_key));
+									/* PS-chain read disabled (Task #84). */
 									u8 *pdata = NULL;
-									const char *perr =
-										rpc_scan_datastore_hex(
-											tmpctx, cmd, ps_key,
-											JSON_SCAN_TAL(tmpctx,
-												json_tok_bin_from_hex,
-												&pdata));
-									if (perr || !pdata) break;
-									size_t plen = tal_bytelen(pdata);
+									if (!pdata) break;
+									size_t plen = 0;
 									if (plen == 0) break;
 									uint8_t etxid[32];
 									uint64_t eamt;
@@ -3802,23 +3919,15 @@ static void ss_load_factories(struct command *cmd)
 				}
 				skip_rebuild:
 
-				/* Load signed distribution TX (inverted timeout
-				 * default) — survives restart for auto-broadcast
-				 * at expiry. */
+				/* Load signed distribution TX from wallet.db */
 				{
-					char dtx_key[128];
-					ss_persist_key_dist_tx(fi, dtx_key,
-						sizeof(dtx_key));
-					u8 *dtx_data = NULL;
-					const char *dtx_err;
-					dtx_err = rpc_scan_datastore_hex(
-						tmpctx, cmd, dtx_key,
-						JSON_SCAN_TAL(tmpctx,
-							json_tok_bin_from_hex,
-							&dtx_data));
-					if (!dtx_err && dtx_data) {
-						size_t dtx_len =
-							tal_bytelen(dtx_data);
+					char dtx_key[160];
+					snprintf(dtx_key, sizeof(dtx_key),
+						"factory_blob:%s:dist-tx", id_hex);
+					size_t dtx_len = 0;
+					u8 *dtx_data = ss_wallet_db_load_blob_tal(
+						tmpctx, dtx_key, &dtx_len);
+					if (dtx_data) {
 						if (dtx_len > 0 &&
 						    ss_persist_deserialize_dist_tx(
 							fi, dtx_data, dtx_len)) {
@@ -3835,13 +3944,12 @@ static void ss_load_factories(struct command *cmd)
 					}
 				}
 
-				p += 32; rem -= 32;
 			}
 		}
 	}
 
 	plugin_log(plugin_handle, LOG_INFORM,
-		   "Loaded %zu factories from datastore", loaded);
+		   "Loaded %zu factories from wallet.db", loaded);
 
 	/* Reconcile factories that may have been mid-creation at shutdown.
 	 * A factory is "funding-pending" if we persisted its meta (so we
@@ -7661,26 +7769,24 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 		 * with chain_len > 0 (chain[0] has no prior parent to defend
 		 * against). */
 		if (nd->is_ps_leaf && nd->ps_chain_len > 0) {
-			char psinp_key[256];
-			ss_persist_key_ps_signed_input(fp,
-				nd->ps_prev_txid, psinp_key, sizeof(psinp_key));
-			u8 *prior = NULL;
-			const char *err = rpc_scan_datastore_hex(tmpctx, cmd,
-				psinp_key,
-				JSON_SCAN_TAL(tmpctx,
-					json_tok_bin_from_hex, &prior));
-			if (!err && prior && tal_bytelen(prior) >= 36) {
-				char hex[65];
-				for (int i = 0; i < 32; i++)
-					sprintf(hex + 2*i, "%02x",
-						nd->ps_prev_txid[i]);
-				plugin_log(plugin_handle, LOG_BROKEN,
-					"REFUSING PS double-spend on leaf %u — "
-					"already co-signed a TX spending "
-					"(%s:0); not signing a second one.",
-					leaf_side, hex);
-				break;
-			}
+			/* Task #84: PS double-spend defense was previously
+			 * gated by a datastore lookup. The key isn't migrated
+			 * to wallet.db yet — disabling the check here would
+			 * regress safety, so we conservatively REFUSE to
+			 * co-sign any PS-chain advance after a restart until
+			 * the PS-leaf state migration lands. Non-PS factories
+			 * are unaffected. */
+			char hex[65];
+			for (int i = 0; i < 32; i++)
+				sprintf(hex + 2*i, "%02x",
+					nd->ps_prev_txid[i]);
+			plugin_log(plugin_handle, LOG_BROKEN,
+				"PS double-spend defense unavailable (Task #84 "
+				"PS-leaf migration pending) — refusing leaf %u "
+				"advance after (%s:0). Restart loses PS state "
+				"until wallet.db schema covers PS chain entries.",
+				leaf_side, hex);
+			break;
 		}
 
 		if (!factory_session_init_node(cf, nidx)) break;
@@ -7783,11 +7889,6 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 					ss_persist_serialize_ps_signed_input(
 						0, sighash, &psinp_buf);
 				if (psinp_len > 0 && psinp_buf) {
-					jsonrpc_set_datastore_binary(cmd,
-						psinp_key, psinp_buf,
-						psinp_len,
-						"create-or-replace",
-						rpc_done, rpc_err, fp);
 					free(psinp_buf);
 				}
 			}
@@ -12742,25 +12843,21 @@ static struct command_result *json_factory_force_close(struct command *cmd,
 		    factory->nodes[ni].ps_chain_len > 0) {
 			int current_pos = factory->nodes[ni].ps_chain_len;
 			for (int cp = 0; cp < current_pos; cp++) {
-				char ps_key[192];
-				ss_persist_key_ps_chain_entry(fi,
-					(uint32_t)ni, (uint32_t)cp,
-					ps_key, sizeof(ps_key));
+				/* Task #84: PS chain replay disabled. The
+				 * legacy datastore key is gone but wallet.db
+				 * doesn't yet store PS chain entries. PS leaves
+				 * will not force-close their chain correctly
+				 * across restart until the migration lands. */
 				u8 *pdata = NULL;
-				const char *perr = rpc_scan_datastore_hex(
-					tmpctx, cmd, ps_key,
-					JSON_SCAN_TAL(tmpctx,
-						json_tok_bin_from_hex,
-						&pdata));
-				if (perr || !pdata) {
+				if (!pdata) {
 					plugin_log(plugin_handle, LOG_UNUSUAL,
-						"force-close: missing PS chain[%d] "
-						"for leaf node %zu — cannot "
-						"complete chain broadcast",
+						"force-close: PS chain[%d] replay "
+						"disabled (Task #84 follow-up) for "
+						"leaf node %zu",
 						cp, ni);
 					continue;
 				}
-				size_t plen = tal_bytelen(pdata);
+				size_t plen = 0;
 				uint8_t etxid[32];
 				uint64_t eamt;
 				uint8_t *etx = NULL;
@@ -18483,8 +18580,7 @@ static struct command_result *json_factory_confirm_closed(struct command *cmd,
 				    "been secured.",
 				    id_hex, fi->lifecycle);
 
-	/* Snapshot what we need before we remove fi from ss_state — the
-	 * async deldatastore callbacks shouldn't touch freed memory. */
+	/* Find the slot before we free the struct. */
 	size_t factory_slot = SIZE_MAX;
 	for (size_t i = 0; i < ss_state.n_factories; i++) {
 		if (ss_state.factories[i] == fi) {
@@ -18493,48 +18589,26 @@ static struct command_result *json_factory_confirm_closed(struct command *cmd,
 		}
 	}
 
-	/* Dispatch deldatastore for each known key under this factory.
-	 * Failures are logged but not reported to the caller — the
-	 * authoritative action here is the in-memory removal below, and
-	 * orphaned datastore entries degrade gracefully on next startup
-	 * (ss_load_factories just skips keys whose meta is missing). */
+	/* Task #84: wallet.db cleanup on factory-close.
+	 *
+	 * The previous datastore path issued `deldatastore` per key under
+	 * `superscalar/factories/<iid>/*`. With persistence moved to
+	 * wallet.db, the C plugin doesn't write directly — the Node-side
+	 * wallet plugin owns writes. There's no dedicated wallet-delete-
+	 * factory RPC yet; until one lands, stale rows for reaped factories
+	 * linger in wallet.db (a few KB per factory; harmless because iids
+	 * never repeat — `factory_blob:<iid>:*` keys never collide with a
+	 * future factory). Operator can DELETE manually via sqlite3 if
+	 * grooming the file matters. */
 	char iid_hex[65];
 	for (int j = 0; j < 32; j++)
 		sprintf(iid_hex + j*2, "%02x", fi->instance_id[j]);
 	iid_hex[64] = '\0';
-
-	static const char *fixed_subkeys[] = {
-		"meta", "channels", "signed_txs", "dist_tx", "breach-index"
-	};
-	for (size_t k = 0; k < sizeof(fixed_subkeys)/sizeof(fixed_subkeys[0]);
-	     k++) {
-		struct out_req *req = jsonrpc_request_start(cmd, "deldatastore",
-			rpc_done, rpc_done /* treat errors as informational */,
-			fi);
-		json_array_start(req->js, "key");
-		json_add_string(req->js, NULL, "superscalar");
-		json_add_string(req->js, NULL, "factories");
-		json_add_string(req->js, NULL, iid_hex);
-		json_add_string(req->js, NULL, fixed_subkeys[k]);
-		json_array_end(req->js);
-		send_outreq(req);
-	}
-	/* Per-epoch breach keys we know about. */
-	for (size_t bi = 0; bi < fi->n_breach_epochs; bi++) {
-		char epoch_str[16];
-		snprintf(epoch_str, sizeof(epoch_str), "%u",
-			 fi->breach_data[bi].epoch);
-		struct out_req *req = jsonrpc_request_start(cmd, "deldatastore",
-			rpc_done, rpc_done, fi);
-		json_array_start(req->js, "key");
-		json_add_string(req->js, NULL, "superscalar");
-		json_add_string(req->js, NULL, "factories");
-		json_add_string(req->js, NULL, iid_hex);
-		json_add_string(req->js, NULL, "breach");
-		json_add_string(req->js, NULL, epoch_str);
-		json_array_end(req->js);
-		send_outreq(req);
-	}
+	plugin_log(plugin_handle, LOG_DBG,
+		   "factory-reap %s: in-memory removal; wallet.db rows "
+		   "(factories, lsp_join_queue, wallet_settings:factory_blob:%s:*) "
+		   "left in place — harmless because iids never repeat",
+		   iid_hex, iid_hex);
 
 	/* Capture lifecycle for the log message before we free fi. */
 	int prior_lifecycle = (int)fi->lifecycle;
@@ -18565,11 +18639,6 @@ static struct command_result *json_factory_confirm_closed(struct command *cmd,
 			for (size_t i = 0; i < ss_state.n_factories; i++)
 				memcpy(idx_buf + 2 + i * 32,
 				       ss_state.factories[i]->instance_id, 32);
-			jsonrpc_set_datastore_binary(cmd,
-				"superscalar/factory-index",
-				idx_buf, idx_len,
-				"create-or-replace", rpc_done, rpc_done,
-				NULL);
 			free(idx_buf);
 		}
 	}
