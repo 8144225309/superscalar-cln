@@ -2779,6 +2779,42 @@ static void ss_save_outgoing_joins(struct command *cmd)
 			empty, 3, "create-or-replace",
 			rpc_done, rpc_err, &ss_state);
 	}
+
+	/* Task #72: dual-write each outgoing_join entry to the soupwallet
+	 * plugin. Per-entry upserts. Best-effort; failures here don't affect
+	 * the canonical datastore write above. */
+	for (size_t k = 0; k < ss_state.n_outgoing_joins; k++) {
+		const outgoing_join_t *o = &ss_state.outgoing_joins[k];
+		char fiid_hex[65], lsp_hex[67];
+		for (int j = 0; j < 32; j++)
+			sprintf(fiid_hex + j*2, "%02x", o->instance_id[j]);
+		fiid_hex[64] = 0;
+		for (int j = 0; j < 33; j++)
+			sprintf(lsp_hex + j*2, "%02x", o->lsp_node_id[j]);
+		lsp_hex[66] = 0;
+		char req_id_str[24], contrib_str[24];
+		snprintf(req_id_str, sizeof req_id_str, "%llu",
+			 (unsigned long long)o->request_id);
+		snprintf(contrib_str, sizeof contrib_str, "%llu",
+			 (unsigned long long)o->contribution_sats);
+		struct out_req *wreq = jsonrpc_request_start(cmd,
+			"wallet-upsert-outgoing-join",
+			rpc_done, rpc_err, NULL);
+		json_add_string(wreq->js, "factory_instance_id_hex", fiid_hex);
+		json_add_string(wreq->js, "lsp_pubkey_hex", lsp_hex);
+		json_add_string(wreq->js, "request_id", req_id_str);
+		json_add_string(wreq->js, "contribution_sats", contrib_str);
+		json_add_u32(wreq->js, "sent_at_block", o->sent_at_block);
+		if (o->expected_signing_block)
+			json_add_u32(wreq->js, "expected_signing_block",
+				     o->expected_signing_block);
+		json_add_u32(wreq->js, "updated_at_block", o->updated_at_block);
+		json_add_u32(wreq->js, "status", (u32)o->status);
+		if (o->reason[0])
+			json_add_string(wreq->js, "reason",
+					(const char *)o->reason);
+		send_outreq(wreq);
+	}
 }
 
 /* Called from init() — load outgoing_joins from datastore at startup so
@@ -2919,6 +2955,27 @@ static void ss_save_factory(struct command *cmd, factory_instance_t *fi)
 		"create-or-replace", rpc_done, rpc_err, fi);
 	free(idx_buf);
 
+	/* Task #72: dual-write the current factory's user-perspective row to
+	 * the soupwallet CLN plugin. Per-factory upsert (the wallet plugin's
+	 * factories table mirrors the datastore index by accumulating these
+	 * upserts). Best-effort; an error here doesn't affect the canonical
+	 * datastore write above. */
+	{
+		char iid_hex[65];
+		for (int j = 0; j < 32; j++)
+			sprintf(iid_hex + j*2, "%02x", fi->instance_id[j]);
+		iid_hex[64] = 0;
+		struct out_req *wreq = jsonrpc_request_start(cmd,
+			"wallet-upsert-factory",
+			rpc_done, rpc_err, NULL);
+		json_add_string(wreq->js, "factory_instance_id_hex", iid_hex);
+		json_add_u32(wreq->js, "my_role", fi->is_lsp ? 1 : 0);
+		json_add_u32(wreq->js, "created_at_block", ss_state.current_blockheight);
+		json_add_u32(wreq->js, "state", (u32)fi->lifecycle);
+		json_add_u32(wreq->js, "archived", 0);
+		send_outreq(wreq);
+	}
+
 	/* Save signed DW tree transactions (for force-close after restart).
 	 * Both LSP and client persist independently — each must be able
 	 * to unilaterally exit without the other's cooperation. */
@@ -2959,6 +3016,52 @@ static void ss_save_factory(struct command *cmd, factory_instance_t *fi)
 			jsonrpc_set_datastore_binary(cmd, key, empty, 3,
 				"create-or-replace", rpc_done, rpc_err, fi);
 		}
+
+		/* Task #72: dual-write each join_queue entry to the soupwallet
+		 * plugin. Per-entry upserts (wallet's lsp_join_queue table
+		 * mirrors the blob). Best-effort; failures here don't affect
+		 * the canonical datastore write above. */
+		char fiid_hex[65];
+		for (int j = 0; j < 32; j++)
+			sprintf(fiid_hex + j*2, "%02x", fi->instance_id[j]);
+		fiid_hex[64] = 0;
+		for (size_t k = 0; k < fi->n_join_queue; k++) {
+			const factory_join_t *jq = &fi->join_queue[k];
+			char cpk_hex[67];
+			for (int j = 0; j < 33; j++)
+				sprintf(cpk_hex + j*2, "%02x", jq->client_node_id[j]);
+			cpk_hex[66] = 0;
+			char req_id_str[24], contrib_str[24];
+			snprintf(req_id_str, sizeof req_id_str, "%llu",
+				 (unsigned long long)jq->request_id);
+			snprintf(contrib_str, sizeof contrib_str, "%llu",
+				 (unsigned long long)jq->contribution_sats);
+			struct out_req *wreq = jsonrpc_request_start(cmd,
+				"wallet-upsert-join-queue-entry",
+				rpc_done, rpc_err, NULL);
+			json_add_string(wreq->js, "factory_instance_id_hex", fiid_hex);
+			json_add_string(wreq->js, "client_pubkey_hex", cpk_hex);
+			json_add_string(wreq->js, "request_id", req_id_str);
+			json_add_string(wreq->js, "contribution_sats", contrib_str);
+			json_add_u32(wreq->js, "received_at_block",
+				     jq->received_at_block);
+			if (jq->accepted_at_block)
+				json_add_u32(wreq->js, "accepted_at_block",
+					     jq->accepted_at_block);
+			if (jq->decided_at_block)
+				json_add_u32(wreq->js, "decided_at_block",
+					     jq->decided_at_block);
+			if (jq->last_seen_block)
+				json_add_u32(wreq->js, "last_seen_block",
+					     jq->last_seen_block);
+			json_add_u32(wreq->js, "status", (u32)jq->status);
+			if (jq->reason[0])
+				json_add_string(wreq->js, "reason",
+						(const char *)jq->reason);
+			send_outreq(wreq);
+		}
+		if (0) {
+		}
 	}
 
 	plugin_log(plugin_handle, LOG_DBG,
@@ -2970,11 +3073,15 @@ static void ss_save_factory(struct command *cmd, factory_instance_t *fi)
 /* Load factories from CLN datastore on startup.
  * Reads factory-index key to discover instance IDs, then
  * loads each factory's meta and channel mappings. */
-/* Gap 8: persist the monotonic iid counter so restarts don't reuse
- * counter values. Keyed "superscalar/iid_counter"; body is a 4-byte
- * little-endian u32. create-or-replace semantics — never deleted. */
+/* Task #72 (transitional): persist the monotonic iid counter to BOTH the
+ * CLN datastore (legacy path, still authoritative for restart-load) AND
+ * the soupwallet CLN plugin (new path, warming up). Once we migrate the
+ * load path off the datastore (lazy-load at first factory-create), the
+ * datastore write here can be dropped and the wallet plugin becomes the
+ * sole authority. */
 static void ss_save_iid_counter(struct command *cmd)
 {
+	/* Legacy: write to CLN datastore. */
 	u8 buf[4];
 	buf[0] = ss_state.factory_counter & 0xFF;
 	buf[1] = (ss_state.factory_counter >> 8) & 0xFF;
@@ -2983,12 +3090,27 @@ static void ss_save_iid_counter(struct command *cmd)
 	jsonrpc_set_datastore_binary(cmd, "superscalar/iid_counter",
 		buf, 4, "create-or-replace",
 		rpc_done, rpc_err, NULL);
+
+	/* New: push to wallet plugin (best-effort; an error here doesn't
+	 * affect the canonical datastore write above). */
+	struct out_req *req = jsonrpc_request_start(cmd,
+		"wallet-set-iid-counter",
+		rpc_done, rpc_err, NULL);
+	json_add_u32(req->js, "counter", ss_state.factory_counter);
+	send_outreq(req);
 }
 
 /* Load the iid counter at plugin init. If no prior value exists
  * (fresh plugin or never-written), start from 0 and mark loaded so
  * subsequent factory-creates save after increment. Called before
- * ss_load_factories so the counter is ready for any early work. */
+ * ss_load_factories so the counter is ready for any early work.
+ *
+ * Task #72 (transitional): reads from the CLN datastore (the historical
+ * location). Future PR migrates this to wallet-get-iid-counter via lazy-
+ * load at first factory-create — the init cmd context doesn't survive
+ * the async wallet RPC reply (libplugin reports "JSON reply with unknown
+ * id"). The save side already dual-writes; once load is migrated, the
+ * datastore write can be dropped. */
 static void ss_load_iid_counter(struct command *cmd)
 {
 	u8 *buf = NULL;
