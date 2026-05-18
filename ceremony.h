@@ -114,6 +114,26 @@
 #define SS_SUBMSG_LEAF_REALLOC_PSIG_3		0x0139
 #define SS_SUBMSG_LEAF_REALLOC_DONE_3		0x013A
 
+/* Browse / discovery (third-party can ask: 'what factories do you run?').
+ * Wire-only, no MuSig2 / no funding tx. Read-only. */
+#define SS_SUBMSG_FACTORY_INFO_REQUEST		0x0140 /* client -> host */
+#define SS_SUBMSG_FACTORY_INFO_RESPONSE		0x0141 /* host -> client */
+
+/* Phase 3: factory join / leave mechanics.
+ *
+ * Wire-only, no MuSig2 / no funding tx. JOIN_REQUEST is the client asking
+ * to be added to an LSP's factory; JOIN_RESPONSE is the LSP's reply
+ * (accepted / queued / rejected / already_queued / already_member);
+ * JOIN_CANCEL is the client withdrawing a pending join (fire-and-forget,
+ * LSP records for visibility — the client's local auto-sign refusal is
+ * what actually opts them out at ceremony time).
+ *
+ * Authentication: requests are attributed by their BOLT-8 sender_id;
+ * no client_pubkey field on the wire (cannot be spoofed). */
+#define SS_SUBMSG_JOIN_REQUEST			0x0142 /* client -> LSP */
+#define SS_SUBMSG_JOIN_RESPONSE			0x0143 /* LSP -> client */
+#define SS_SUBMSG_JOIN_CANCEL			0x0144 /* client -> LSP, fire-and-forget */
+
 /* Ceremony state */
 typedef enum {
 	CEREMONY_IDLE,

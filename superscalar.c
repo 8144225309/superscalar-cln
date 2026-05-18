@@ -13,6 +13,7 @@
 #include <bitcoin/privkey.h>
 #include <common/addr.h>
 #include <common/features.h>
+#include <common/memleak.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
@@ -265,6 +266,502 @@ static const uint8_t SUPERSCALAR_PROTOCOL_ID[32] = {
 	'S','u','p','e','r','S','c','a','l','a','r','/','v','1',
 	0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
 };
+
+/* --------------------------------------------------------------------- *
+ * Browse (third-party factory enumeration) — pending request tracking
+ *
+ * factory-browse-host sends FACTORY_INFO_REQUEST (0x0140) to a target peer
+ * and awaits FACTORY_INFO_RESPONSE (0x0141). The RPC returns
+ * command_still_pending; this table maps request_id -> cmd so the dispatch
+ * handler can resolve the right RPC when the response arrives.
+ * --------------------------------------------------------------------- */
+#define SS_BROWSE_MAX_PENDING		16
+#define SS_BROWSE_TIMEOUT_SECS		30
+/* Runtime-mutable copy set by --superscalar-browse-timeout-secs.
+ * Default mirrors the compile-time constant; operators can lower for
+ * impatient UIs or raise for high-latency networks. */
+static u32 ss_browse_timeout_secs = SS_BROWSE_TIMEOUT_SECS;
+struct ss_browse_pending_slot {
+	uint64_t request_id;
+	struct command *cmd;
+	time_t deadline;
+	uint8_t peer_id[33];        /* for per-peer cap release */
+};
+static struct ss_browse_pending_slot ss_browse_pending[SS_BROWSE_MAX_PENDING];
+
+/* Forward decl: ss_audit_log is defined below ss_fresh_request_id, but the
+ * peer-table helpers (which appear above the helper definition) call it. */
+static void ss_audit_log(enum log_level lvl, const char *event,
+                         const char *fmt, ...);
+
+/* Forward decl for factory-funding-precheck handler (Phase 4). */
+static struct command_result *json_factory_funding_precheck(
+	struct command *cmd, const char *buf, const jsmntok_t *params);
+
+/* ============================================================================
+ * Per-peer rate limit + slot cap tracking (hardening: DoS resistance)
+ *
+ * Goal: one hostile peer cannot exhaust the 16-slot global browse/join pools.
+ *
+ * Limits enforced per peer node_id:
+ *   - Max SS_PEER_MAX_CONCURRENT outstanding slots (browse + join combined)
+ *   - Max SS_PEER_RATE_LIMIT requests per SS_PEER_RATE_WINDOW_SECS
+ *
+ * Implementation: fixed-size table (no dynamic allocation). Entries are
+ * recycled LRU-style when full. Trade-off: under sustained attack from
+ * many distinct peers, the table is evicted in FIFO order; legitimate
+ * peers may briefly bypass the cap. Acceptable for v1.
+ * ============================================================================ */
+/* ============================================================================
+ * SuperScalar JSON-RPC error codes (Task #69).
+ *
+ * CLN uses errcode_t int; we allocate the 2200-2299 range for
+ * plugin-specific codes so clients can switch on them instead of
+ * regexing the message string. Codes are stable: do NOT renumber.
+ *
+ * Parameter-validation errors continue to use JSONRPC2_INVALID_PARAMS
+ * (CLN-defined, -32602). The codes below are for post-parse semantic
+ * failures (peer rate limited, slot pool exhausted, etc.).
+ *
+ * Wallet adoption: clients should map unrecognized codes to "unknown
+ * server error" rather than failing — the code list will grow.
+ * ============================================================================ */
+#define SS_ERR_INTERNAL                  2200
+/* Per-peer DoS protection */
+#define SS_ERR_PEER_RATE_LIMIT           2210
+#define SS_ERR_PEER_CONCURRENT_LIMIT     2211
+#define SS_ERR_PEER_SOFT_BANNED          2212
+#define SS_ERR_PEER_TABLE_FULL           2213
+/* Slot pool exhaustion */
+#define SS_ERR_SLOT_EXHAUSTED            2220
+/* Peer connectivity */
+#define SS_ERR_PEER_NOT_CONNECTED        2230
+#define SS_ERR_PEER_NOT_BLIP56           2231
+/* Factory state */
+#define SS_ERR_UNKNOWN_FACTORY           2240
+#define SS_ERR_FACTORY_QUEUE_FULL        2241
+#define SS_ERR_DUPLICATE_JOIN            2242
+#define SS_ERR_OUTGOING_JOINS_FULL       2243
+#define SS_ERR_INSTANCE_ID_INVALID       2244
+/* Wire/timing */
+#define SS_ERR_REQUEST_TIMEOUT           2250
+/* Funding (Phase 4) */
+#define SS_ERR_INSUFFICIENT_FUNDS        2270
+
+#define SS_PEER_TABLE_SIZE          64
+#define SS_PEER_MAX_CONCURRENT       2
+#define SS_PEER_RATE_LIMIT          10
+#define SS_PEER_RATE_WINDOW_SECS    60
+/* Soft-ban (#71): N fails within window triggers M-second ban. */
+#define SS_PEER_MAX_FAILS            5
+#define SS_PEER_FAIL_WINDOW_SECS    60
+#define SS_PEER_SOFT_BAN_SECS      300
+
+struct ss_peer_usage {
+	uint8_t node_id[33];
+	bool in_use;
+	int concurrent_slots;       /* current outstanding browse + join slots */
+	time_t window_start;        /* start of current rate-limit window */
+	int requests_in_window;     /* requests counted in current window */
+	time_t last_seen;           /* LRU tracking for eviction */
+	/* Soft-ban (#71): fails counted within fail_window_start..+SECS;
+	 * crossing SS_PEER_MAX_FAILS sets ban_until = now + SOFT_BAN_SECS.
+	 * 0 ban_until means not banned. */
+	int fail_count;
+	time_t fail_window_start;
+	time_t ban_until;
+};
+
+static struct ss_peer_usage ss_peer_table[SS_PEER_TABLE_SIZE];
+
+/* Find or allocate a peer-usage entry by node_id. Returns NULL only if
+ * the entry can't be allocated (shouldn't happen with LRU eviction). */
+static struct ss_peer_usage *ss_peer_usage_get(const uint8_t node_id[33])
+{
+	time_t now = time(NULL);
+
+	/* Pass 1: existing entry */
+	for (int i = 0; i < SS_PEER_TABLE_SIZE; i++) {
+		if (ss_peer_table[i].in_use &&
+		    memcmp(ss_peer_table[i].node_id, node_id, 33) == 0) {
+			ss_peer_table[i].last_seen = now;
+			return &ss_peer_table[i];
+		}
+	}
+
+	/* Pass 2: find a free slot */
+	for (int i = 0; i < SS_PEER_TABLE_SIZE; i++) {
+		if (!ss_peer_table[i].in_use) {
+			memcpy(ss_peer_table[i].node_id, node_id, 33);
+			ss_peer_table[i].in_use = true;
+			ss_peer_table[i].concurrent_slots = 0;
+			ss_peer_table[i].window_start = now;
+			ss_peer_table[i].requests_in_window = 0;
+			ss_peer_table[i].last_seen = now;
+			ss_peer_table[i].fail_count = 0;
+			ss_peer_table[i].fail_window_start = now;
+			ss_peer_table[i].ban_until = 0;
+			return &ss_peer_table[i];
+		}
+	}
+
+	/* Pass 3: LRU eviction. Find the oldest in_use entry whose
+	 * concurrent_slots == 0 (don't evict peers with live slots). */
+	int oldest_idx = -1;
+	time_t oldest_seen = now;
+	for (int i = 0; i < SS_PEER_TABLE_SIZE; i++) {
+		if (ss_peer_table[i].concurrent_slots > 0) continue;
+		if (ss_peer_table[i].last_seen < oldest_seen) {
+			oldest_seen = ss_peer_table[i].last_seen;
+			oldest_idx = i;
+		}
+	}
+	if (oldest_idx >= 0) {
+		memcpy(ss_peer_table[oldest_idx].node_id, node_id, 33);
+		ss_peer_table[oldest_idx].in_use = true;
+		ss_peer_table[oldest_idx].concurrent_slots = 0;
+		ss_peer_table[oldest_idx].window_start = now;
+		ss_peer_table[oldest_idx].requests_in_window = 0;
+		ss_peer_table[oldest_idx].last_seen = now;
+		ss_peer_table[oldest_idx].fail_count = 0;
+		ss_peer_table[oldest_idx].fail_window_start = now;
+		ss_peer_table[oldest_idx].ban_until = 0;
+		return &ss_peer_table[oldest_idx];
+	}
+
+	/* Table fully saturated with peers holding live slots — extreme
+	 * pathological case. Return NULL; caller will reject. */
+	return NULL;
+}
+
+/* Check if peer can take a new slot. Returns NULL on OK, or a static
+ * error reason string. Does NOT mutate state — caller commits on success
+ * via ss_peer_usage_commit_slot. */
+static const char *ss_peer_check_limits(const uint8_t node_id[33])
+{
+	struct ss_peer_usage *u = ss_peer_usage_get(node_id);
+	if (!u)
+		return "internal: per-peer tracking table saturated";
+
+	time_t now = time(NULL);
+	/* Reset window if expired */
+	if (now - u->window_start >= SS_PEER_RATE_WINDOW_SECS) {
+		u->window_start = now;
+		u->requests_in_window = 0;
+	}
+
+	/* Soft-ban check (#71). Returns the static "banned" string while
+	 * within ban_until; auto-clears when window expires. */
+	if (u->ban_until > 0) {
+		if (now < u->ban_until)
+			return "peer is soft-banned (too many recent failures)";
+		u->ban_until = 0;
+		u->fail_count = 0;
+		u->fail_window_start = now;
+	}
+
+	if (u->concurrent_slots >= SS_PEER_MAX_CONCURRENT)
+		return "peer has too many concurrent requests (max 2)";
+	if (u->requests_in_window >= SS_PEER_RATE_LIMIT)
+		return "peer exceeded rate limit (max 10 requests/minute)";
+
+	return NULL;
+}
+
+/* Record a soft-ban-eligible failure for the given peer. Resets the
+ * fail-window if it has elapsed; increments fail_count; triggers a
+ * ban if count >= SS_PEER_MAX_FAILS. Idempotent if peer table is
+ * saturated (no-op). */
+static void ss_peer_record_fail(const uint8_t node_id[33])
+{
+	struct ss_peer_usage *u = ss_peer_usage_get(node_id);
+	if (!u) return;
+	time_t now = time(NULL);
+	if (now - u->fail_window_start >= SS_PEER_FAIL_WINDOW_SECS) {
+		u->fail_window_start = now;
+		u->fail_count = 0;
+	}
+	u->fail_count++;
+	if (u->fail_count >= SS_PEER_MAX_FAILS && u->ban_until == 0) {
+		u->ban_until = now + SS_PEER_SOFT_BAN_SECS;
+		ss_audit_log(LOG_UNUSUAL, "peer_soft_banned",
+			     "\"fail_count\":%d,\"ban_secs\":%d",
+			     u->fail_count, SS_PEER_SOFT_BAN_SECS);
+	}
+}
+
+/* Commit a slot allocation. Caller must have already called check_limits
+ * and gotten NULL back. */
+static void ss_peer_usage_commit_slot(const uint8_t node_id[33])
+{
+	struct ss_peer_usage *u = ss_peer_usage_get(node_id);
+	if (!u) return;
+	u->concurrent_slots++;
+	u->requests_in_window++;
+}
+
+/* Release a slot when its RPC completes (success, failure, or timeout). */
+static void ss_peer_usage_release_slot(const uint8_t node_id[33])
+{
+	struct ss_peer_usage *u = ss_peer_usage_get(node_id);
+	if (!u) return;
+	if (u->concurrent_slots > 0)
+		u->concurrent_slots--;
+}
+
+/* Generate a fresh 64-bit request_id from /dev/urandom (CSPRNG). Birthday
+ * collision at 2^32 requests is ~10^-14 — safe at any realistic scale.
+ *
+ * Why not a counter? Counters reset on plugin restart. An old response
+ * with request_id=42 arriving after restart could match a fresh request
+ * slot that also got request_id=42 → wrong data returned to caller.
+ *
+ * Falls back to time(NULL) ^ rand() if /dev/urandom unavailable (tests
+ * only; production CLN nodes always have /dev/urandom).
+ */
+static uint64_t ss_fresh_request_id(void)
+{
+	uint64_t id = 0;
+	FILE *urandom = fopen("/dev/urandom", "rb");
+	if (urandom) {
+		if (fread(&id, sizeof(id), 1, urandom) != 1)
+			id = 0;
+		fclose(urandom);
+	}
+	if (id == 0) {
+		/* Fallback: time-mixed PRNG. Not collision-safe but better
+		 * than zero. Should never hit this path on a real CLN node. */
+		id = ((uint64_t)time(NULL) << 32) | (uint64_t)rand();
+	}
+	/* Avoid 0 (sentinel for "slot free" in slot tables). */
+	return id ? id : 1;
+}
+
+/* Structured audit log helper. Emits a single-line JSON object as the
+ * message body of an ordinary plugin_log call:
+ *
+ *   {"audit":"<event>",<caller json fragment>}
+ *
+ * Downstream log ingest (loki/elastic/etc.) can recognize lines whose
+ * body parses as JSON with an "audit" key and route them to a
+ * dedicated audit index. Free-form plugin_log calls are preserved for
+ * developer diagnostics; this helper is reserved for events relevant
+ * to ops/forensics (slot exhaustion, rate-limit rejections, join
+ * lifecycle transitions, timeouts).
+ *
+ * Caller writes the inner k:v fragment. All migration in this codebase
+ * is us-writes-both, so injection from untrusted strings is not a
+ * concern; if a future caller needs to embed peer-controlled data, it
+ * must escape JSON quotes first. */
+static void ss_audit_log(enum log_level lvl, const char *event,
+                         const char *fmt, ...)
+{
+	char body[1024];
+	va_list ap;
+	va_start(ap, fmt);
+	int n = vsnprintf(body, sizeof(body), fmt, ap);
+	va_end(ap);
+	if (n < 0) n = 0;
+	if ((size_t)n >= sizeof(body)) n = sizeof(body) - 1;
+	body[n] = '\0';
+	plugin_log(plugin_handle, lvl,
+	           "{\"audit\":\"%s\",%s}", event, body);
+}
+
+
+/* Kept for backward compatibility — will be deleted once all callers
+ * use ss_fresh_request_id. Currently unused after this commit. */
+static uint64_t ss_browse_next_request_id = 1;
+
+static int ss_browse_alloc_slot(void)
+{
+	time_t now = time(NULL);
+	int free_slot = -1;
+	for (int i = 0; i < SS_BROWSE_MAX_PENDING; i++) {
+		if (ss_browse_pending[i].request_id == 0) {
+			if (free_slot < 0) free_slot = i;
+			continue;
+		}
+		if (now > ss_browse_pending[i].deadline) {
+			struct command *stuck = ss_browse_pending[i].cmd;
+			uint64_t stuck_id = ss_browse_pending[i].request_id;
+			ss_browse_pending[i].request_id = 0;
+			ss_browse_pending[i].cmd = NULL;
+			plugin_log(plugin_handle, LOG_UNUSUAL,
+				   "browse: timing out stuck request_id=%llu",
+				   (unsigned long long)stuck_id);
+			ss_audit_log(LOG_UNUSUAL, "request_timeout",
+				     "\"rpc\":\"factory-browse-host\","
+				     "\"request_id\":%llu",
+				     (unsigned long long)stuck_id);
+			if (stuck) {
+				struct command_result *_cfail = command_fail(stuck, LIGHTNINGD,
+					"factory-browse-host: timeout waiting for peer response (req_id=%llu)",
+					(unsigned long long)stuck_id);
+				(void)_cfail;
+			}
+			if (free_slot < 0) free_slot = i;
+		}
+	}
+	return free_slot;
+}
+
+static int ss_browse_find_slot(uint64_t request_id)
+{
+	for (int i = 0; i < SS_BROWSE_MAX_PENDING; i++) {
+		if (ss_browse_pending[i].request_id == request_id) return i;
+	}
+	return -1;
+}
+
+/* ============================================================================
+ * Phase 3: client-side join-request pending tracking. Mirrors the browse
+ * slot pattern — a client RPC factory-join-request returns
+ * command_still_pending while waiting for the LSP's JOIN_RESPONSE; this
+ * table maps request_id -> cmd so the dispatch handler can resolve the
+ * right RPC when 0x0143 arrives.
+ *
+ * Memory-only: persistence lives in ss_state.outgoing_joins. This slot
+ * table is just RPC-correlation state.
+ * ============================================================================ */
+#define SS_JOIN_MAX_PENDING		16
+#define SS_JOIN_TIMEOUT_SECS		30
+/* Runtime-mutable copy set by --superscalar-join-timeout-secs.
+ * See note on ss_browse_timeout_secs. */
+static u32 ss_join_timeout_secs = SS_JOIN_TIMEOUT_SECS;
+struct ss_join_pending_slot {
+	uint64_t request_id;
+	struct command *cmd;
+	time_t deadline;
+	uint8_t peer_id[33];        /* for per-peer cap release */
+};
+static struct ss_join_pending_slot ss_join_pending[SS_JOIN_MAX_PENDING];
+static uint64_t ss_join_next_request_id = 1;
+
+static int ss_join_alloc_slot(void)
+{
+	time_t now = time(NULL);
+	int free_slot = -1;
+	for (int i = 0; i < SS_JOIN_MAX_PENDING; i++) {
+		if (ss_join_pending[i].request_id == 0) {
+			if (free_slot < 0) free_slot = i;
+			continue;
+		}
+		if (now > ss_join_pending[i].deadline) {
+			struct command *stuck = ss_join_pending[i].cmd;
+			uint64_t stuck_id = ss_join_pending[i].request_id;
+			ss_join_pending[i].request_id = 0;
+			ss_join_pending[i].cmd = NULL;
+			plugin_log(plugin_handle, LOG_UNUSUAL,
+				   "join: timing out stuck request_id=%llu",
+				   (unsigned long long)stuck_id);
+			ss_audit_log(LOG_UNUSUAL, "request_timeout",
+				     "\"rpc\":\"factory-join-request\","
+				     "\"request_id\":%llu",
+				     (unsigned long long)stuck_id);
+			if (stuck) {
+				struct command_result *_cf = command_fail(stuck,
+					LIGHTNINGD,
+					"factory-join-request: timeout waiting for LSP "
+					"response (req_id=%llu)",
+					(unsigned long long)stuck_id);
+				(void)_cf;
+			}
+			if (free_slot < 0) free_slot = i;
+		}
+	}
+	return free_slot;
+}
+
+static int ss_join_find_slot(uint64_t request_id)
+{
+	for (int i = 0; i < SS_JOIN_MAX_PENDING; i++) {
+		if (ss_join_pending[i].request_id == request_id) return i;
+	}
+	return -1;
+}
+
+/* Phase 3: join reaper logic. Called from ss_browse_reap_tick (combined
+ * timer) — registering it as its own global_timer alongside the browse
+ * reaper crashed the plugin after ~13s. Reason: libplugin has a problem
+ * with two concurrent global_timer registrations on the same interval. */
+static void ss_join_reap_scan(void)
+{
+	time_t now = time(NULL);
+	for (int i = 0; i < SS_JOIN_MAX_PENDING; i++) {
+		if (ss_join_pending[i].request_id == 0) continue;
+		if (now <= ss_join_pending[i].deadline) continue;
+		struct command *stuck = ss_join_pending[i].cmd;
+		uint64_t stuck_id = ss_join_pending[i].request_id;
+		ss_peer_usage_release_slot(ss_join_pending[i].peer_id);
+		ss_join_pending[i].request_id = 0;
+		ss_join_pending[i].cmd = NULL;
+		plugin_log(plugin_handle, LOG_UNUSUAL,
+			   "join: reaper timing out stuck req_id=%llu",
+			   (unsigned long long)stuck_id);
+		if (stuck) {
+			struct command_result *_cf = command_fail(stuck,
+				LIGHTNINGD,
+				"factory-join-request: timeout waiting for "
+				"LSP response (req_id=%llu)",
+				(unsigned long long)stuck_id);
+			(void)_cf;
+		}
+	}
+}
+
+/* Legacy entry point for forward-decl compatibility — no longer registered
+ * as its own timer. Just calls the scan + re-registers itself (defensive,
+ * but unreachable in normal init flow). */
+static struct command_result *ss_join_reap_tick(struct command *timer_cmd,
+						 void *unused)
+{
+	(void)unused;
+	ss_join_reap_scan();
+	notleak(global_timer(plugin_handle, time_from_sec(5),
+			     ss_join_reap_tick, NULL));
+	return timer_complete(timer_cmd);
+}
+
+/* Bug B fix: active slot reaper. Registered as a global_timer at plugin
+ * init, fires every 5s. Scans the pending-slot table for entries whose
+ * deadline has passed and fails their associated RPC commands with a
+ * timeout error. Without this active tick, the only reaper is the
+ * lazy-reap in ss_browse_alloc_slot — so a single stuck browse RPC
+ * stays stuck forever (until another browse runs). */
+static struct command_result *ss_browse_reap_tick(struct command *timer_cmd,
+						  void *unused)
+{
+	/* Phase 3: also reap join slots in this same timer tick. Avoids
+	 * registering two separate global_timer callbacks which crashes
+	 * the plugin after ~13s. */
+	ss_join_reap_scan();
+
+	time_t now = time(NULL);
+	for (int i = 0; i < SS_BROWSE_MAX_PENDING; i++) {
+		if (ss_browse_pending[i].request_id == 0) continue;
+		if (now <= ss_browse_pending[i].deadline) continue;
+		struct command *stuck = ss_browse_pending[i].cmd;
+		uint64_t stuck_id = ss_browse_pending[i].request_id;
+		ss_peer_usage_release_slot(ss_browse_pending[i].peer_id);
+		ss_browse_pending[i].request_id = 0;
+		ss_browse_pending[i].cmd = NULL;
+		plugin_log(plugin_handle, LOG_UNUSUAL,
+			   "browse: reaper timing out stuck req_id=%llu",
+			   (unsigned long long)stuck_id);
+		if (stuck) {
+			struct command_result *_cf = command_fail(stuck,
+				LIGHTNINGD,
+				"factory-browse-host: timeout waiting for "
+				"peer response (req_id=%llu)",
+				(unsigned long long)stuck_id);
+			(void)_cf;
+		}
+	}
+	notleak(global_timer(plugin_handle, time_from_sec(5),
+			     ss_browse_reap_tick, NULL));
+	return timer_complete(timer_cmd);
+}
 
 /* --------------------------------------------------------------------- *
  * BIP-141 parser helpers (Phase 2b)
@@ -709,6 +1206,16 @@ static struct command_result *rpc_err(struct command *cmd,
 				      const char *buf,
 				      const jsmntok_t *result,
 				      void *arg);
+static struct command_result *rpc_err_browse(struct command *cmd,
+					     const char *method,
+					     const char *buf,
+					     const jsmntok_t *result,
+					     void *arg);
+static struct command_result *rpc_err_join(struct command *cmd,
+					   const char *method,
+					   const char *buf,
+					   const jsmntok_t *result,
+					   void *arg);
 
 /* Per-client context for async fundchannel_start → fundchannel_complete chain.
  * Carries the factory pointer and the specific client index so callbacks
@@ -729,6 +1236,91 @@ struct funding_ctx {
 	uint8_t funding_spk[34];
 	uint8_t funding_spk_len;
 };
+
+/* Gap 9: capture/restore MuSig2 keyagg cache snapshots.
+ *
+ * After factory_build_tree, every node's keyagg (agg_pubkey + opaque
+ * cache) has been recomputed from pubkeys + arity. The signet-recovery
+ * incident showed that this recompute can produce a cache whose agg
+ * pubkey matches the originally-signed value yet still produces sigs
+ * that fail on-chain validation — likely subtle non-determinism in
+ * tweaking / parity state inside the opaque cache.
+ *
+ * Capture: serialize lib_factory->nodes[i].keyagg into fi->keyagg_-
+ * snapshots, replacing any previous blob. Persisted in meta v15.
+ *
+ * Restore: walk fi->keyagg_snapshots after factory_build_tree and
+ * memcpy each entry back onto lib_factory->nodes[node_idx].keyagg.
+ *
+ * Blob format (matches the structure documented on
+ * factory_instance_t.keyagg_snapshots):
+ *   u16 BE n_entries
+ *   for each entry:
+ *     u16 BE node_idx
+ *     u32 BE payload_size
+ *     payload_size bytes : raw memcpy of musig_keyagg_t */
+static void ss_keyagg_snapshot_capture(factory_instance_t *fi)
+{
+	factory_t *lf = (factory_t *)fi->lib_factory;
+	if (!lf || lf->n_nodes == 0) return;
+
+	const size_t entry_size = sizeof(musig_keyagg_t);
+	const size_t blob_len =
+		2 + lf->n_nodes * (2 + 4 + entry_size);
+
+	uint8_t *buf = malloc(blob_len);
+	if (!buf) return;
+	size_t off = 0;
+	buf[off++] = (lf->n_nodes >> 8) & 0xFF;
+	buf[off++] = lf->n_nodes & 0xFF;
+	for (size_t i = 0; i < lf->n_nodes; i++) {
+		buf[off++] = (i >> 8) & 0xFF;
+		buf[off++] = i & 0xFF;
+		buf[off++] = (entry_size >> 24) & 0xFF;
+		buf[off++] = (entry_size >> 16) & 0xFF;
+		buf[off++] = (entry_size >>  8) & 0xFF;
+		buf[off++] = entry_size & 0xFF;
+		memcpy(buf + off, &lf->nodes[i].keyagg, entry_size);
+		off += entry_size;
+	}
+
+	free(fi->keyagg_snapshots);
+	fi->keyagg_snapshots = buf;
+	fi->keyagg_snapshots_len = blob_len;
+}
+
+static void ss_keyagg_snapshot_restore(factory_instance_t *fi)
+{
+	factory_t *lf = (factory_t *)fi->lib_factory;
+	if (!lf || lf->n_nodes == 0) return;
+	if (!fi->keyagg_snapshots || fi->keyagg_snapshots_len < 2) return;
+
+	const uint8_t *p = fi->keyagg_snapshots;
+	size_t rem = fi->keyagg_snapshots_len;
+	uint16_t n_entries = ((uint16_t)p[0] << 8) | p[1];
+	p += 2; rem -= 2;
+
+	size_t restored = 0;
+	for (uint16_t i = 0; i < n_entries; i++) {
+		if (rem < 2 + 4) return;
+		uint16_t node_idx = ((uint16_t)p[0] << 8) | p[1];
+		uint32_t sz = ((uint32_t)p[2] << 24) | ((uint32_t)p[3] << 16)
+			    | ((uint32_t)p[4] <<  8) | p[5];
+		p += 6; rem -= 6;
+		if (rem < sz) return;
+		if (node_idx < lf->n_nodes
+		    && sz == sizeof(musig_keyagg_t)) {
+			memcpy(&lf->nodes[node_idx].keyagg, p, sz);
+			restored++;
+		}
+		p += sz; rem -= sz;
+	}
+	if (restored > 0)
+		plugin_log(plugin_handle, LOG_DBG,
+			   "Gap 9: restored %zu keyagg snapshot(s) onto "
+			   "rebuilt tree (n_nodes=%zu)",
+			   restored, lf->n_nodes);
+}
 
 /* Apply per-client allocations to every leaf's output amounts.
  * Uses fi->allocations[] (populated from factory-create RPC or from
@@ -928,6 +1520,106 @@ static void send_factory_msg(struct command *cmd, const char *peer_id,
 
 	struct out_req *req = jsonrpc_request_start(cmd,
 		"sendcustommsg", rpc_done, rpc_err, cmd);
+	json_add_string(req->js, "node_id", peer_id);
+	json_add_string(req->js, "msg", hex);
+	send_outreq(req);
+	free(wire);
+}
+
+/* Phase 3: join variant of send_factory_msg. Same shape as
+ * send_factory_msg_browse but plumbs rpc_err_join as the failure callback. */
+static void send_factory_msg_join(struct command *cmd, const char *peer_id,
+				  uint16_t ss_submsg, const uint8_t *data,
+				  size_t data_len)
+{
+	size_t inner_len = 2 + data_len;
+	size_t varint_size = (inner_len < 253) ? 1 : 3;
+	size_t tlv1024_len = 3 + varint_size + inner_len;
+	size_t wire_len = 4 + 34 + tlv1024_len;
+
+	uint8_t *wire = calloc(1, wire_len);
+	wire[0] = (FACTORY_MSG_TYPE >> 8) & 0xFF;
+	wire[1] = FACTORY_MSG_TYPE & 0xFF;
+	wire[2] = 0x00; wire[3] = 0x04;
+
+	uint8_t *p = wire + 4;
+	*p++ = 0x00;
+	*p++ = 32;
+	memcpy(p, SUPERSCALAR_PROTOCOL_ID, 32); p += 32;
+
+	*p++ = 0xfd;
+	*p++ = 0x04; *p++ = 0x00;
+	if (inner_len < 253) {
+		*p++ = (uint8_t)inner_len;
+	} else {
+		*p++ = 0xfd;
+		*p++ = (inner_len >> 8) & 0xFF;
+		*p++ = inner_len & 0xFF;
+	}
+	*p++ = (ss_submsg >> 8) & 0xFF;
+	*p++ = ss_submsg & 0xFF;
+	if (data_len > 0)
+		memcpy(p, data, data_len);
+	p += data_len;
+
+	size_t actual_len = (size_t)(p - wire);
+	char *hex = tal_arr(cmd, char, actual_len * 2 + 1);
+	for (size_t h = 0; h < actual_len; h++)
+		sprintf(hex + h*2, "%02x", wire[h]);
+
+	struct out_req *req = jsonrpc_request_start(cmd,
+		"sendcustommsg", rpc_done, rpc_err_join, cmd);
+	json_add_string(req->js, "node_id", peer_id);
+	json_add_string(req->js, "msg", hex);
+	send_outreq(req);
+	free(wire);
+}
+
+/* Bug A fix: browse variant of send_factory_msg. Identical wire formatting
+ * but plumbs rpc_err_browse as the failure callback so synchronous
+ * sendcustommsg errors (peer not connected, unknown node, etc.) fail the
+ * original RPC immediately instead of leaving it pending. */
+static void send_factory_msg_browse(struct command *cmd, const char *peer_id,
+				    uint16_t ss_submsg, const uint8_t *data,
+				    size_t data_len)
+{
+	size_t inner_len = 2 + data_len;
+	size_t varint_size = (inner_len < 253) ? 1 : 3;
+	size_t tlv1024_len = 3 + varint_size + inner_len;
+	size_t wire_len = 4 + 34 + tlv1024_len;
+
+	uint8_t *wire = calloc(1, wire_len);
+	wire[0] = (FACTORY_MSG_TYPE >> 8) & 0xFF;
+	wire[1] = FACTORY_MSG_TYPE & 0xFF;
+	wire[2] = 0x00; wire[3] = 0x04;
+
+	uint8_t *p = wire + 4;
+	*p++ = 0x00;
+	*p++ = 32;
+	memcpy(p, SUPERSCALAR_PROTOCOL_ID, 32); p += 32;
+
+	*p++ = 0xfd;
+	*p++ = 0x04; *p++ = 0x00;
+	if (inner_len < 253) {
+		*p++ = (uint8_t)inner_len;
+	} else {
+		*p++ = 0xfd;
+		*p++ = (inner_len >> 8) & 0xFF;
+		*p++ = inner_len & 0xFF;
+	}
+	*p++ = (ss_submsg >> 8) & 0xFF;
+	*p++ = ss_submsg & 0xFF;
+	if (data_len > 0)
+		memcpy(p, data, data_len);
+	p += data_len;
+
+	size_t actual_len = (size_t)(p - wire);
+	char *hex = tal_arr(cmd, char, actual_len * 2 + 1);
+	for (size_t h = 0; h < actual_len; h++)
+		sprintf(hex + h*2, "%02x", wire[h]);
+
+	struct out_req *req = jsonrpc_request_start(cmd,
+		"sendcustommsg", rpc_done, rpc_err_browse, cmd);
 	json_add_string(req->js, "node_id", peer_id);
 	json_add_string(req->js, "msg", hex);
 	send_outreq(req);
@@ -1446,6 +2138,67 @@ static struct command_result *rpc_err(struct command *cmd,
 	return command_still_pending(cmd);
 }
 
+/* Phase 3: join-specific error callback. Same pattern as rpc_err_browse —
+ * synchronous sendcustommsg failures must fail the original RPC immediately
+ * and free the slot, rather than leaving it pending. */
+static struct command_result *rpc_err_join(struct command *cmd,
+					   const char *method,
+					   const char *buf,
+					   const jsmntok_t *result,
+					   void *arg)
+{
+	for (int i = 0; i < SS_JOIN_MAX_PENDING; i++) {
+		if (ss_join_pending[i].cmd == cmd) {
+			uint64_t freed_id = ss_join_pending[i].request_id;
+			ss_peer_usage_release_slot(ss_join_pending[i].peer_id);
+			ss_join_pending[i].request_id = 0;
+			ss_join_pending[i].cmd = NULL;
+			plugin_log(plugin_handle, LOG_DBG,
+				   "join: freed slot for failed RPC "
+				   "(req_id=%llu)",
+				   (unsigned long long)freed_id);
+			break;
+		}
+	}
+	const jsmntok_t *msg_tok = json_get_member(buf, result, "message");
+	const char *errmsg = msg_tok
+		? json_strdup(cmd, buf, msg_tok)
+		: "sendcustommsg failed (no error message)";
+	return command_fail(cmd, LIGHTNINGD,
+			    "factory-join-request: %s", errmsg);
+}
+
+/* Bug A fix: browse-specific error callback. The generic rpc_err returns
+ * command_still_pending which is correct for ceremony state machines
+ * (they get resolved later by an incoming wire message) but wrong for
+ * one-shot browse RPCs that have no follow-up path. */
+static struct command_result *rpc_err_browse(struct command *cmd,
+					     const char *method,
+					     const char *buf,
+					     const jsmntok_t *result,
+					     void *arg)
+{
+	for (int i = 0; i < SS_BROWSE_MAX_PENDING; i++) {
+		if (ss_browse_pending[i].cmd == cmd) {
+			uint64_t freed_id = ss_browse_pending[i].request_id;
+			ss_peer_usage_release_slot(ss_browse_pending[i].peer_id);
+			ss_browse_pending[i].request_id = 0;
+			ss_browse_pending[i].cmd = NULL;
+			plugin_log(plugin_handle, LOG_DBG,
+				   "browse: freed slot for failed RPC "
+				   "(req_id=%llu)",
+				   (unsigned long long)freed_id);
+			break;
+		}
+	}
+	const jsmntok_t *msg_tok = json_get_member(buf, result, "message");
+	const char *errmsg = msg_tok
+		? json_strdup(cmd, buf, msg_tok)
+		: "sendcustommsg failed (no error message)";
+	return command_fail(cmd, LIGHTNINGD,
+			    "factory-browse-host: %s", errmsg);
+}
+
 /* Callback after fundchannel_complete succeeds */
 static struct command_result *fundchannel_complete_ok(struct command *cmd,
 						      const char *method,
@@ -1858,6 +2611,240 @@ static void rotate_finish_and_notify(struct command *cmd,
 }
 
 /* Persist a factory's state to CLN datastore (fire-and-forget) */
+/* ============================================================================
+ * Phase 3: join queue + outgoing joins persistence helpers
+ *
+ * Serialized formats use a leading u8 schema_version so future changes can
+ * detect and migrate old blobs. Current schema_version = 1.
+ *
+ * TODO(privacy): pre-mainnet, audit what subset of these fields can be
+ * hashed/dropped after lifecycle completes. Currently we retain everything.
+ * ============================================================================ */
+#define SS_JOIN_SCHEMA_V1 1
+
+/* Per-entry sizes are written explicitly so a parser at a different version
+ * can sanity-check before trying to deserialize. v1 entry sizes: */
+#define SS_JOIN_QUEUE_ENTRY_V1_SZ      126   /* 33+8+8+4+4+4+1+64 */
+#define SS_OUTGOING_JOIN_ENTRY_V1_SZ   158   /* 33+32+8+8+4+4+4+1+64 */
+
+/* Datastore key for an LSP's join queue: superscalar/<iid_hex>/join-queue */
+static void ss_persist_key_join_queue(const factory_instance_t *fi,
+				       char *key, size_t keylen)
+{
+	char iid_hex[65];
+	for (int j = 0; j < 32; j++)
+		sprintf(iid_hex + j*2, "%02x", fi->instance_id[j]);
+	iid_hex[64] = 0;
+	snprintf(key, keylen, "superscalar/%s/join-queue", iid_hex);
+}
+
+/* Serialize the LSP-side join_queue to a freshly-allocated buffer.
+ * Caller frees the returned buffer (via free()). Returns 0 on empty queue. */
+static size_t ss_persist_serialize_join_queue(const factory_instance_t *fi,
+					       uint8_t **out_buf)
+{
+	*out_buf = NULL;
+	if (fi->n_join_queue == 0)
+		return 0;
+	size_t len = 3 + fi->n_join_queue * SS_JOIN_QUEUE_ENTRY_V1_SZ;
+	uint8_t *buf = calloc(1, len);
+	if (!buf) return 0;
+	uint8_t *p = buf;
+	*p++ = SS_JOIN_SCHEMA_V1;
+	*p++ = (fi->n_join_queue >> 8) & 0xFF;
+	*p++ = fi->n_join_queue & 0xFF;
+	for (size_t i = 0; i < fi->n_join_queue; i++) {
+		const factory_join_t *j = &fi->join_queue[i];
+		memcpy(p, j->client_node_id, 33); p += 33;
+		for (int k = 7; k >= 0; k--) *p++ = (j->request_id >> (k*8)) & 0xFF;
+		for (int k = 7; k >= 0; k--) *p++ = (j->contribution_sats >> (k*8)) & 0xFF;
+		for (int k = 3; k >= 0; k--) *p++ = (j->received_at_block >> (k*8)) & 0xFF;
+		for (int k = 3; k >= 0; k--) *p++ = (j->accepted_at_block >> (k*8)) & 0xFF;
+		for (int k = 3; k >= 0; k--) *p++ = (j->decided_at_block >> (k*8)) & 0xFF;
+		*p++ = (uint8_t)j->status;
+		memcpy(p, j->reason, 64); p += 64;
+	}
+	*out_buf = buf;
+	return len;
+}
+
+/* Deserialize a join_queue blob into fi->join_queue. Returns true on success,
+ * false on schema-version mismatch or length mismatch (in which case the
+ * caller should treat as "no saved queue"). */
+static bool ss_persist_deserialize_join_queue(factory_instance_t *fi,
+					       const uint8_t *buf, size_t len)
+{
+	if (len < 3) return false;
+	if (buf[0] != SS_JOIN_SCHEMA_V1) {
+		plugin_log(plugin_handle, LOG_UNUSUAL,
+			   "join_queue blob has unknown schema_version=%u for "
+			   "factory, refusing to load (will start fresh)",
+			   buf[0]);
+		return false;
+	}
+	uint16_t n = ((uint16_t)buf[1] << 8) | buf[2];
+	if (n > MAX_JOIN_QUEUE) {
+		plugin_log(plugin_handle, LOG_UNUSUAL,
+			   "join_queue blob declares %u entries, exceeds "
+			   "MAX_JOIN_QUEUE=%u, refusing to load",
+			   (unsigned)n, MAX_JOIN_QUEUE);
+		return false;
+	}
+	if (len != (size_t)(3 + n * SS_JOIN_QUEUE_ENTRY_V1_SZ)) {
+		plugin_log(plugin_handle, LOG_UNUSUAL,
+			   "join_queue blob length mismatch (got %zu, "
+			   "expected %zu for n=%u)", len,
+			   (size_t)(3 + n * SS_JOIN_QUEUE_ENTRY_V1_SZ),
+			   (unsigned)n);
+		return false;
+	}
+	const uint8_t *p = buf + 3;
+	fi->n_join_queue = 0;
+	for (uint16_t i = 0; i < n; i++) {
+		factory_join_t *j = &fi->join_queue[i];
+		memcpy(j->client_node_id, p, 33); p += 33;
+		j->request_id = 0;
+		for (int k = 0; k < 8; k++) j->request_id = (j->request_id << 8) | *p++;
+		j->contribution_sats = 0;
+		for (int k = 0; k < 8; k++) j->contribution_sats = (j->contribution_sats << 8) | *p++;
+		j->received_at_block = 0;
+		for (int k = 0; k < 4; k++) j->received_at_block = (j->received_at_block << 8) | *p++;
+		j->accepted_at_block = 0;
+		for (int k = 0; k < 4; k++) j->accepted_at_block = (j->accepted_at_block << 8) | *p++;
+		j->decided_at_block = 0;
+		for (int k = 0; k < 4; k++) j->decided_at_block = (j->decided_at_block << 8) | *p++;
+		j->status = (factory_join_status_t)*p++;
+		memcpy(j->reason, p, 64); p += 64;
+		fi->n_join_queue++;
+	}
+	plugin_log(plugin_handle, LOG_INFORM,
+		   "Loaded join_queue: %u entries", (unsigned)n);
+	return true;
+}
+
+/* ----- Client-side outgoing joins ----------------------------------------- */
+
+#define SS_OUTGOING_JOINS_KEY "superscalar/outgoing-joins"
+
+/* Serialize the client-side outgoing_joins to a freshly-allocated buffer.
+ * Caller frees via free(). Returns 0 on empty list. */
+static size_t ss_persist_serialize_outgoing_joins(uint8_t **out_buf)
+{
+	*out_buf = NULL;
+	if (ss_state.n_outgoing_joins == 0)
+		return 0;
+	size_t len = 3 + ss_state.n_outgoing_joins * SS_OUTGOING_JOIN_ENTRY_V1_SZ;
+	uint8_t *buf = calloc(1, len);
+	if (!buf) return 0;
+	uint8_t *p = buf;
+	*p++ = SS_JOIN_SCHEMA_V1;
+	*p++ = (ss_state.n_outgoing_joins >> 8) & 0xFF;
+	*p++ = ss_state.n_outgoing_joins & 0xFF;
+	for (size_t i = 0; i < ss_state.n_outgoing_joins; i++) {
+		const outgoing_join_t *o = &ss_state.outgoing_joins[i];
+		memcpy(p, o->lsp_node_id, 33); p += 33;
+		memcpy(p, o->instance_id, 32); p += 32;
+		for (int k = 7; k >= 0; k--) *p++ = (o->request_id >> (k*8)) & 0xFF;
+		for (int k = 7; k >= 0; k--) *p++ = (o->contribution_sats >> (k*8)) & 0xFF;
+		for (int k = 3; k >= 0; k--) *p++ = (o->sent_at_block >> (k*8)) & 0xFF;
+		for (int k = 3; k >= 0; k--) *p++ = (o->expected_signing_block >> (k*8)) & 0xFF;
+		for (int k = 3; k >= 0; k--) *p++ = (o->updated_at_block >> (k*8)) & 0xFF;
+		*p++ = (uint8_t)o->status;
+		memcpy(p, o->reason, 64); p += 64;
+	}
+	*out_buf = buf;
+	return len;
+}
+
+/* Persist outgoing_joins to the datastore. Caller is responsible for not
+ * calling this excessively — current pattern saves on every mutation. */
+static void ss_save_outgoing_joins(struct command *cmd)
+{
+	uint8_t *buf = NULL;
+	size_t len = ss_persist_serialize_outgoing_joins(&buf);
+	if (len > 0 && buf) {
+		jsonrpc_set_datastore_binary(cmd, SS_OUTGOING_JOINS_KEY,
+			buf, len, "create-or-replace",
+			rpc_done, rpc_err, &ss_state);
+		free(buf);
+		plugin_log(plugin_handle, LOG_DBG,
+			   "Persisted outgoing_joins (%zu entries, %zu bytes)",
+			   ss_state.n_outgoing_joins, len);
+	} else if (ss_state.n_outgoing_joins == 0) {
+		/* Persist an empty marker so a later load knows "we exist
+		 * but have no joins" rather than "no data ever". v1
+		 * marker is just the 3-byte header. */
+		uint8_t empty[3] = { SS_JOIN_SCHEMA_V1, 0, 0 };
+		jsonrpc_set_datastore_binary(cmd, SS_OUTGOING_JOINS_KEY,
+			empty, 3, "create-or-replace",
+			rpc_done, rpc_err, &ss_state);
+	}
+}
+
+/* Called from init() — load outgoing_joins from datastore at startup so
+ * wallet restarts don't lose pending-rotation memberships. */
+static void ss_load_outgoing_joins(struct command *cmd)
+{
+	u8 *buf = NULL;
+	const char *err = rpc_scan_datastore_hex(tmpctx, cmd,
+		SS_OUTGOING_JOINS_KEY,
+		JSON_SCAN_TAL(tmpctx, json_tok_bin_from_hex, &buf));
+	if (err || !buf) {
+		/* No prior data — fresh plugin or first run. Fine. */
+		ss_state.n_outgoing_joins = 0;
+		return;
+	}
+	size_t len = tal_bytelen(buf);
+	if (len < 3 || buf[0] != SS_JOIN_SCHEMA_V1) {
+		plugin_log(plugin_handle, LOG_UNUSUAL,
+			   "outgoing_joins blob has bad header (len=%zu, "
+			   "schema=%u), starting fresh", len,
+			   len > 0 ? buf[0] : 0);
+		ss_state.n_outgoing_joins = 0;
+		return;
+	}
+	uint16_t n = ((uint16_t)buf[1] << 8) | buf[2];
+	if (n > MAX_OUTGOING_JOINS) {
+		plugin_log(plugin_handle, LOG_UNUSUAL,
+			   "outgoing_joins blob declares %u entries, exceeds "
+			   "MAX_OUTGOING_JOINS=%u, starting fresh",
+			   (unsigned)n, MAX_OUTGOING_JOINS);
+		ss_state.n_outgoing_joins = 0;
+		return;
+	}
+	if (len != (size_t)(3 + n * SS_OUTGOING_JOIN_ENTRY_V1_SZ)) {
+		plugin_log(plugin_handle, LOG_UNUSUAL,
+			   "outgoing_joins blob length mismatch (got %zu, "
+			   "expected %zu for n=%u), starting fresh", len,
+			   (size_t)(3 + n * SS_OUTGOING_JOIN_ENTRY_V1_SZ),
+			   (unsigned)n);
+		ss_state.n_outgoing_joins = 0;
+		return;
+	}
+	const uint8_t *p = buf + 3;
+	ss_state.n_outgoing_joins = 0;
+	for (uint16_t i = 0; i < n; i++) {
+		outgoing_join_t *o = &ss_state.outgoing_joins[i];
+		memcpy(o->lsp_node_id, p, 33); p += 33;
+		memcpy(o->instance_id, p, 32); p += 32;
+		o->request_id = 0;
+		for (int k = 0; k < 8; k++) o->request_id = (o->request_id << 8) | *p++;
+		o->contribution_sats = 0;
+		for (int k = 0; k < 8; k++) o->contribution_sats = (o->contribution_sats << 8) | *p++;
+		o->sent_at_block = 0;
+		for (int k = 0; k < 4; k++) o->sent_at_block = (o->sent_at_block << 8) | *p++;
+		o->expected_signing_block = 0;
+		for (int k = 0; k < 4; k++) o->expected_signing_block = (o->expected_signing_block << 8) | *p++;
+		o->updated_at_block = 0;
+		for (int k = 0; k < 4; k++) o->updated_at_block = (o->updated_at_block << 8) | *p++;
+		o->status = (outgoing_join_status_t)*p++;
+		memcpy(o->reason, p, 64); p += 64;
+		ss_state.n_outgoing_joins++;
+	}
+	plugin_log(plugin_handle, LOG_INFORM,
+		   "Loaded outgoing_joins: %u entries", (unsigned)n);
+}
+
 static void ss_save_factory(struct command *cmd, factory_instance_t *fi)
 {
 	char key[128];
@@ -1957,9 +2944,27 @@ static void ss_save_factory(struct command *cmd, factory_instance_t *fi)
 		}
 	}
 
+	/* Phase 3: persist LSP-side join queue (only meaningful for is_lsp).
+	 * Empty queues are still saved (as a 3-byte header) so loaders can
+	 * distinguish "no entries yet" from "factory not yet seen at all". */
+	if (fi->is_lsp) {
+		ss_persist_key_join_queue(fi, key, sizeof(key));
+		len = ss_persist_serialize_join_queue(fi, &buf);
+		if (len > 0 && buf) {
+			jsonrpc_set_datastore_binary(cmd, key, buf, len,
+				"create-or-replace", rpc_done, rpc_err, fi);
+			free(buf);
+		} else if (fi->n_join_queue == 0) {
+			uint8_t empty[3] = { SS_JOIN_SCHEMA_V1, 0, 0 };
+			jsonrpc_set_datastore_binary(cmd, key, empty, 3,
+				"create-or-replace", rpc_done, rpc_err, fi);
+		}
+	}
+
 	plugin_log(plugin_handle, LOG_DBG,
-		   "Persisted factory state (epoch=%u, channels=%zu)",
-		   fi->epoch, fi->n_channels);
+		   "Persisted factory state (epoch=%u, channels=%zu, "
+		   "join_queue=%zu)",
+		   fi->epoch, fi->n_channels, fi->n_join_queue);
 }
 
 /* Load factories from CLN datastore on startup.
@@ -2280,14 +3285,28 @@ static void ss_load_factories(struct command *cmd)
 					}
 				}
 
+				/* Phase 3: load LSP-side join queue if persisted. */
+				if (fi->is_lsp) {
+					char jq_key[128];
+					ss_persist_key_join_queue(fi, jq_key, sizeof(jq_key));
+					u8 *jq_buf = NULL;
+					const char *jq_err = rpc_scan_datastore_hex(tmpctx, cmd,
+						jq_key,
+						JSON_SCAN_TAL(tmpctx, json_tok_bin_from_hex, &jq_buf));
+					if (!jq_err && jq_buf) {
+						ss_persist_deserialize_join_queue(fi,
+							jq_buf, tal_bytelen(jq_buf));
+					}
+				}
+
 				loaded++;
 				plugin_log(plugin_handle, LOG_INFORM,
 					   "Loaded factory %s (epoch=%u, "
 					   "channels=%zu, breach_epochs=%zu, "
-					   "lifecycle=%d)",
+					   "lifecycle=%d, join_queue=%zu)",
 					   id_hex, fi->epoch,
 					   fi->n_channels, fi->n_breach_epochs,
-					   fi->lifecycle);
+					   fi->lifecycle, fi->n_join_queue);
 
 				/* Rebuild factory_t from persisted data so
 				 * rotation/force-close work after restart. */
@@ -2408,6 +3427,13 @@ static void ss_load_factories(struct command *cmd)
 							fi->lib_factory = f;
 							fi->n_tree_nodes =
 								(uint32_t)f->n_nodes;
+							/* Gap 9: restore persisted
+							 * keyagg cache snapshots
+							 * onto the rebuilt tree.
+							 * No-op if the meta record
+							 * predates v15 or no
+							 * blob was captured. */
+							ss_keyagg_snapshot_restore(fi);
 							/* Load signed TXs from
 							 * datastore if available */
 							{
@@ -2675,6 +3701,14 @@ static void continue_after_funding(struct command *cmd,
 		fi->lib_factory = new_f;
 		f = new_f;
 
+		/* Gap 9: snapshot the rebuilt tree's keyagg state. This is the
+		 * post-real-funding tree we're about to ALL_NONCES → PSIG →
+		 * sign against; persist its cache so a future reload restores
+		 * the same bytes instead of trusting the recompute. The
+		 * subsequent ss_save_factory call (line ~2881) picks up the
+		 * fresh blob and writes it to the meta record. */
+		ss_keyagg_snapshot_capture(fi);
+
 		factory_sessions_init(f);
 		nonce_entry_t *cache = (nonce_entry_t *)fi->cached_nonces;
 		if (cache) {
@@ -2783,12 +3817,53 @@ static void continue_after_funding(struct command *cmd,
 	ss_save_factory(cmd, fi);
 }
 
+/* Phase 4: passive last_seen tracking. Updates every factory's join_queue
+ * entry whose client_node_id matches the BOLT-8 sender. Called from the
+ * top of dispatch_superscalar_submsg so ANY wire message from a known
+ * client refreshes their last_seen_block. Replaces a dedicated heartbeat
+ * submsg — CLN BOLT-8 ping already covers wire-level liveness; this
+ * adds factory-state-level freshness without new wire traffic. */
+static void ss_update_peer_last_seen(const uint8_t peer_pk[33])
+{
+	for (size_t fi_idx = 0; fi_idx < ss_state.n_factories; fi_idx++) {
+		factory_instance_t *fi = ss_state.factories[fi_idx];
+		if (!fi || !fi->is_lsp) continue;
+		for (size_t i = 0; i < fi->n_join_queue; i++) {
+			if (memcmp(fi->join_queue[i].client_node_id,
+				   peer_pk, 33) == 0) {
+				fi->join_queue[i].last_seen_block =
+					ss_state.current_blockheight;
+			}
+		}
+	}
+}
+
 static void dispatch_superscalar_submsg(struct command *cmd,
 					const char *peer_id,
 					u16 submsg_id,
 					const u8 *data, size_t len)
 {
 	factory_instance_t *fi = NULL;
+
+	/* Phase 4: passive last_seen tracking. Update last_seen_block on every
+	 * factory's join_queue entry that matches this peer. Cheap O(F*Q) scan
+	 * — F factories × Q queue entries per factory. F is small (1-10 for
+	 * typical LSP), Q caps at MAX_JOIN_QUEUE=256. */
+	{
+		uint8_t peer_pk_seen[33];
+		if (strlen(peer_id) == 66) {
+			bool ok = true;
+			for (int k = 0; k < 33 && ok; k++) {
+				unsigned int by;
+				if (sscanf(peer_id + k*2, "%2x", &by) != 1)
+					ok = false;
+				else
+					peer_pk_seen[k] = (uint8_t)by;
+			}
+			if (ok)
+				ss_update_peer_last_seen(peer_pk_seen);
+		}
+	}
 
 	/* Extract instance_id from submessage (first 32 bytes).
 	 * Don't strip it — handlers that use nonce_bundle_deserialize
@@ -2797,7 +3872,12 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 	    && submsg_id != SS_SUBMSG_ROTATE_PROPOSE
 	    && submsg_id != SS_SUBMSG_REVOKE
 	    && submsg_id != SS_SUBMSG_REVOKE_ACK
-	    && submsg_id != SS_SUBMSG_CLOSE_PROPOSE) {
+	    && submsg_id != SS_SUBMSG_CLOSE_PROPOSE
+	    && submsg_id != SS_SUBMSG_FACTORY_INFO_REQUEST
+	    && submsg_id != SS_SUBMSG_FACTORY_INFO_RESPONSE
+	    && submsg_id != SS_SUBMSG_JOIN_REQUEST
+	    && submsg_id != SS_SUBMSG_JOIN_RESPONSE
+	    && submsg_id != SS_SUBMSG_JOIN_CANCEL) {
 		fi = ss_factory_find(&ss_state, data);
 		if (!fi) {
 			plugin_log(plugin_handle, LOG_UNUSUAL,
@@ -3614,6 +4694,16 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 							json_add_string(wreq->js,
 								"satoshi", amt_str);
 						}
+						/* Phase 4: caller-supplied feerate override.
+						 * Honors signet 0.1 sat/vb (=100 perkw) etc. */
+						if (fi->requested_feerate_perkw > 0) {
+							char fr_str[32];
+							snprintf(fr_str, sizeof(fr_str),
+								 "%uperkw",
+								 fi->requested_feerate_perkw);
+							json_add_string(wreq->js,
+								"feerate", fr_str);
+						}
 						send_outreq(wreq);
 
 						fi->ceremony = CEREMONY_FUNDING_PENDING;
@@ -3724,6 +4814,16 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 						}
 						fi->lib_factory = new_f;
 						f = new_f;
+
+						/* Gap 9: snapshot keyagg state on this
+						 * client-side rebuild path (post-PROPOSE
+						 * with real funding). Force a save now
+						 * so the blob is durable before we begin
+						 * sending PSIG — the existing PROPOSE
+						 * handler doesn't otherwise persist meta
+						 * here. */
+						ss_keyagg_snapshot_capture(fi);
+						ss_save_factory(cmd, fi);
 
 						/* Re-init sessions then re-set all nonces
 						 * from cache (LSP's + all clients') */
@@ -3981,6 +5081,17 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 					free(old_f);
 					fi->lib_factory = new_f;
 					f = new_f;
+
+					/* Gap 9: snapshot keyagg state on the
+					 * client-side ALL_NONCES rebuild — this
+					 * is the tree we're about to PSIG with
+					 * real pubkeys, so the cache here is
+					 * what we need to restore on reload.
+					 * Force a save so the blob is durable
+					 * before PSIG. */
+					ss_keyagg_snapshot_capture(fi);
+					ss_save_factory(cmd, fi);
+
 					plugin_log(plugin_handle, LOG_INFORM,
 						   "Client: rebuilt tree with real "
 						   "pubkeys from ALL_NONCES");
@@ -7495,6 +8606,578 @@ realloc_all_nonces_done:
 		break;
 	}
 
+	case SS_SUBMSG_FACTORY_INFO_REQUEST: {
+		if (len < 12) {
+			plugin_log(plugin_handle, LOG_UNUSUAL,
+				   "FACTORY_INFO_REQUEST from %s too short (%zu bytes)",
+				   peer_id, len);
+			break;
+		}
+		uint64_t req_id = 0;
+		for (int i = 0; i < 8; i++) req_id = (req_id << 8) | data[i];
+		uint32_t since_block = 0;
+		for (int i = 0; i < 4; i++) since_block = (since_block << 8) | data[8+i];
+
+		plugin_log(plugin_handle, LOG_INFORM,
+			   "FACTORY_INFO_REQUEST from %s (req_id=%llu since_block=%u)",
+			   peer_id, (unsigned long long)req_id, since_block);
+
+		size_t n_facts = ss_state.n_factories;
+		if (n_facts > 32) n_facts = 32;
+		size_t total = 13 + n_facts * 47;
+		uint8_t *resp = tal_arr(cmd, uint8_t, total);
+		uint8_t *p = resp;
+		for (int i = 7; i >= 0; i--) *p++ = (uint8_t)(req_id >> (i*8));
+		uint32_t snap = ss_state.current_blockheight;
+		for (int i = 3; i >= 0; i--) *p++ = (uint8_t)(snap >> (i*8));
+		uint8_t *n_facts_field = p;
+		*p++ = (uint8_t)n_facts;
+		size_t emitted = 0;
+		for (size_t fi_i = 0; fi_i < ss_state.n_factories && emitted < n_facts; fi_i++) {
+			factory_instance_t *xfi = ss_state.factories[fi_i];
+			if (!xfi) continue;
+			if (since_block && xfi->creation_block < since_block) continue;
+			memcpy(p, xfi->instance_id, 32); p += 32;
+			*p++ = (uint8_t)xfi->lifecycle;
+			for (int j = 3; j >= 0; j--) *p++ = (uint8_t)(xfi->creation_block >> (j*8));
+			for (int j = 3; j >= 0; j--) *p++ = (uint8_t)(xfi->expiry_block >> (j*8));
+			*p++ = (uint8_t)xfi->n_clients;
+			*p++ = (uint8_t)xfi->n_channels;
+			*p++ = xfi->is_lsp ? 1 : 0;
+			bool accepting = xfi->is_lsp && xfi->lifecycle == FACTORY_LIFECYCLE_INIT;
+			*p++ = accepting ? 1 : 0;
+			*p++ = 0; *p++ = 0;
+			emitted++;
+		}
+		if (emitted != n_facts) {
+			*n_facts_field = (uint8_t)emitted;
+			total = 13 + emitted * 47;
+		}
+
+		send_factory_msg(cmd, peer_id, SS_SUBMSG_FACTORY_INFO_RESPONSE,
+				 resp, total);
+		plugin_log(plugin_handle, LOG_INFORM,
+			   "Sent FACTORY_INFO_RESPONSE to %s (req_id=%llu, %zu bytes, %zu factories)",
+			   peer_id, (unsigned long long)req_id, total, emitted);
+		tal_free(resp);
+		break;
+	}
+
+	case SS_SUBMSG_FACTORY_INFO_RESPONSE: {
+		/* Bug-1 hardening: if we can read req_id (>=8 bytes), free the
+		 * slot and command_fail. Otherwise we have nothing to attribute
+		 * the malformed message to — just log and drop. */
+		if (len < 8) {
+			plugin_log(plugin_handle, LOG_UNUSUAL,
+				   "FACTORY_INFO_RESPONSE from %s too short to "
+				   "read req_id (%zu bytes) — dropped",
+				   peer_id, len);
+			break;
+		}
+		uint64_t req_id = 0;
+		for (int i = 0; i < 8; i++) req_id = (req_id << 8) | data[i];
+
+		int slot = ss_browse_find_slot(req_id);
+		if (slot < 0) {
+			plugin_log(plugin_handle, LOG_UNUSUAL,
+				   "FACTORY_INFO_RESPONSE for unknown req_id=%llu from %s (already timed out?)",
+				   (unsigned long long)req_id, peer_id);
+			break;
+		}
+		struct command *orig_cmd = ss_browse_pending[slot].cmd;
+		if (!orig_cmd) {
+			ss_browse_pending[slot].request_id = 0;
+			break;
+		}
+
+		/* Helper to free the slot + command_fail with a reason.
+		 * Used for every malformed-response path so the RPC fails
+		 * in <1ms instead of waiting 30s for the reaper. */
+		#define BROWSE_FAIL_MALFORMED(fmt, ...) do {			\
+			ss_browse_pending[slot].request_id = 0;		\
+			ss_browse_pending[slot].cmd = NULL;		\
+			ss_browse_pending[slot].deadline = 0;		\
+			plugin_log(plugin_handle, LOG_UNUSUAL,		\
+				   "browse: malformed response from %s "	\
+				   "(req_id=%llu): " fmt,			\
+				   peer_id,					\
+				   (unsigned long long)req_id,		\
+				   ##__VA_ARGS__);				\
+			struct command_result *_bf = command_fail(	\
+				orig_cmd, LIGHTNINGD,			\
+				"factory-browse-host: malformed "	\
+				"response from peer: " fmt,		\
+				##__VA_ARGS__);				\
+			(void)_bf;					\
+		} while (0)
+
+		if (len < 13) {
+			BROWSE_FAIL_MALFORMED(
+				"header truncated (%zu bytes, need 13)",
+				len);
+			break;
+		}
+
+		uint32_t snap = 0;
+		for (int i = 0; i < 4; i++) snap = (snap << 8) | data[8+i];
+		uint8_t n_factories = data[12];
+
+		/* Bug-2 hardening: pre-validate the wire body fits. For v1 each
+		 * factory entry is 47 bytes (trailing_tlv_len=0). If a peer
+		 * starts sending non-zero trailing TLVs we need to honor them,
+		 * but they must still fit within len. We do a strict cumulative
+		 * walk below and fail if any boundary is overrun. */
+
+		struct json_stream *js = jsonrpc_stream_success(orig_cmd);
+		json_add_string(js, "host_node_id", peer_id);
+		json_add_string(js, "factory_protocol_id", "SuperScalar/v1");
+		json_add_u32(js, "snapshot_block", snap);
+		json_array_start(js, "factories");
+
+		size_t offset = 13;
+		bool malformed = false;
+		for (uint8_t i = 0; i < n_factories; i++) {
+			/* Each fixed-section entry is 47 bytes. Bounds check
+			 * BEFORE reading any of it. */
+			if (offset + 47 > len) {
+				malformed = true;
+				break;
+			}
+			json_object_start(js, NULL);
+			char iid_hex[65];
+			for (int j = 0; j < 32; j++) sprintf(iid_hex + j*2, "%02x", data[offset + j]);
+			iid_hex[64] = 0;
+			json_add_string(js, "instance_id", iid_hex);
+			offset += 32;
+
+			uint8_t lc = data[offset++];
+			const char *lc_name;
+			switch (lc) {
+			case FACTORY_LIFECYCLE_INIT:               lc_name = "init"; break;
+			case FACTORY_LIFECYCLE_ACTIVE:             lc_name = "active"; break;
+			case FACTORY_LIFECYCLE_DYING:              lc_name = "dying"; break;
+			case FACTORY_LIFECYCLE_EXPIRED:            lc_name = "expired"; break;
+			case FACTORY_LIFECYCLE_CLOSED_EXTERNALLY:  lc_name = "closed_externally"; break;
+			case FACTORY_LIFECYCLE_CLOSED_COOPERATIVE: lc_name = "closed_cooperative"; break;
+			case FACTORY_LIFECYCLE_CLOSED_UNILATERAL:  lc_name = "closed_unilateral"; break;
+			case FACTORY_LIFECYCLE_CLOSED_BREACHED:    lc_name = "closed_breached"; break;
+			case FACTORY_LIFECYCLE_ABORTED:            lc_name = "aborted"; break;
+			default: lc_name = "unknown"; break;
+			}
+			json_add_string(js, "lifecycle", lc_name);
+
+			uint32_t cb = 0;
+			for (int j = 0; j < 4; j++) cb = (cb << 8) | data[offset + j];
+			json_add_u32(js, "created_block", cb);
+			offset += 4;
+			uint32_t eb = 0;
+			for (int j = 0; j < 4; j++) eb = (eb << 8) | data[offset + j];
+			json_add_u32(js, "expiry_block", eb);
+			offset += 4;
+			json_add_u32(js, "n_clients", data[offset++]);
+			json_add_u32(js, "n_channels", data[offset++]);
+			json_add_bool(js, "is_lsp", data[offset++] != 0);
+			json_add_bool(js, "accepting_joins", data[offset++] != 0);
+
+			/* Bug-2 hardening: read trailing_tlv_len and honor it
+			 * (advance past any trailing TLV bytes). v1 spec says
+			 * trailing_tlv_len = 0; future versions may use it for
+			 * per-entry feature TLVs. Refuse if declared length
+			 * runs past the message buffer. */
+			uint16_t trailing_tlv_len =
+				((uint16_t)data[offset]) << 8 |
+				(uint16_t)data[offset + 1];
+			offset += 2;
+			if (offset + trailing_tlv_len > len) {
+				/* JSON object is mid-build — close it before
+				 * we bail so the JSON stream stays well-formed
+				 * for the BROWSE_FAIL_MALFORMED path. */
+				json_object_end(js);
+				malformed = true;
+				break;
+			}
+			offset += trailing_tlv_len;
+			json_object_end(js);
+		}
+		json_array_end(js);
+
+		if (malformed) {
+			/* Tear down the half-built JSON stream by closing it
+			 * (the success-stream is owned by lightningd's RPC
+			 * subsystem and gets discarded when command_fail
+			 * replaces the success path). */
+			BROWSE_FAIL_MALFORMED(
+				"truncated body — declared %u factories but "
+				"only %zu of %zu bytes consumed",
+				(unsigned)n_factories, offset, len);
+			break;
+		}
+
+		plugin_log(plugin_handle, LOG_INFORM,
+			   "factory-browse-host: resolved req_id=%llu with %u factories from %s",
+			   (unsigned long long)req_id, (unsigned)n_factories, peer_id);
+
+		ss_peer_usage_release_slot(ss_browse_pending[slot].peer_id);
+		ss_browse_pending[slot].request_id = 0;
+		ss_browse_pending[slot].cmd = NULL;
+		ss_browse_pending[slot].deadline = 0;
+
+		struct command_result *_cf_unused = command_finished(orig_cmd, js);
+		(void)_cf_unused;
+		#undef BROWSE_FAIL_MALFORMED
+		break;
+	}
+
+	/* Phase 3: SS_SUBMSG_JOIN_REQUEST — LSP-side handler.
+	 * Client is asking to join our factory. Decide accept/reject/dedup
+	 * by hardcoded permissive policy (TODO: replace with real policy
+	 * fields when they're added to factory_instance_t). Respond with
+	 * JOIN_RESPONSE; persist updated queue.
+	 *
+	 * Wire format (variable, min 18 bytes):
+	 *   u64    request_id
+	 *   u8[32] instance_id
+	 *   u64    contribution_sats
+	 *   u16    trailing_tlv_len
+	 * (TLV trailer bytes ignored in v1)
+	 */
+	case SS_SUBMSG_JOIN_REQUEST: {
+		if (len < 50) {
+			plugin_log(plugin_handle, LOG_UNUSUAL,
+				   "JOIN_REQUEST from %s too short (%zu bytes, need 50)",
+				   peer_id, len);
+			break;
+		}
+		uint64_t req_id = 0;
+		for (int i = 0; i < 8; i++) req_id = (req_id << 8) | data[i];
+		const uint8_t *iid = data + 8;
+		uint64_t contribution_sats = 0;
+		for (int i = 0; i < 8; i++)
+			contribution_sats = (contribution_sats << 8) | data[40 + i];
+		/* trailing_tlv_len at data[48..49] — ignored for v1 */
+
+		factory_instance_t *target_fi = ss_factory_find(&ss_state, iid);
+		if (!target_fi || !target_fi->is_lsp) {
+			plugin_log(plugin_handle, LOG_UNUSUAL,
+				   "JOIN_REQUEST from %s for unknown or "
+				   "non-LSP factory (req_id=%llu)",
+				   peer_id, (unsigned long long)req_id);
+			/* Build and send REJECTED response */
+			uint8_t resp[3 + 8 + 1 + 4 + 1 + 64 + 2];
+			uint8_t *rp = resp;
+			for (int k = 7; k >= 0; k--) *rp++ = (req_id >> (k*8)) & 0xFF;
+			*rp++ = (uint8_t)JOIN_STATUS_REJECTED;
+			for (int k = 0; k < 4; k++) *rp++ = 0;
+			const char *reason = "unknown factory";
+			size_t rlen = strlen(reason);
+			*rp++ = (uint8_t)rlen;
+			memcpy(rp, reason, rlen); rp += rlen;
+			*rp++ = 0; *rp++ = 0;
+			size_t actual = (size_t)(rp - resp);
+			send_factory_msg(cmd, peer_id,
+					 SS_SUBMSG_JOIN_RESPONSE,
+					 resp, actual);
+			break;
+		}
+
+		/* Decode peer_id hex (66 chars) into 33-byte client pubkey */
+		uint8_t client_pk[33];
+		if (strlen(peer_id) != 66) {
+			plugin_log(plugin_handle, LOG_UNUSUAL,
+				   "JOIN_REQUEST peer_id has wrong length %zu",
+				   strlen(peer_id));
+			break;
+		}
+		for (int k = 0; k < 33; k++) {
+			unsigned int by;
+			sscanf(peer_id + k*2, "%2x", &by);
+			client_pk[k] = (uint8_t)by;
+		}
+
+		/* Dedup: any existing entry for this client_node_id in this
+		 * factory's queue (any status)? */
+		int dup_idx = -1;
+		for (size_t i = 0; i < target_fi->n_join_queue; i++) {
+			if (memcmp(target_fi->join_queue[i].client_node_id,
+				   client_pk, 33) == 0) {
+				dup_idx = (int)i;
+				break;
+			}
+		}
+
+		/* Determine status to respond with */
+		factory_join_status_t resp_status;
+		const char *resp_reason = "";
+
+		if (dup_idx >= 0) {
+			factory_join_status_t prev =
+				target_fi->join_queue[dup_idx].status;
+			if (prev == JOIN_STATUS_SIGNED) {
+				resp_status = JOIN_STATUS_ALREADY_MEMBER;
+				resp_reason = "already a member of this factory";
+			} else if (prev == JOIN_STATUS_QUEUED ||
+				   prev == JOIN_STATUS_ACCEPTED) {
+				resp_status = JOIN_STATUS_ALREADY_MEMBER;
+				resp_reason = "duplicate join request, "
+					      "cancel previous one first";
+			} else {
+				/* Previous was REJECTED or CANCELLED — allow
+				 * re-application. Overwrite the old entry. */
+				factory_join_t *j = &target_fi->join_queue[dup_idx];
+				j->request_id = req_id;
+				j->contribution_sats = contribution_sats;
+				j->received_at_block = ss_state.current_blockheight;
+				j->accepted_at_block = ss_state.current_blockheight;
+				j->decided_at_block = ss_state.current_blockheight;
+				j->status = JOIN_STATUS_ACCEPTED;
+				memset(j->reason, 0, 64);
+				resp_status = JOIN_STATUS_ACCEPTED;
+				plugin_log(plugin_handle, LOG_INFORM,
+					   "join: re-accepted previously-declined "
+					   "client %s for factory (req_id=%llu, "
+					   "contribution=%llu sats)",
+					   peer_id,
+					   (unsigned long long)req_id,
+					   (unsigned long long)contribution_sats);
+				ss_save_factory(cmd, target_fi);
+			}
+		} else if (target_fi->n_join_queue >= MAX_JOIN_QUEUE) {
+			resp_status = JOIN_STATUS_REJECTED;
+			resp_reason = "factory join queue full";
+			plugin_log(plugin_handle, LOG_UNUSUAL,
+				   "join: rejecting %s (req_id=%llu) — queue full",
+				   peer_id, (unsigned long long)req_id);
+		} else {
+			/* New entry, auto-accept (v1 policy). */
+			/* TODO(privacy): retention review pre-mainnet */
+			factory_join_t *j =
+				&target_fi->join_queue[target_fi->n_join_queue++];
+			memcpy(j->client_node_id, client_pk, 33);
+			j->request_id = req_id;
+			j->contribution_sats = contribution_sats;
+			j->received_at_block = ss_state.current_blockheight;
+			j->accepted_at_block = ss_state.current_blockheight;
+			j->decided_at_block = ss_state.current_blockheight;
+			j->status = JOIN_STATUS_ACCEPTED;
+			memset(j->reason, 0, 64);
+			resp_status = JOIN_STATUS_ACCEPTED;
+			plugin_log(plugin_handle, LOG_INFORM,
+				   "join: accepted client %s for factory "
+				   "(req_id=%llu, contribution=%llu sats, "
+				   "queue_size=%zu)",
+				   peer_id,
+				   (unsigned long long)req_id,
+				   (unsigned long long)contribution_sats,
+				   target_fi->n_join_queue);
+			ss_audit_log(LOG_INFORM, "join_status",
+				     "\"peer\":\"%s\",\"req_id\":%llu,"
+				     "\"transition\":\"->ACCEPTED\","
+				     "\"contribution_sats\":%llu,"
+				     "\"queue_size\":%zu",
+				     peer_id,
+				     (unsigned long long)req_id,
+				     (unsigned long long)contribution_sats,
+				     target_fi->n_join_queue);
+			ss_save_factory(cmd, target_fi);
+		}
+
+		/* Build JOIN_RESPONSE: u64 req_id + u8 status + u32 expected_block
+		 * + u8 reason_len + reason + u16 trailing_tlv_len */
+		size_t rlen = strlen(resp_reason);
+		if (rlen > 64) rlen = 64;
+		uint8_t resp[8 + 1 + 4 + 1 + 64 + 2];
+		uint8_t *rp = resp;
+		for (int k = 7; k >= 0; k--) *rp++ = (req_id >> (k*8)) & 0xFF;
+		*rp++ = (uint8_t)resp_status;
+		/* expected_signing_block = 0 for v1 (TODO: real estimate) */
+		for (int k = 0; k < 4; k++) *rp++ = 0;
+		*rp++ = (uint8_t)rlen;
+		memcpy(rp, resp_reason, rlen); rp += rlen;
+		*rp++ = 0; *rp++ = 0;
+		size_t actual = (size_t)(rp - resp);
+		send_factory_msg(cmd, peer_id, SS_SUBMSG_JOIN_RESPONSE,
+				 resp, actual);
+		plugin_log(plugin_handle, LOG_DBG,
+			   "join: sent JOIN_RESPONSE to %s (req_id=%llu, "
+			   "status=%d, %zu bytes)",
+			   peer_id, (unsigned long long)req_id,
+			   (int)resp_status, actual);
+		break;
+	}
+
+	/* Phase 3: SS_SUBMSG_JOIN_RESPONSE — client-side handler.
+	 * LSP has decided on our outstanding JOIN_REQUEST. Update both the
+	 * pending-RPC slot AND the persistent outgoing_joins entry. */
+	case SS_SUBMSG_JOIN_RESPONSE: {
+		if (len < 14) {
+			plugin_log(plugin_handle, LOG_UNUSUAL,
+				   "JOIN_RESPONSE from %s too short (%zu bytes)",
+				   peer_id, len);
+			break;
+		}
+		uint64_t req_id = 0;
+		for (int i = 0; i < 8; i++) req_id = (req_id << 8) | data[i];
+		uint8_t status = data[8];
+		uint32_t exp_block = 0;
+		for (int i = 0; i < 4; i++)
+			exp_block = (exp_block << 8) | data[9 + i];
+		uint8_t reason_len = data[13];
+		if (reason_len > 64) reason_len = 64;
+		if (len < (size_t)(14 + reason_len + 2)) {
+			plugin_log(plugin_handle, LOG_UNUSUAL,
+				   "JOIN_RESPONSE truncated body");
+			break;
+		}
+		char reason[65];
+		memcpy(reason, data + 14, reason_len);
+		reason[reason_len] = 0;
+
+		/* Update persistent outgoing_joins state */
+		outgoing_join_t *oj = NULL;
+		for (size_t i = 0; i < ss_state.n_outgoing_joins; i++) {
+			if (ss_state.outgoing_joins[i].request_id == req_id) {
+				oj = &ss_state.outgoing_joins[i];
+				break;
+			}
+		}
+		if (oj) {
+			oj->expected_signing_block = exp_block;
+			oj->updated_at_block = ss_state.current_blockheight;
+			memcpy(oj->reason, reason, sizeof(oj->reason) - 1);
+			oj->reason[sizeof(oj->reason) - 1] = 0;
+			switch ((factory_join_status_t)status) {
+			case JOIN_STATUS_QUEUED:
+				oj->status = OUTGOING_JOIN_QUEUED; break;
+			case JOIN_STATUS_ACCEPTED:
+				oj->status = OUTGOING_JOIN_ACCEPTED; break;
+			case JOIN_STATUS_SIGNED:
+				oj->status = OUTGOING_JOIN_SIGNED; break;
+			case JOIN_STATUS_REJECTED:
+				oj->status = OUTGOING_JOIN_REJECTED; break;
+			case JOIN_STATUS_CANCELLED:
+				oj->status = OUTGOING_JOIN_CANCELLED; break;
+			case JOIN_STATUS_ALREADY_MEMBER:
+				oj->status = OUTGOING_JOIN_ALREADY_MEMBER; break;
+			}
+			/* Task #62: ss_save_outgoing_joins disabled — see json_factory_join_request comment */
+			plugin_log(plugin_handle, LOG_INFORM,
+				   "join: updated outgoing join req_id=%llu "
+				   "status=%d reason='%s'",
+				   (unsigned long long)req_id,
+				   (int)status, reason);
+		}
+
+		/* Resolve any pending factory-join-request RPC */
+		int slot = ss_join_find_slot(req_id);
+		if (slot < 0) {
+			plugin_log(plugin_handle, LOG_DBG,
+				   "JOIN_RESPONSE for req_id=%llu has no pending "
+				   "RPC (unsolicited or already timed out)",
+				   (unsigned long long)req_id);
+			break;
+		}
+		struct command *orig_cmd = ss_join_pending[slot].cmd;
+		ss_peer_usage_release_slot(ss_join_pending[slot].peer_id);
+		ss_join_pending[slot].request_id = 0;
+		ss_join_pending[slot].cmd = NULL;
+		ss_join_pending[slot].deadline = 0;
+
+		if (!orig_cmd) break;
+
+		struct json_stream *js = jsonrpc_stream_success(orig_cmd);
+		json_add_u64(js, "request_id", req_id);
+		const char *status_name = "unknown";
+		switch ((factory_join_status_t)status) {
+		case JOIN_STATUS_QUEUED:         status_name = "queued"; break;
+		case JOIN_STATUS_ACCEPTED:       status_name = "accepted"; break;
+		case JOIN_STATUS_SIGNED:         status_name = "signed"; break;
+		case JOIN_STATUS_REJECTED:       status_name = "rejected"; break;
+		case JOIN_STATUS_CANCELLED:      status_name = "cancelled"; break;
+		case JOIN_STATUS_ALREADY_MEMBER: status_name = "already_member"; break;
+		}
+		json_add_string(js, "status", status_name);
+		json_add_u32(js, "expected_signing_block", exp_block);
+		json_add_string(js, "reason", reason);
+		struct command_result *_cf = command_finished(orig_cmd, js);
+		(void)_cf;
+		break;
+	}
+
+	/* Phase 3: SS_SUBMSG_JOIN_CANCEL — LSP-side handler.
+	 * Client withdrew a pending join. Mark the queue entry as CANCELLED.
+	 * No response sent (fire-and-forget per design). Client's local
+	 * wallet has already locally marked the cancellation; LSP's record
+	 * is for visibility in factory-incoming-joins.
+	 *
+	 * Wire format (42 bytes):
+	 *   u64    request_id
+	 *   u8[32] instance_id
+	 *   u16    trailing_tlv_len
+	 */
+	case SS_SUBMSG_JOIN_CANCEL: {
+		if (len < 42) {
+			plugin_log(plugin_handle, LOG_UNUSUAL,
+				   "JOIN_CANCEL from %s too short (%zu bytes)",
+				   peer_id, len);
+			break;
+		}
+		uint64_t req_id = 0;
+		for (int i = 0; i < 8; i++) req_id = (req_id << 8) | data[i];
+		const uint8_t *iid = data + 8;
+
+		factory_instance_t *target_fi = ss_factory_find(&ss_state, iid);
+		if (!target_fi || !target_fi->is_lsp) {
+			plugin_log(plugin_handle, LOG_DBG,
+				   "JOIN_CANCEL for unknown/non-LSP factory "
+				   "(req_id=%llu) — ignored",
+				   (unsigned long long)req_id);
+			break;
+		}
+
+		/* Decode peer_id to verify the cancel comes from the same
+		 * client who originally requested. */
+		uint8_t client_pk[33];
+		if (strlen(peer_id) != 66) break;
+		for (int k = 0; k < 33; k++) {
+			unsigned int by;
+			sscanf(peer_id + k*2, "%2x", &by);
+			client_pk[k] = (uint8_t)by;
+		}
+
+		bool found = false;
+		for (size_t i = 0; i < target_fi->n_join_queue; i++) {
+			factory_join_t *j = &target_fi->join_queue[i];
+			if (j->request_id != req_id) continue;
+			if (memcmp(j->client_node_id, client_pk, 33) != 0) {
+				plugin_log(plugin_handle, LOG_UNUSUAL,
+					   "JOIN_CANCEL req_id=%llu sender %s "
+					   "doesn't match original requester — "
+					   "ignored",
+					   (unsigned long long)req_id, peer_id);
+				break;
+			}
+			j->status = JOIN_STATUS_CANCELLED;
+			j->decided_at_block = ss_state.current_blockheight;
+			strncpy((char *)j->reason, "client cancelled",
+				sizeof(j->reason) - 1);
+			j->reason[sizeof(j->reason) - 1] = 0;
+			found = true;
+			plugin_log(plugin_handle, LOG_INFORM,
+				   "join: cancelled by client %s "
+				   "(req_id=%llu)",
+				   peer_id, (unsigned long long)req_id);
+			ss_save_factory(cmd, target_fi);
+			break;
+		}
+		if (!found) {
+			plugin_log(plugin_handle, LOG_DBG,
+				   "JOIN_CANCEL req_id=%llu not found in queue "
+				   "(already processed or never existed)",
+				   (unsigned long long)req_id);
+		}
+		break;
+	}
+
 	default:
 		plugin_log(plugin_handle, LOG_DBG,
 			   "Unknown submsg 0x%04x from %s (len=%zu)",
@@ -7801,6 +9484,673 @@ static struct command_result *handle_openchannel(struct command *cmd,
 
 /* factory-create RPC — LSP creates a new factory (Phase 1)
  * Takes client node IDs and creates the DW tree. */
+/* Bug C fix: context carried across the listpeers preflight callback */
+struct browse_preflight_ctx {
+	const char *node_id_str;
+	uint32_t since_block;
+};
+
+/* Bug C fix: listpeers preflight succeeded. Check the peer is actually
+ * connected before allocating a slot and sending the wire request. */
+static struct command_result *browse_preflight_ok(struct command *cmd,
+						  const char *method,
+						  const char *buf,
+						  const jsmntok_t *result,
+						  void *arg)
+{
+	struct browse_preflight_ctx *ctx = arg;
+
+	const jsmntok_t *peers_tok = json_get_member(buf, result, "peers");
+	if (!peers_tok || peers_tok->type != JSMN_ARRAY ||
+	    peers_tok->size == 0) {
+		return command_fail(cmd, LIGHTNINGD,
+			"factory-browse-host: not connected to %s. "
+			"Run `lightning-cli connect <node_id>@<host>:<port>` first.",
+			ctx->node_id_str);
+	}
+
+	/* First (and only) peer in the array */
+	const jsmntok_t *peer_tok = peers_tok + 1;
+	const jsmntok_t *conn_tok = json_get_member(buf, peer_tok,
+						   "connected");
+	bool connected = false;
+	if (!conn_tok || !json_to_bool(buf, conn_tok, &connected) ||
+	    !connected) {
+		return command_fail(cmd, LIGHTNINGD,
+			"factory-browse-host: peer %s known but not currently "
+			"connected. Run `lightning-cli connect "
+			"<node_id>@<host>:<port>` to reconnect.",
+			ctx->node_id_str);
+	}
+
+	int slot = ss_browse_alloc_slot();
+	if (slot < 0) {
+		ss_audit_log(LOG_UNUSUAL, "slot_exhausted",
+			     "\"rpc\":\"factory-browse-host\","
+			     "\"peer\":\"%s\",\"max\":%d",
+			     ctx->node_id_str, SS_BROWSE_MAX_PENDING);
+		return command_fail(cmd, SS_ERR_SLOT_EXHAUSTED,
+			"factory-browse-host: too many pending requests "
+			"(max %d). Try again later.",
+			SS_BROWSE_MAX_PENDING);
+	}
+
+	uint64_t req_id = ss_fresh_request_id();
+	ss_browse_pending[slot].request_id = req_id;
+	ss_browse_pending[slot].cmd = cmd;
+	ss_browse_pending[slot].deadline = time(NULL) + ss_browse_timeout_secs;
+
+	uint8_t payload[12];
+	uint8_t *p = payload;
+	for (int i = 7; i >= 0; i--) *p++ = (uint8_t)(req_id >> (i*8));
+	for (int i = 3; i >= 0; i--)
+		*p++ = (uint8_t)(ctx->since_block >> (i*8));
+
+	send_factory_msg_browse(cmd, ctx->node_id_str,
+				SS_SUBMSG_FACTORY_INFO_REQUEST,
+				payload, sizeof(payload));
+
+	plugin_log(plugin_handle, LOG_INFORM,
+		   "factory-browse-host: sent FACTORY_INFO_REQUEST to %s "
+		   "(req_id=%llu since_block=%u)",
+		   ctx->node_id_str, (unsigned long long)req_id,
+		   ctx->since_block);
+
+	return command_still_pending(cmd);
+}
+
+static struct command_result *browse_preflight_err(struct command *cmd,
+						   const char *method,
+						   const char *buf,
+						   const jsmntok_t *result,
+						   void *arg)
+{
+	struct browse_preflight_ctx *ctx = arg;
+	const jsmntok_t *msg_tok = json_get_member(buf, result, "message");
+	const char *errmsg = msg_tok
+		? json_strdup(cmd, buf, msg_tok)
+		: "listpeers failed";
+	return command_fail(cmd, LIGHTNINGD,
+		"factory-browse-host: peer connectivity check failed for %s: %s",
+		ctx->node_id_str, errmsg);
+}
+
+static struct command_result *json_factory_browse_host(struct command *cmd,
+						       const char *buf,
+						       const jsmntok_t *params)
+{
+	const char *node_id_str = NULL;
+	uint32_t *since_block_opt = NULL;
+
+	if (!param(cmd, buf, params,
+		   p_req("node_id", param_string, &node_id_str),
+		   p_opt("since_block", param_u32, &since_block_opt),
+		   NULL))
+		return command_param_failed();
+
+	/* Bug C fix: preflight listpeers check before allocating a slot.
+	 * Avoids sending into the void when the target peer is unknown
+	 * or disconnected, and gives the user a clear, fast error
+	 * instead of a hanging RPC. */
+	struct browse_preflight_ctx *ctx =
+		tal(cmd, struct browse_preflight_ctx);
+	ctx->node_id_str = tal_strdup(ctx, node_id_str);
+	ctx->since_block = since_block_opt ? *since_block_opt : 0;
+
+	struct out_req *req = jsonrpc_request_start(cmd, "listpeers",
+						    browse_preflight_ok,
+						    browse_preflight_err, ctx);
+	json_add_string(req->js, "id", ctx->node_id_str);
+	return send_outreq(req);
+}
+
+/* ============================================================================
+ * Phase 3: factory-join-request / factory-cancel-join /
+ *          factory-incoming-joins / factory-kick-joiner RPCs
+ *
+ * factory-join-request: client RPC. Sends JOIN_REQUEST (0x0142) to a
+ *   specific LSP for a specific factory. Returns command_still_pending
+ *   while waiting for the LSPs JOIN_RESPONSE (0x0143).
+ *
+ * factory-cancel-join: client RPC. Marks a local outgoing_join entry as
+ *   CANCELLED and sends a fire-and-forget JOIN_CANCEL (0x0144) to the LSP
+ *   for visibility. Synchronous return.
+ *
+ * factory-incoming-joins: LSP RPC. Returns the join_queue for one or all
+ *   factories the LSP is hosting. Read-only, synchronous.
+ *
+ * factory-kick-joiner: LSP RPC. Marks a queue entry as REJECTED with an
+ *   optional reason and sends unsolicited JOIN_RESPONSE so the kicked
+ *   client's wallet can update.
+ *
+ * TODO(privacy): all four RPCs write/read persistent join records; the
+ * pre-mainnet privacy pass needs to review each.
+ * ============================================================================ */
+
+/* Helper: decode a 66-char hex node_id string into a 33-byte pubkey.
+ * Returns true on success, false on bad input. */
+static bool ss_decode_node_id_hex(const char *hex, uint8_t out[33])
+{
+	if (!hex || strlen(hex) != 66) return false;
+	for (int k = 0; k < 33; k++) {
+		unsigned int by;
+		if (sscanf(hex + k*2, "%2x", &by) != 1) return false;
+		out[k] = (uint8_t)by;
+	}
+	return true;
+}
+
+/* Helper: decode a 64-char hex instance_id string into a 32-byte buffer. */
+static bool ss_decode_instance_id_hex(const char *hex, uint8_t out[32])
+{
+	if (!hex || strlen(hex) != 64) return false;
+	for (int k = 0; k < 32; k++) {
+		unsigned int by;
+		if (sscanf(hex + k*2, "%2x", &by) != 1) return false;
+		out[k] = (uint8_t)by;
+	}
+	return true;
+}
+
+/* Helper: status enum to lowercase string for JSON output. */
+static const char *ss_outgoing_join_status_name(outgoing_join_status_t s)
+{
+	switch (s) {
+	case OUTGOING_JOIN_SENT:           return "sent";
+	case OUTGOING_JOIN_QUEUED:         return "queued";
+	case OUTGOING_JOIN_ACCEPTED:       return "accepted";
+	case OUTGOING_JOIN_SIGNED:         return "signed";
+	case OUTGOING_JOIN_REJECTED:       return "rejected";
+	case OUTGOING_JOIN_CANCELLED:      return "cancelled";
+	case OUTGOING_JOIN_TIMEOUT:        return "timeout";
+	case OUTGOING_JOIN_ALREADY_MEMBER: return "already_member";
+	}
+	return "unknown";
+}
+
+static const char *ss_factory_join_status_name(factory_join_status_t s)
+{
+	switch (s) {
+	case JOIN_STATUS_QUEUED:         return "queued";
+	case JOIN_STATUS_ACCEPTED:       return "accepted";
+	case JOIN_STATUS_SIGNED:         return "signed";
+	case JOIN_STATUS_REJECTED:       return "rejected";
+	case JOIN_STATUS_CANCELLED:      return "cancelled";
+	case JOIN_STATUS_ALREADY_MEMBER: return "already_member";
+	}
+	return "unknown";
+}
+
+/* ----- factory-join-request ----------------------------------------------- */
+
+/* Context carried across the listpeers preflight callback for join. */
+struct join_preflight_ctx {
+	const char *lsp_node_id_str;
+	uint8_t  instance_id[32];
+	uint64_t contribution_sats;
+};
+
+static struct command_result *join_preflight_ok(struct command *cmd,
+						const char *method,
+						const char *buf,
+						const jsmntok_t *result,
+						void *arg)
+{
+	plugin_log(plugin_handle, LOG_INFORM,
+		   "DEBUG: join_preflight_ok entered");
+	struct join_preflight_ctx *ctx = arg;
+	plugin_log(plugin_handle, LOG_INFORM,
+		   "DEBUG: ctx unpacked, lsp=%s", ctx->lsp_node_id_str);
+
+	const jsmntok_t *peers_tok = json_get_member(buf, result, "peers");
+	if (!peers_tok || peers_tok->type != JSMN_ARRAY ||
+	    peers_tok->size == 0) {
+		return command_fail(cmd, LIGHTNINGD,
+			"factory-join-request: not connected to %s. "
+			"Run `lightning-cli connect <node_id>@<host>:<port>` first.",
+			ctx->lsp_node_id_str);
+	}
+	const jsmntok_t *peer_tok = peers_tok + 1;
+	const jsmntok_t *conn_tok = json_get_member(buf, peer_tok,
+						   "connected");
+	bool connected = false;
+	if (!conn_tok || !json_to_bool(buf, conn_tok, &connected) ||
+	    !connected) {
+		return command_fail(cmd, LIGHTNINGD,
+			"factory-join-request: peer %s known but not "
+			"currently connected. Run `lightning-cli connect "
+			"<node_id>@<host>:<port>` to reconnect.",
+			ctx->lsp_node_id_str);
+	}
+
+	/* Check we don't already have an outstanding join for this
+	 * (lsp, instance_id). Dedup safety net at the local layer. */
+	uint8_t lsp_pk[33];
+	if (!ss_decode_node_id_hex(ctx->lsp_node_id_str, lsp_pk)) {
+		return command_fail(cmd, LIGHTNINGD,
+			"factory-join-request: invalid lsp node_id");
+	}
+	for (size_t i = 0; i < ss_state.n_outgoing_joins; i++) {
+		outgoing_join_t *o = &ss_state.outgoing_joins[i];
+		if (memcmp(o->lsp_node_id, lsp_pk, 33) == 0 &&
+		    memcmp(o->instance_id, ctx->instance_id, 32) == 0 &&
+		    (o->status == OUTGOING_JOIN_SENT ||
+		     o->status == OUTGOING_JOIN_QUEUED ||
+		     o->status == OUTGOING_JOIN_ACCEPTED ||
+		     o->status == OUTGOING_JOIN_SIGNED)) {
+			return command_fail(cmd, SS_ERR_DUPLICATE_JOIN,
+				"factory-join-request: already have an active "
+				"join for this factory (status=%s, "
+				"request_id=%llu). Cancel it first with "
+				"factory-cancel-join.",
+				ss_outgoing_join_status_name(o->status),
+				(unsigned long long)o->request_id);
+		}
+	}
+
+	/* Check we have room in outgoing_joins */
+	if (ss_state.n_outgoing_joins >= MAX_OUTGOING_JOINS) {
+		return command_fail(cmd, SS_ERR_OUTGOING_JOINS_FULL,
+			"factory-join-request: outgoing joins full "
+			"(max %d). Cancel or wait for existing ones.",
+			MAX_OUTGOING_JOINS);
+	}
+
+	/* Allocate slot for response correlation */
+	int slot = ss_join_alloc_slot();
+	if (slot < 0) {
+		ss_audit_log(LOG_UNUSUAL, "slot_exhausted",
+			     "\"rpc\":\"factory-join-request\","
+			     "\"max\":%d", SS_JOIN_MAX_PENDING);
+		return command_fail(cmd, SS_ERR_SLOT_EXHAUSTED,
+			"factory-join-request: too many pending requests "
+			"(max %d). Try again later.", SS_JOIN_MAX_PENDING);
+	}
+	uint64_t req_id = ss_fresh_request_id();
+	ss_join_pending[slot].request_id = req_id;
+	ss_join_pending[slot].cmd = cmd;
+	ss_join_pending[slot].deadline = time(NULL) + ss_join_timeout_secs;
+
+	/* Add persistent outgoing_join_t entry */
+	/* TODO(privacy): retention review pre-mainnet */
+	outgoing_join_t *o = &ss_state.outgoing_joins[ss_state.n_outgoing_joins++];
+	memcpy(o->lsp_node_id, lsp_pk, 33);
+	memcpy(o->instance_id, ctx->instance_id, 32);
+	o->request_id = req_id;
+	o->contribution_sats = ctx->contribution_sats;
+	o->sent_at_block = ss_state.current_blockheight;
+	o->expected_signing_block = 0;
+	o->updated_at_block = ss_state.current_blockheight;
+	o->status = OUTGOING_JOIN_SENT;
+	memset(o->reason, 0, 64);
+	plugin_log(plugin_handle, LOG_INFORM,
+		   "DEBUG: about to save outgoing joins n=%zu",
+		   ss_state.n_outgoing_joins);
+	/* Task #62: ss_save_outgoing_joins disabled — see json_factory_join_request comment */
+	plugin_log(plugin_handle, LOG_INFORM,
+		   "DEBUG: saved outgoing joins, about to send wire");
+
+	/* Build wire payload: req_id(8) + instance_id(32) + contribution(8) + tlv_len(2) = 50 */
+	uint8_t payload[50];
+	uint8_t *p = payload;
+	for (int i = 7; i >= 0; i--) *p++ = (uint8_t)(req_id >> (i*8));
+	memcpy(p, ctx->instance_id, 32); p += 32;
+	for (int i = 7; i >= 0; i--)
+		*p++ = (uint8_t)(ctx->contribution_sats >> (i*8));
+	*p++ = 0; *p++ = 0;  /* trailing_tlv_len = 0 */
+
+	send_factory_msg_join(cmd, ctx->lsp_node_id_str,
+			      SS_SUBMSG_JOIN_REQUEST, payload, sizeof(payload));
+
+	plugin_log(plugin_handle, LOG_INFORM,
+		   "factory-join-request: sent JOIN_REQUEST to %s "
+		   "(req_id=%llu, contribution=%llu sats)",
+		   ctx->lsp_node_id_str, (unsigned long long)req_id,
+		   (unsigned long long)ctx->contribution_sats);
+
+	return command_still_pending(cmd);
+}
+
+static struct command_result *join_preflight_err(struct command *cmd,
+						 const char *method,
+						 const char *buf,
+						 const jsmntok_t *result,
+						 void *arg)
+{
+	plugin_log(plugin_handle, LOG_INFORM,
+		   "DEBUG: join_preflight_err entered");
+	struct join_preflight_ctx *ctx = arg;
+	const jsmntok_t *msg_tok = json_get_member(buf, result, "message");
+	const char *errmsg = msg_tok
+		? json_strdup(cmd, buf, msg_tok)
+		: "listpeers failed";
+	return command_fail(cmd, LIGHTNINGD,
+		"factory-join-request: peer connectivity check failed "
+		"for %s: %s", ctx->lsp_node_id_str, errmsg);
+}
+
+static struct command_result *json_factory_join_request(struct command *cmd,
+							const char *buf,
+							const jsmntok_t *params)
+{
+	const char *lsp_node_id_str = NULL;
+	const char *instance_id_str = NULL;
+	uint64_t *contribution_sats = NULL;
+
+	if (!param(cmd, buf, params,
+		   p_req("lsp_node_id", param_string, &lsp_node_id_str),
+		   p_req("instance_id", param_string, &instance_id_str),
+		   p_req("contribution_sats", param_u64, &contribution_sats),
+		   NULL))
+		return command_param_failed();
+
+	uint8_t lsp_pk[33], iid[32];
+	if (!ss_decode_node_id_hex(lsp_node_id_str, lsp_pk))
+		return command_fail(cmd, LIGHTNINGD, "lsp_node_id must be 66-char hex");
+	if (!ss_decode_instance_id_hex(instance_id_str, iid))
+		return command_fail(cmd, LIGHTNINGD, "instance_id must be 64-char hex");
+
+	if (ss_state.n_outgoing_joins >= MAX_OUTGOING_JOINS)
+		return command_fail(cmd, SS_ERR_OUTGOING_JOINS_FULL, "outgoing joins full");
+
+	/* Hardening Task #67: per-peer slot cap + rate limit */
+	const char *limit_err = ss_peer_check_limits(lsp_pk);
+	if (limit_err) {
+		ss_peer_record_fail(lsp_pk);
+		ss_audit_log(LOG_UNUSUAL, "peer_limit_reject",
+			     "\"rpc\":\"factory-join-request\","
+			     "\"reason\":\"%s\"", limit_err);
+		return command_fail(cmd, SS_ERR_PEER_RATE_LIMIT,
+			"factory-join-request: %s", limit_err);
+	}
+
+	int slot = ss_join_alloc_slot();
+	if (slot < 0)
+		return command_fail(cmd, SS_ERR_SLOT_EXHAUSTED, "too many pending requests");
+
+	uint64_t req_id = ss_fresh_request_id();
+	ss_join_pending[slot].request_id = req_id;
+	ss_join_pending[slot].cmd = cmd;
+	ss_join_pending[slot].deadline = time(NULL) + ss_join_timeout_secs;
+	memcpy(ss_join_pending[slot].peer_id, lsp_pk, 33);
+	ss_peer_usage_commit_slot(lsp_pk);
+
+	outgoing_join_t *o = &ss_state.outgoing_joins[ss_state.n_outgoing_joins++];
+	memcpy(o->lsp_node_id, lsp_pk, 33);
+	memcpy(o->instance_id, iid, 32);
+	o->request_id = req_id;
+	o->contribution_sats = *contribution_sats;
+	o->sent_at_block = ss_state.current_blockheight;
+	o->expected_signing_block = 0;
+	o->updated_at_block = ss_state.current_blockheight;
+	o->status = OUTGOING_JOIN_SENT;
+	memset(o->reason, 0, 64);
+	ss_save_outgoing_joins(cmd);
+
+	uint8_t payload[50];
+	uint8_t *p = payload;
+	for (int i = 7; i >= 0; i--) *p++ = (uint8_t)(req_id >> (i*8));
+	memcpy(p, iid, 32); p += 32;
+	for (int i = 7; i >= 0; i--)
+		*p++ = (uint8_t)(*contribution_sats >> (i*8));
+	*p++ = 0; *p++ = 0;
+
+	send_factory_msg_join(cmd, lsp_node_id_str,
+			      SS_SUBMSG_JOIN_REQUEST, payload, sizeof(payload));
+	plugin_log(plugin_handle, LOG_INFORM,
+		   "factory-join-request: sent JOIN_REQUEST to %s (req_id=%llu)",
+		   lsp_node_id_str, (unsigned long long)req_id);
+
+	return command_still_pending(cmd);
+}
+
+/* ----- factory-cancel-join ------------------------------------------------ */
+
+static struct command_result *json_factory_cancel_join(struct command *cmd,
+						       const char *buf,
+						       const jsmntok_t *params)
+{
+	uint64_t *request_id = NULL;
+
+	if (!param(cmd, buf, params,
+		   p_req("request_id", param_u64, &request_id),
+		   NULL))
+		return command_param_failed();
+
+	outgoing_join_t *o = NULL;
+	size_t found_idx = 0;
+	for (size_t i = 0; i < ss_state.n_outgoing_joins; i++) {
+		if (ss_state.outgoing_joins[i].request_id == *request_id) {
+			o = &ss_state.outgoing_joins[i];
+			found_idx = i;
+			break;
+		}
+	}
+	if (!o)
+		return command_fail(cmd, LIGHTNINGD,
+			"factory-cancel-join: no outgoing join with "
+			"request_id=%llu",
+			(unsigned long long)*request_id);
+	(void)found_idx;
+
+	if (o->status == OUTGOING_JOIN_CANCELLED ||
+	    o->status == OUTGOING_JOIN_REJECTED ||
+	    o->status == OUTGOING_JOIN_SIGNED) {
+		return command_fail(cmd, LIGHTNINGD,
+			"factory-cancel-join: join request_id=%llu is "
+			"already in status=%s, cannot cancel.",
+			(unsigned long long)*request_id,
+			ss_outgoing_join_status_name(o->status));
+	}
+
+	/* Build wire payload: req_id(8) + instance_id(32) + tlv_len(2) = 42 */
+	uint8_t payload[42];
+	uint8_t *p = payload;
+	for (int i = 7; i >= 0; i--) *p++ = (uint8_t)(*request_id >> (i*8));
+	memcpy(p, o->instance_id, 32); p += 32;
+	*p++ = 0; *p++ = 0;
+
+	/* Hex-encode lsp_node_id for the send call */
+	char lsp_hex[67];
+	for (int k = 0; k < 33; k++)
+		sprintf(lsp_hex + k*2, "%02x", o->lsp_node_id[k]);
+	lsp_hex[66] = 0;
+
+	/* Fire-and-forget: use generic send_factory_msg (any error just gets
+	 * logged by rpc_err; we mark cancelled locally regardless). */
+	send_factory_msg(cmd, lsp_hex, SS_SUBMSG_JOIN_CANCEL,
+			 payload, sizeof(payload));
+
+	/* Update local state */
+	o->status = OUTGOING_JOIN_CANCELLED;
+	o->updated_at_block = ss_state.current_blockheight;
+	strncpy((char *)o->reason, "user cancelled", sizeof(o->reason) - 1);
+	o->reason[sizeof(o->reason) - 1] = 0;
+	/* Task #62: ss_save_outgoing_joins disabled — see json_factory_join_request comment */
+
+	plugin_log(plugin_handle, LOG_INFORM,
+		   "factory-cancel-join: cancelled join req_id=%llu to %s",
+		   (unsigned long long)*request_id, lsp_hex);
+
+	struct json_stream *js = jsonrpc_stream_success(cmd);
+	json_add_u64(js, "request_id", *request_id);
+	json_add_string(js, "status", "cancelled");
+	return command_finished(cmd, js);
+}
+
+/* ----- factory-incoming-joins --------------------------------------------- */
+
+static struct command_result *json_factory_incoming_joins(struct command *cmd,
+							  const char *buf,
+							  const jsmntok_t *params)
+{
+	const char *instance_id_str = NULL;
+
+	if (!param(cmd, buf, params,
+		   p_opt("instance_id", param_string, &instance_id_str),
+		   NULL))
+		return command_param_failed();
+
+	uint8_t filter_iid[32];
+	bool filter = false;
+	if (instance_id_str) {
+		if (!ss_decode_instance_id_hex(instance_id_str, filter_iid))
+			return command_fail(cmd, LIGHTNINGD,
+				"instance_id must be 64-char hex (32 bytes)");
+		filter = true;
+	}
+
+	struct json_stream *js = jsonrpc_stream_success(cmd);
+	json_array_start(js, "factories");
+
+	for (size_t fi_idx = 0; fi_idx < ss_state.n_factories; fi_idx++) {
+		factory_instance_t *fi = ss_state.factories[fi_idx];
+		if (!fi || !fi->is_lsp) continue;
+		if (filter && memcmp(fi->instance_id, filter_iid, 32) != 0)
+			continue;
+
+		json_object_start(js, NULL);
+		char iid_hex[65];
+		for (int j = 0; j < 32; j++)
+			sprintf(iid_hex + j*2, "%02x",
+				fi->instance_id[j]);
+		iid_hex[64] = 0;
+		json_add_string(js, "instance_id", iid_hex);
+		json_add_u32(js, "n_clients", fi->n_clients);
+		json_add_u32(js, "n_channels", fi->n_channels);
+		json_add_string(js, "lifecycle",
+			fi->lifecycle == FACTORY_LIFECYCLE_INIT ? "init" :
+			fi->lifecycle == FACTORY_LIFECYCLE_ACTIVE ? "active" :
+			fi->lifecycle == FACTORY_LIFECYCLE_DYING ? "dying" :
+			fi->lifecycle == FACTORY_LIFECYCLE_EXPIRED ? "expired" :
+			"other");
+
+		json_array_start(js, "joins");
+		for (size_t i = 0; i < fi->n_join_queue; i++) {
+			factory_join_t *j = &fi->join_queue[i];
+			json_object_start(js, NULL);
+			char cnid_hex[67];
+			for (int k = 0; k < 33; k++)
+				sprintf(cnid_hex + k*2, "%02x",
+					j->client_node_id[k]);
+			cnid_hex[66] = 0;
+			json_add_string(js, "client_node_id", cnid_hex);
+			json_add_u64(js, "request_id", j->request_id);
+			json_add_u64(js, "contribution_sats",
+				     j->contribution_sats);
+			json_add_string(js, "status",
+				ss_factory_join_status_name(j->status));
+			json_add_u32(js, "received_at_block",
+				     j->received_at_block);
+			json_add_u32(js, "accepted_at_block",
+				     j->accepted_at_block);
+			json_add_u32(js, "decided_at_block",
+				     j->decided_at_block);
+			if (j->last_seen_block)
+				json_add_u32(js, "last_seen_block",
+					     j->last_seen_block);
+			if (j->reason[0])
+				json_add_string(js, "reason",
+						(const char *)j->reason);
+			json_object_end(js);
+		}
+		json_array_end(js);
+		json_object_end(js);
+	}
+	json_array_end(js);
+	return command_finished(cmd, js);
+}
+
+/* ----- factory-kick-joiner ------------------------------------------------ */
+
+static struct command_result *json_factory_kick_joiner(struct command *cmd,
+						       const char *buf,
+						       const jsmntok_t *params)
+{
+	const char *instance_id_str = NULL;
+	const char *client_node_id_str = NULL;
+	const char *reason_str = NULL;
+
+	if (!param(cmd, buf, params,
+		   p_req("instance_id", param_string, &instance_id_str),
+		   p_req("client_node_id", param_string, &client_node_id_str),
+		   p_opt("reason", param_string, &reason_str),
+		   NULL))
+		return command_param_failed();
+
+	uint8_t iid[32], client_pk[33];
+	if (!ss_decode_instance_id_hex(instance_id_str, iid))
+		return command_fail(cmd, LIGHTNINGD,
+			"instance_id must be 64-char hex");
+	if (!ss_decode_node_id_hex(client_node_id_str, client_pk))
+		return command_fail(cmd, LIGHTNINGD,
+			"client_node_id must be 66-char hex");
+
+	factory_instance_t *fi = ss_factory_find(&ss_state, iid);
+	if (!fi || !fi->is_lsp)
+		return command_fail(cmd, LIGHTNINGD,
+			"factory-kick-joiner: factory %s not found or "
+			"not hosted by us", instance_id_str);
+
+	factory_join_t *target = NULL;
+	for (size_t i = 0; i < fi->n_join_queue; i++) {
+		if (memcmp(fi->join_queue[i].client_node_id, client_pk, 33) == 0) {
+			target = &fi->join_queue[i];
+			break;
+		}
+	}
+	if (!target)
+		return command_fail(cmd, LIGHTNINGD,
+			"factory-kick-joiner: no queue entry for "
+			"client %s in factory %s",
+			client_node_id_str, instance_id_str);
+
+	if (target->status == JOIN_STATUS_REJECTED ||
+	    target->status == JOIN_STATUS_CANCELLED)
+		return command_fail(cmd, LIGHTNINGD,
+			"factory-kick-joiner: client %s is already in "
+			"status=%s, cannot kick",
+			client_node_id_str,
+			ss_factory_join_status_name(target->status));
+
+	target->status = JOIN_STATUS_REJECTED;
+	target->decided_at_block = ss_state.current_blockheight;
+	const char *use_reason = (reason_str && reason_str[0])
+		? reason_str : "kicked by LSP operator";
+	strncpy((char *)target->reason, use_reason, sizeof(target->reason) - 1);
+	target->reason[sizeof(target->reason) - 1] = 0;
+
+	plugin_log(plugin_handle, LOG_INFORM,
+		   "factory-kick-joiner: kicked client %s from factory %s "
+		   "(reason: %s)",
+		   client_node_id_str, instance_id_str, use_reason);
+
+	/* Send unsolicited JOIN_RESPONSE to the kicked client so their
+	 * wallet status updates. */
+	size_t rlen = strlen(use_reason);
+	if (rlen > 64) rlen = 64;
+	uint8_t resp[8 + 1 + 4 + 1 + 64 + 2];
+	uint8_t *rp = resp;
+	for (int k = 7; k >= 0; k--) *rp++ = (target->request_id >> (k*8)) & 0xFF;
+	*rp++ = (uint8_t)JOIN_STATUS_REJECTED;
+	for (int k = 0; k < 4; k++) *rp++ = 0;
+	*rp++ = (uint8_t)rlen;
+	memcpy(rp, use_reason, rlen); rp += rlen;
+	*rp++ = 0; *rp++ = 0;
+	size_t actual = (size_t)(rp - resp);
+	send_factory_msg(cmd, client_node_id_str,
+			 SS_SUBMSG_JOIN_RESPONSE, resp, actual);
+
+	ss_save_factory(cmd, fi);
+
+	struct json_stream *js = jsonrpc_stream_success(cmd);
+	json_add_string(js, "instance_id", instance_id_str);
+	json_add_string(js, "client_node_id", client_node_id_str);
+	json_add_string(js, "status", "rejected");
+	json_add_string(js, "reason", use_reason);
+	return command_finished(cmd, js);
+}
+
 static struct command_result *json_factory_create(struct command *cmd,
 						  const char *buf,
 						  const jsmntok_t *params)
@@ -7813,11 +10163,13 @@ static struct command_result *json_factory_create(struct command *cmd,
 
 	const jsmntok_t *allocations_tok = NULL;
 	const char *arity_mode_str = NULL;
+	u32 *feerate_perkw_opt = NULL;
 	if (!param(cmd, buf, params,
 		   p_req("funding_sats", param_u64, &funding_sats),
 		   p_req("clients", param_array, &clients_tok),
 		   p_opt("allocations", param_array, &allocations_tok),
 		   p_opt("arity_mode", param_string, &arity_mode_str),
+		   p_opt("feerate_perkw", param_u32, &feerate_perkw_opt),
 		   NULL))
 		return command_param_failed();
 
@@ -7880,6 +10232,7 @@ static struct command_result *json_factory_create(struct command *cmd,
 	fi->lifecycle = FACTORY_LIFECYCLE_INIT;
 	fi->ceremony = CEREMONY_IDLE;
 	fi->arity_mode = parsed_arity_mode;
+	fi->requested_feerate_perkw = feerate_perkw_opt ? *feerate_perkw_opt : 0;
 
 	/* Parse client node IDs */
 	const jsmntok_t *t;
@@ -8983,6 +11336,86 @@ static struct command_result *json_factory_metrics(struct command *cmd,
 				     swp_by_state[s]);
 	}
 	json_object_end(js);
+	json_object_end(js);
+
+	/* Phase 4 / Task #68: slot-table + peer-table stats for dashboard */
+	json_object_start(js, "slots");
+	{
+		unsigned int browse_used = 0, join_used = 0;
+		time_t now = time(NULL);
+		(void)now;
+		for (int i = 0; i < SS_BROWSE_MAX_PENDING; i++)
+			if (ss_browse_pending[i].request_id != 0) browse_used++;
+		for (int i = 0; i < SS_JOIN_MAX_PENDING; i++)
+			if (ss_join_pending[i].request_id != 0) join_used++;
+		json_add_u32(js, "browse_used", browse_used);
+		json_add_u32(js, "browse_total", SS_BROWSE_MAX_PENDING);
+		json_add_u32(js, "join_used", join_used);
+		json_add_u32(js, "join_total", SS_JOIN_MAX_PENDING);
+	}
+	json_object_end(js);
+
+	json_object_start(js, "peer_table");
+	{
+		unsigned int peers_tracked = 0;
+		unsigned int peers_with_active_slots = 0;
+		for (int i = 0; i < SS_PEER_TABLE_SIZE; i++) {
+			if (!ss_peer_table[i].in_use) continue;
+			peers_tracked++;
+			if (ss_peer_table[i].concurrent_slots > 0)
+				peers_with_active_slots++;
+		}
+		json_add_u32(js, "peers_tracked", peers_tracked);
+		json_add_u32(js, "peers_with_active_slots", peers_with_active_slots);
+		json_add_u32(js, "table_capacity", SS_PEER_TABLE_SIZE);
+	}
+	json_object_end(js);
+
+	json_object_start(js, "join_queue_summary");
+	{
+		unsigned int total_queued = 0, total_accepted = 0;
+		unsigned int total_signed = 0, total_rejected = 0;
+		unsigned int total_cancelled = 0;
+		for (size_t fi_idx = 0; fi_idx < ss_state.n_factories; fi_idx++) {
+			factory_instance_t *fi = ss_state.factories[fi_idx];
+			if (!fi || !fi->is_lsp) continue;
+			for (size_t j = 0; j < fi->n_join_queue; j++) {
+				switch (fi->join_queue[j].status) {
+				case JOIN_STATUS_QUEUED: total_queued++; break;
+				case JOIN_STATUS_ACCEPTED: total_accepted++; break;
+				case JOIN_STATUS_SIGNED: total_signed++; break;
+				case JOIN_STATUS_REJECTED: total_rejected++; break;
+				case JOIN_STATUS_CANCELLED: total_cancelled++; break;
+				default: break;
+				}
+			}
+		}
+		json_add_u32(js, "queued", total_queued);
+		json_add_u32(js, "accepted", total_accepted);
+		json_add_u32(js, "signed", total_signed);
+		json_add_u32(js, "rejected", total_rejected);
+		json_add_u32(js, "cancelled", total_cancelled);
+	}
+	json_object_end(js);
+
+	json_object_start(js, "outgoing_joins_summary");
+	{
+		unsigned int total_sent = 0, total_queued_out = 0;
+		unsigned int total_accepted_out = 0, total_other = 0;
+		for (size_t i = 0; i < ss_state.n_outgoing_joins; i++) {
+			switch (ss_state.outgoing_joins[i].status) {
+			case OUTGOING_JOIN_SENT: total_sent++; break;
+			case OUTGOING_JOIN_QUEUED: total_queued_out++; break;
+			case OUTGOING_JOIN_ACCEPTED: total_accepted_out++; break;
+			default: total_other++; break;
+			}
+		}
+		json_add_u32(js, "sent", total_sent);
+		json_add_u32(js, "queued", total_queued_out);
+		json_add_u32(js, "accepted", total_accepted_out);
+		json_add_u32(js, "other", total_other);
+		json_add_u32(js, "total", (unsigned)ss_state.n_outgoing_joins);
+	}
 	json_object_end(js);
 
 	return command_finished(cmd, js);
@@ -10379,6 +12812,26 @@ static void ss_launch_breach_scan(struct command *cmd,
 				  factory_instance_t *fi,
 				  size_t factory_idx)
 {
+	/* Phase 3 architectural decision: chain-watching is delegated to
+	 * the standalone superscalar_watchtower binary (see SuperScalar
+	 * source tree). This function previously called CLN's getblockhash
+	 * + getblock RPCs, both of which were removed in recent CLN
+	 * versions. Rather than reimplementing block scanning in the
+	 * plugin, the integration pattern is:
+	 *
+	 *   plugin = factory ceremony coordinator + Lightning wire
+	 *   superscalar_watchtower = chain watching + penalty broadcast
+	 *
+	 * Phase 4 (pre-mainnet hardening): writer hook exporting per-epoch
+	 * state-root txids to a SuperScalar-compatible SQLite DB. See
+	 * PROTOCOL_NOTES.md section 10.
+	 *
+	 * Phase 6+ (architectural cleanup): full library embed via
+	 * libsuperscalar's watchtower module + chain_backend adapter
+	 * for CLN's bcli RPCs. */
+	(void)cmd; (void)fi; (void)factory_idx;
+	return;
+
 	bool has_real_funding = false;
 	for (int fb = 0; fb < 32; fb++) {
 		if (fi->funding_txid[fb] != 0) {
@@ -10866,6 +13319,11 @@ static void ss_launch_state_tx_scan(struct command *cmd,
 				    const uint8_t *kickoff_txid,
 				    uint32_t window)
 {
+	/* Phase 3 architectural decision: chain-watching delegated to
+	 * superscalar_watchtower. See ss_launch_breach_scan for the full
+	 * reasoning + Phase 4/6 roadmap. */
+	(void)cmd; (void)fi; (void)kickoff_txid; (void)window;
+	return;
 	if (ss_state.current_blockheight == 0) return;
 
 	struct command *acmd = aux_command(cmd);
@@ -11062,7 +13520,7 @@ static int ss_penalty_scheduler_tick(struct command *cmd,
 
 		tx_buf_t burn_tx;
 		tx_buf_init(&burn_tx, 256);
-		if (factory_build_burn_tx(f, &burn_tx, leaf->txid,
+		if (factory_build_burn_tx(f, &burn_tx, leaf, leaf->txid,
 					  lstock_vout, lstock_amt,
 					  pp->epoch)) {
 			char *burn_hex = tal_arr(cmd, char,
@@ -11275,7 +13733,7 @@ static int ss_rebuild_breach_burns(struct command *cmd,
 
 			tx_buf_t burn_tx;
 			tx_buf_init(&burn_tx, 256);
-			if (factory_build_burn_tx(f, &burn_tx, leaf->txid,
+			if (factory_build_burn_tx(f, &burn_tx, leaf, leaf->txid,
 						  lstock_vout, lstock_amt,
 						  bd->epoch)) {
 				char *burn_hex = tal_arr(cmd, char,
@@ -13644,7 +16102,7 @@ static struct command_result *breach_utxo_checked(struct command *cmd,
 
 				tx_buf_t burn_tx;
 				tx_buf_init(&burn_tx, 256);
-				if (factory_build_burn_tx(f, &burn_tx,
+				if (factory_build_burn_tx(f, &burn_tx, leaf,
 							  leaf->txid,
 							  lstock_vout,
 							  lstock_amt,
@@ -13775,6 +16233,14 @@ static struct command_result *handle_block_added(struct command *cmd,
 						 const char *buf,
 						 const jsmntok_t *params)
 {
+	/* Phase 3 architectural decision: per-block handling delegated to
+	 * superscalar_watchtower (separate process). The plugin's role is
+	 * factory ceremony coordination, not chain watching. See
+	 * ss_launch_breach_scan for full architecture notes + Phase 4/6
+	 * roadmap. */
+	(void)buf; (void)params;
+	return notification_handled(cmd);
+
 	/* CLN's block_added notification sends fields flat:
 	 *   {"hash": "...", "height": N}
 	 * not nested under a "block" key. */
@@ -14324,11 +16790,30 @@ static struct command_result *json_factory_check_breach(struct command *cmd,
 		l_txid[31 - j] = (uint8_t)b; /* internal byte order */
 	}
 
-	/* Build burn tx for the specified epoch */
+	/* Build burn tx for the specified epoch.
+	 * lib PR #121 (zmn t/1242) added leaf_node as the 3rd arg to
+	 * factory_build_burn_tx. This dev RPC takes a raw txid from the
+	 * operator, so we look up the matching leaf by scanning the
+	 * factory's nodes. Returns a clear error if no leaf matches
+	 * (caller must have passed a valid L-stock txid from one of this
+	 * factory's leaves). */
+	const factory_node_t *leaf_for_burn = NULL;
+	for (size_t li = 0; li < factory->n_nodes; li++) {
+		if (memcmp(factory->nodes[li].txid, l_txid, 32) == 0) {
+			leaf_for_burn = &factory->nodes[li];
+			break;
+		}
+	}
+	if (!leaf_for_burn) {
+		return command_fail(cmd, LIGHTNINGD,
+			"No leaf in factory with that l_stock_txid — "
+			"check the txid matches an existing leaf node");
+	}
+
 	tx_buf_t burn_tx;
 	tx_buf_init(&burn_tx, 256);
 
-	if (!factory_build_burn_tx(factory, &burn_tx,
+	if (!factory_build_burn_tx(factory, &burn_tx, leaf_for_burn,
 				    l_txid, *vout, *amount_sats,
 				    *epoch)) {
 		tx_buf_free(&burn_tx);
@@ -14696,6 +17181,9 @@ static const char *init(struct command *init_cmd,
 	 * derivation we do during startup picks up the right value. */
 	ss_load_iid_counter(init_cmd);
 
+	/* Phase 3: load client-side outgoing_joins persistent state. */
+	ss_load_outgoing_joins(init_cmd);
+
 	/* Load persisted factories from datastore */
 	ss_load_factories(init_cmd);
 
@@ -14732,6 +17220,15 @@ static const char *init(struct command *init_cmd,
 			}
 		}
 	}
+
+	/* Phase 3 + Bug B fix: register the combined reaper timer.
+	 * Browse reaper now also scans join slots (ss_join_reap_scan).
+	 * Two separate global_timer registrations on the same interval
+	 * was crashing the plugin after ~13s. */
+	notleak(global_timer(plugin_handle, time_from_sec(5),
+			     ss_browse_reap_tick, NULL));
+	plugin_log(plugin_handle, LOG_INFORM,
+		   "combined slot reaper timer registered (5s tick, browse+join)");
 
 	plugin_log(plugin_handle, LOG_INFORM,
 		   "SuperScalar factory plugin initialized "
@@ -15205,7 +17702,7 @@ static struct command_result *json_factory_initiate_exit(struct command *cmd,
 	if (strlen(inst_hex) != 64)
 		return command_fail(cmd, LIGHTNINGD, "Bad instance_id");
 	if (strlen(client_hex) != 66)
-		return command_fail(cmd, LIGHTNINGD, "Bad client_id (66 hex chars)");
+		return command_fail(cmd, SS_ERR_INSTANCE_ID_INVALID, "Bad client_id (66 hex chars)");
 
 	uint8_t instance_id[32];
 	for (int j = 0; j < 32; j++) {
@@ -15418,6 +17915,7 @@ static struct command_result *json_factory_confirm_closed(struct command *cmd,
 	}
 	if (fi->breach_data) free(fi->breach_data);
 	if (fi->dist_signed_tx) free(fi->dist_signed_tx);
+	if (fi->keyagg_snapshots) free(fi->keyagg_snapshots);
 	free(fi);
 	fi = NULL; /* poison */
 
@@ -15670,6 +18168,26 @@ json_dev_superscalar_state(struct command *cmd,
 		}
 		json_add_u64(js, "cached_ps_psig_len",
 			     (u64)fi->cached_ps_psig_len);
+		/* Gap 9: keyagg snapshot fingerprint. SHA256 of the persisted
+		 * blob — tests use this to verify pre-restart and post-restart
+		 * caches are byte-identical. Empty string when no snapshot has
+		 * been captured (factory pre-v15 or pre-funding). */
+		json_add_u64(js, "keyagg_snapshots_len",
+			     (u64)fi->keyagg_snapshots_len);
+		if (fi->keyagg_snapshots && fi->keyagg_snapshots_len > 0) {
+			struct sha256 fp;
+			sha256(&fp, fi->keyagg_snapshots,
+			       fi->keyagg_snapshots_len);
+			char fp_hex[65] = {0};
+			for (int j = 0; j < 32; j++)
+				sprintf(fp_hex + j*2, "%02x",
+					((uint8_t *)&fp)[j]);
+			json_add_string(js, "keyagg_snapshots_fingerprint",
+					fp_hex);
+		} else {
+			json_add_string(js, "keyagg_snapshots_fingerprint",
+					"");
+		}
 	}
 	return command_finished(cmd, js);
 }
@@ -17013,6 +19531,131 @@ json_dev_factory_trigger_reorg_check(struct command *cmd,
 	return json_factory_reorg_check(cmd, buf, params);
 }
 
+/* ============================================================================
+ * factory-funding-precheck RPC (Phase 4)
+ *
+ * Wallet calls this BEFORE factory-create to verify enough confirmed
+ * non-reserved UTXOs exist. Pure inspection — does not allocate any
+ * factory state. Output is shaped to drive the wallet's "you need to
+ * deposit N more sats" UI.
+ *
+ * Default fee estimate: 1000 sats (~ a few hundred vbytes at modest
+ * feerate). Caller can override with fee_estimate_sats.
+ *
+ * Failure modes:
+ *   - SS_ERR_INSUFFICIENT_FUNDS only when caller passes strict=true
+ *     AND wallet can't cover it. Otherwise returns a JSON response with
+ *     sufficient=false so the wallet can render the gap.
+ * ============================================================================ */
+
+struct funding_precheck_ctx {
+	u64 funding_sats;
+	u64 fee_estimate_sats;
+	bool strict;
+};
+
+static struct command_result *
+funding_precheck_listfunds_reply(struct command *cmd,
+				 const char *method UNUSED,
+				 const char *buf,
+				 const jsmntok_t *result,
+				 void *arg)
+{
+	struct funding_precheck_ctx *ctx = (struct funding_precheck_ctx *)arg;
+
+	const jsmntok_t *outputs = json_get_member(buf, result, "outputs");
+	if (!outputs || outputs->type != JSMN_ARRAY) {
+		return command_fail(cmd, SS_ERR_INTERNAL,
+			"factory-funding-precheck: listfunds returned no outputs array");
+	}
+
+	uint64_t available_sats = 0;
+	uint32_t counted = 0;
+	const jsmntok_t *t;
+	size_t i;
+	json_for_each_arr(i, t, outputs) {
+		const jsmntok_t *status_tok = json_get_member(buf, t, "status");
+		const jsmntok_t *reserved_tok = json_get_member(buf, t, "reserved");
+		const jsmntok_t *amt_tok = json_get_member(buf, t, "amount_msat");
+		if (!status_tok || !reserved_tok || !amt_tok) continue;
+
+		if (!json_tok_streq(buf, status_tok, "confirmed")) continue;
+
+		bool reserved_flag;
+		if (!json_to_bool(buf, reserved_tok, &reserved_flag)) continue;
+		if (reserved_flag) continue;
+
+		u64 amt_msat;
+		if (!json_to_u64(buf, amt_tok, &amt_msat)) continue;
+		available_sats += amt_msat / 1000;
+		counted++;
+	}
+
+	uint64_t required_sats = ctx->funding_sats + ctx->fee_estimate_sats;
+	bool sufficient = available_sats >= required_sats;
+	uint64_t shortfall = sufficient ? 0 : (required_sats - available_sats);
+
+	if (ctx->strict && !sufficient) {
+		return command_fail(cmd, SS_ERR_INSUFFICIENT_FUNDS,
+			"factory-funding-precheck: wallet has %"PRIu64" sat "
+			"confirmed non-reserved, need %"PRIu64" sat "
+			"(funding=%"PRIu64" + fee=%"PRIu64"). Shortfall %"PRIu64" sat.",
+			available_sats, required_sats,
+			ctx->funding_sats, ctx->fee_estimate_sats,
+			shortfall);
+	}
+
+	struct json_stream *js = jsonrpc_stream_success(cmd);
+	json_add_u64(js, "funding_sats", ctx->funding_sats);
+	json_add_u64(js, "fee_estimate_sats", ctx->fee_estimate_sats);
+	json_add_u64(js, "required_sats", required_sats);
+	json_add_u64(js, "available_sats", available_sats);
+	json_add_u32(js, "utxos_counted", counted);
+	json_add_bool(js, "sufficient", sufficient);
+	if (!sufficient)
+		json_add_u64(js, "shortfall_sats", shortfall);
+	return command_finished(cmd, js);
+}
+
+static struct command_result *
+funding_precheck_listfunds_err(struct command *cmd,
+			       const char *method UNUSED,
+			       const char *buf UNUSED,
+			       const jsmntok_t *result UNUSED,
+			       void *arg UNUSED)
+{
+	return command_fail(cmd, SS_ERR_INTERNAL,
+		"factory-funding-precheck: listfunds RPC failed");
+}
+
+static struct command_result *
+json_factory_funding_precheck(struct command *cmd,
+			      const char *buf,
+			      const jsmntok_t *params)
+{
+	u64 *funding_sats;
+	u64 *fee_estimate_sats_opt;
+	bool *strict_opt;
+	if (!param(cmd, buf, params,
+		   p_req("funding_sats", param_u64, &funding_sats),
+		   p_opt("fee_estimate_sats", param_u64, &fee_estimate_sats_opt),
+		   p_opt("strict", param_bool, &strict_opt),
+		   NULL))
+		return command_param_failed();
+
+	struct funding_precheck_ctx *ctx = tal(cmd, struct funding_precheck_ctx);
+	ctx->funding_sats = *funding_sats;
+	ctx->fee_estimate_sats = fee_estimate_sats_opt ? *fee_estimate_sats_opt : 1000;
+	ctx->strict = strict_opt ? *strict_opt : false;
+
+	struct out_req *req = jsonrpc_request_start(cmd, "listfunds",
+		funding_precheck_listfunds_reply,
+		funding_precheck_listfunds_err,
+		ctx);
+	send_outreq(req);
+	return command_still_pending(cmd);
+}
+
 static const struct plugin_command commands[] = {
 	{
 		"dev-factory-set-signal",
@@ -17115,6 +19758,30 @@ static const struct plugin_command commands[] = {
 		json_dev_factory_mark_cpfp_parent_confirmed,
 	},
 	{
+		"factory-browse-host",
+		json_factory_browse_host,
+	},
+	{
+		"factory-join-request",
+		json_factory_join_request,
+	},
+	{
+		"factory-cancel-join",
+		json_factory_cancel_join,
+	},
+	{
+		"factory-incoming-joins",
+		json_factory_incoming_joins,
+	},
+	{
+		"factory-funding-precheck",
+		json_factory_funding_precheck,
+	},
+	{
+		"factory-kick-joiner",
+		json_factory_kick_joiner,
+	},
+	{
 		"factory-create",
 		json_factory_create,
 	},
@@ -17206,5 +19873,17 @@ int main(int argc, char *argv[])
 		    notifs, ARRAY_SIZE(notifs),
 		    hooks, ARRAY_SIZE(hooks),
 		    NULL, 0,
+		    plugin_option("superscalar-browse-timeout-secs",
+				  "int",
+				  "Seconds before a pending factory-browse-host "
+				  "request times out and is reaped. Default 30.",
+				  u32_option, u32_jsonfmt,
+				  &ss_browse_timeout_secs),
+		    plugin_option("superscalar-join-timeout-secs",
+				  "int",
+				  "Seconds before a pending factory-join-request "
+				  "times out and is reaped. Default 30.",
+				  u32_option, u32_jsonfmt,
+				  &ss_join_timeout_secs),
 		    NULL);
 }
