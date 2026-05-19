@@ -302,6 +302,88 @@ struct ss_browse_pending_slot {
 };
 static struct ss_browse_pending_slot ss_browse_pending[SS_BROWSE_MAX_PENDING];
 
+/* B1.5: client-side cache of LSP-advertised policies, populated when a
+ * FACTORY_INFO_RESPONSE arrives.  Keyed by (peer_id, instance_id).  The
+ * validator looks this up at FACTORY_PROPOSE time to decide whether to
+ * refuse signing.  Small static array — typical browse pattern touches
+ * single-digit LSPs over a session; 64 slots is generous. */
+#define SS_POLICY_CACHE_SIZE 64
+struct ss_policy_cache_entry {
+	uint8_t  lsp_peer_id[33];        /* LSP node_id from peer_id hex */
+	uint8_t  instance_id[32];
+	ss_factory_policy_t policy;
+	bool     used;
+	uint32_t cached_at_block;        /* for staleness checks (future) */
+};
+static struct ss_policy_cache_entry ss_policy_cache[SS_POLICY_CACHE_SIZE];
+
+/* B1.5: hex peer_id -> 33-byte pubkey.  Returns true on success.  Defined
+ * (or used inline) elsewhere in this file too; standalone here so the
+ * cache helpers below can use it without forward-decl noise. */
+static bool ss_peer_id_hex_to_bytes(const char *hex, uint8_t out[33])
+{
+	if (!hex || strlen(hex) != 66) return false;
+	for (int j = 0; j < 33; j++) {
+		unsigned int b;
+		if (sscanf(hex + j*2, "%2x", &b) != 1) return false;
+		out[j] = (uint8_t)b;
+	}
+	return true;
+}
+
+/* B1.5: insert or update a policy in the cache.  If a slot for this
+ * (peer, instance_id) already exists, overwrite it; else find an unused
+ * slot; else evict the oldest (simple LRU by cached_at_block). */
+static void ss_policy_cache_put(const uint8_t lsp_peer_id[33],
+				  const uint8_t instance_id[32],
+				  const ss_factory_policy_t *policy)
+{
+	if (!lsp_peer_id || !instance_id || !policy) return;
+	int free_slot = -1;
+	int oldest_slot = 0;
+	uint32_t oldest_age = UINT32_MAX;
+	for (int i = 0; i < SS_POLICY_CACHE_SIZE; i++) {
+		struct ss_policy_cache_entry *e = &ss_policy_cache[i];
+		if (e->used
+		    && memcmp(e->lsp_peer_id, lsp_peer_id, 33) == 0
+		    && memcmp(e->instance_id, instance_id, 32) == 0) {
+			/* update in place */
+			memcpy(&e->policy, policy, sizeof(e->policy));
+			e->cached_at_block = ss_state.current_blockheight;
+			return;
+		}
+		if (!e->used && free_slot < 0) free_slot = i;
+		if (e->used && e->cached_at_block < oldest_age) {
+			oldest_age = e->cached_at_block;
+			oldest_slot = i;
+		}
+	}
+	int target = (free_slot >= 0) ? free_slot : oldest_slot;
+	struct ss_policy_cache_entry *e = &ss_policy_cache[target];
+	memcpy(e->lsp_peer_id, lsp_peer_id, 33);
+	memcpy(e->instance_id, instance_id, 32);
+	memcpy(&e->policy, policy, sizeof(e->policy));
+	e->cached_at_block = ss_state.current_blockheight;
+	e->used = true;
+}
+
+/* B1.5: look up a cached policy.  Returns pointer into the cache (caller
+ * must NOT free) or NULL if not found.  Cache entries are stable for
+ * the lifetime of the plugin process. */
+static const ss_factory_policy_t *ss_policy_cache_get(
+	const uint8_t lsp_peer_id[33], const uint8_t instance_id[32])
+{
+	if (!lsp_peer_id || !instance_id) return NULL;
+	for (int i = 0; i < SS_POLICY_CACHE_SIZE; i++) {
+		struct ss_policy_cache_entry *e = &ss_policy_cache[i];
+		if (e->used
+		    && memcmp(e->lsp_peer_id, lsp_peer_id, 33) == 0
+		    && memcmp(e->instance_id, instance_id, 32) == 0)
+			return &e->policy;
+	}
+	return NULL;
+}
+
 /* Forward decl: ss_audit_log is defined below ss_fresh_request_id, but the
  * peer-table helpers (which appear above the helper definition) call it. */
 static void ss_audit_log(enum log_level lvl, const char *event,
@@ -4408,6 +4490,55 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 					   "Bad FACTORY_PROPOSE payload");
 				free(nb);
 				break;
+			}
+
+			/* B1.5: policy validation gate.  Look up the LSP's
+			 * advertised policy (cached at browse time) and check
+			 * it against client_signing_prefs.  Hard-fail = refuse
+			 * to sign — bail out without generating nonces.  No
+			 * advertised policy => no promise to compare against;
+			 * we still apply user prefs against the canonical
+			 * defaults so a permissive-by-omission LSP can't slip
+			 * a hostile policy by hiding it. */
+			{
+				uint8_t lsp_pk_validate[33];
+				if (ss_peer_id_hex_to_bytes(peer_id, lsp_pk_validate)) {
+					const ss_factory_policy_t *cached =
+						ss_policy_cache_get(lsp_pk_validate,
+							nb->instance_id);
+					ss_factory_policy_t fallback;
+					ss_factory_policy_init_defaults(&fallback);
+					const ss_factory_policy_t *check_policy =
+						cached ? cached : &fallback;
+
+					ss_client_signing_prefs_t prefs;
+					ss_client_signing_prefs_init_defaults(&prefs);
+
+					ss_policy_validation_result_t res;
+					int rc = ss_validate_policy_against_prefs(
+						check_policy, &prefs, &res);
+					if (rc == SS_POLICY_VALIDATE_HARD_FAIL) {
+						plugin_log(plugin_handle, LOG_BROKEN,
+							"REFUSING to sign FACTORY_PROPOSE from %s — "
+							"policy violates client_signing_prefs: "
+							"field_tlv=0x%04x reason=\"%s\"%s",
+							peer_id,
+							(unsigned)res.field_tlv,
+							res.reason,
+							cached ? "" : " (no advertised policy cached; "
+								   "checked defaults)");
+						ss_audit_log(LOG_BROKEN,
+							"policy_violation_refused_sign",
+							"{\"peer\":\"%s\",\"field_tlv\":%u,"
+							"\"reason\":\"%s\",\"had_cached_policy\":%s}",
+							peer_id,
+							(unsigned)res.field_tlv,
+							res.reason,
+							cached ? "true" : "false");
+						free(nb);
+						break;
+					}
+				}
 			}
 
 			/* Read funding amount (0 if old 4-byte trailer). In the
@@ -9392,6 +9523,11 @@ realloc_all_nonces_done:
 		 * array; the wallet UI renders them so the user sees what
 		 * the LSP is advertising BEFORE deciding to join. */
 		if (offset < len && n_factories > 0) {
+			/* B1.5: ALSO cache each policy so the validator can
+			 * look it up at FACTORY_PROPOSE time without needing
+			 * the wallet to round-trip the policy back. */
+			uint8_t lsp_pk[33];
+			bool lsp_pk_ok = ss_peer_id_hex_to_bytes(peer_id, lsp_pk);
 			json_array_start(js, "factory_policies");
 			for (uint8_t i = 0; i < n_factories; i++) {
 				if (offset + 2 > len) break;
@@ -9406,6 +9542,12 @@ realloc_all_nonces_done:
 					ss_factory_policy_decode(
 						data + offset, blob_len, &pol);
 				offset += blob_len;
+
+				/* Cache for validator lookup (B1.5).  Keyed by
+				 * (lsp_node_id, instance_id). */
+				if (lsp_pk_ok)
+					ss_policy_cache_put(lsp_pk,
+						data + 13 + i*47, &pol);
 
 				/* Echo the matching instance_id so the wallet
 				 * can correlate to the entry in the "factories"

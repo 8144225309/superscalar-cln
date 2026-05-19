@@ -597,3 +597,133 @@ int ss_factory_policy_decode(const uint8_t *buf, size_t len,
 	}
 	return (off == len) ? 1 : 0;
 }
+
+/* ============================================================================
+ * Validator (B1.5) — check 12 joiner_enforceable_hard fields
+ * ========================================================================= */
+
+#include <stdio.h>  /* snprintf for reason strings */
+
+#define VALIDATION_HARD_FAIL(tlv, fmt, ...) do { \
+	out->result = SS_POLICY_VALIDATE_HARD_FAIL; \
+	out->field_tlv = (tlv); \
+	snprintf(out->reason, sizeof(out->reason), fmt, __VA_ARGS__); \
+	return SS_POLICY_VALIDATE_HARD_FAIL; \
+} while (0)
+
+int ss_validate_policy_against_prefs(const ss_factory_policy_t *policy,
+				       const ss_client_signing_prefs_t *prefs,
+				       ss_policy_validation_result_t *out)
+{
+	if (!policy || !prefs || !out) return SS_POLICY_VALIDATE_HARD_FAIL;
+	memset(out, 0, sizeof(*out));
+	out->field_tlv = 0xFFFF;
+
+	/* §4.5.3 htlc_min_sat — refuse if LSP's minimum HTLC is too high */
+	if (policy->htlc_min_sat > prefs->max_htlc_min_sat)
+		VALIDATION_HARD_FAIL(SS_POLICY_TLV_HTLC_MIN_SAT,
+			"htlc_min_sat=%llu > user max %llu",
+			(unsigned long long)policy->htlc_min_sat,
+			(unsigned long long)prefs->max_htlc_min_sat);
+
+	/* §4.5.4 htlc_max_sat — refuse if LSP caps HTLCs below user min.
+	 * Special case: policy.htlc_max_sat == 0 means "= channel capacity"
+	 * which is the most permissive setting; no violation possible. */
+	if (policy->htlc_max_sat > 0
+	    && policy->htlc_max_sat < prefs->min_htlc_max_sat)
+		VALIDATION_HARD_FAIL(SS_POLICY_TLV_HTLC_MAX_SAT,
+			"htlc_max_sat=%llu < user min %llu",
+			(unsigned long long)policy->htlc_max_sat,
+			(unsigned long long)prefs->min_htlc_max_sat);
+
+	/* §4.6.1 max_concurrent_htlcs_per_channel */
+	if (policy->max_concurrent_htlcs_per_channel
+	    < prefs->min_max_concurrent_htlcs)
+		VALIDATION_HARD_FAIL(SS_POLICY_TLV_MAX_CONCURRENT_HTLCS_PER_CHANNEL,
+			"max_concurrent_htlcs=%u < user min %u",
+			(unsigned)policy->max_concurrent_htlcs_per_channel,
+			(unsigned)prefs->min_max_concurrent_htlcs);
+
+	/* §4.6.2 max_in_flight_msat_per_channel.  Special case 0 = "90% of
+	 * capacity" which is permissive; no violation possible. */
+	if (policy->max_in_flight_msat_per_channel > 0
+	    && policy->max_in_flight_msat_per_channel
+	       < prefs->min_max_in_flight_msat)
+		VALIDATION_HARD_FAIL(SS_POLICY_TLV_MAX_IN_FLIGHT_MSAT_PER_CHANNEL,
+			"max_in_flight_msat=%llu < user min %llu",
+			(unsigned long long)policy->max_in_flight_msat_per_channel,
+			(unsigned long long)prefs->min_max_in_flight_msat);
+
+	/* §4.6.3 min_final_cltv_expiry_delta — refuse if LSP demands too
+	 * long a CLTV (funds locked for too long per payment). */
+	if (policy->min_final_cltv_expiry_delta > prefs->max_min_final_cltv_delta)
+		VALIDATION_HARD_FAIL(SS_POLICY_TLV_MIN_FINAL_CLTV_EXPIRY_DELTA,
+			"min_final_cltv_expiry_delta=%u > user max %u",
+			(unsigned)policy->min_final_cltv_expiry_delta,
+			(unsigned)prefs->max_min_final_cltv_delta);
+
+	/* §4.6.4 cltv_expiry_delta_forward */
+	if (policy->cltv_expiry_delta_forward > prefs->max_cltv_delta_forward)
+		VALIDATION_HARD_FAIL(SS_POLICY_TLV_CLTV_EXPIRY_DELTA_FORWARD,
+			"cltv_expiry_delta_forward=%u > user max %u",
+			(unsigned)policy->cltv_expiry_delta_forward,
+			(unsigned)prefs->max_cltv_delta_forward);
+
+	/* §4.4.7 min_capacity_per_join_sat — refuse if LSP requires too much
+	 * upfront capacity to join. */
+	if (policy->min_capacity_per_join_sat
+	    > prefs->max_min_capacity_per_join_sat)
+		VALIDATION_HARD_FAIL(SS_POLICY_TLV_MIN_CAPACITY_PER_JOIN_SAT,
+			"min_capacity_per_join_sat=%llu > user max %llu",
+			(unsigned long long)policy->min_capacity_per_join_sat,
+			(unsigned long long)prefs->max_min_capacity_per_join_sat);
+
+	/* §4.4.8 max_capacity_per_join_sat — refuse if LSP caps channel size
+	 * below what we need.  Special case 0 = "no cap" (= per_client_capacity_sat
+	 * default) which is permissive. */
+	if (policy->max_capacity_per_join_sat > 0
+	    && policy->max_capacity_per_join_sat
+	       < prefs->min_max_capacity_per_join_sat)
+		VALIDATION_HARD_FAIL(SS_POLICY_TLV_MAX_CAPACITY_PER_JOIN_SAT,
+			"max_capacity_per_join_sat=%llu < user min %llu",
+			(unsigned long long)policy->max_capacity_per_join_sat,
+			(unsigned long long)prefs->min_max_capacity_per_join_sat);
+
+	/* §4.7.4 proof_tier_required — lower enum value = stricter tier
+	 * (CHANNEL=0 strictest, NONE=2 loosest).  Refuse if LSP requires
+	 * stricter than user can supply. */
+	if (prefs->require_strict_proof_tier
+	    && (uint8_t)policy->proof_tier_required > (uint8_t)prefs->max_proof_tier)
+		VALIDATION_HARD_FAIL(SS_POLICY_TLV_PROOF_TIER_REQUIRED,
+			"proof_tier_required=%u > user max %u",
+			(unsigned)policy->proof_tier_required,
+			(unsigned)prefs->max_proof_tier);
+
+	/* §4.13.4 rotation_interval_blocks — refuse if LSP rotates too
+	 * frequently.  Special case 0 = "on-demand only" which is permissive. */
+	if (policy->rotation_interval_blocks > 0
+	    && policy->rotation_interval_blocks
+	       < prefs->min_rotation_interval_blocks)
+		VALIDATION_HARD_FAIL(SS_POLICY_TLV_ROTATION_INTERVAL_BLOCKS,
+			"rotation_interval_blocks=%u < user min %u",
+			(unsigned)policy->rotation_interval_blocks,
+			(unsigned)prefs->min_rotation_interval_blocks);
+
+	/* §4.7.6 allow_tier_b_rollover */
+	if (prefs->require_tier_b_rollover && !policy->allow_tier_b_rollover)
+		VALIDATION_HARD_FAIL(SS_POLICY_TLV_ALLOW_TIER_B_ROLLOVER,
+			"allow_tier_b_rollover=false but user requires%s", "");
+
+	/* §4.9.3 state_replay_defense_window_blocks */
+	if (policy->state_replay_defense_window_blocks
+	    < prefs->min_state_replay_defense_window_blocks)
+		VALIDATION_HARD_FAIL(SS_POLICY_TLV_STATE_REPLAY_DEFENSE_WINDOW,
+			"state_replay_defense_window_blocks=%u < user min %u",
+			(unsigned)policy->state_replay_defense_window_blocks,
+			(unsigned)prefs->min_state_replay_defense_window_blocks);
+
+	out->result = SS_POLICY_VALIDATE_OK;
+	return SS_POLICY_VALIDATE_OK;
+}
+
+#undef VALIDATION_HARD_FAIL

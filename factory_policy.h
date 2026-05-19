@@ -409,4 +409,12 @@ typedef struct {
 	char      reason[128];  /* human-readable single-line description */
 } ss_policy_validation_result_t;
 
+/* B1.5 validator — declared here, defined in factory_policy.c.
+ * Walks the 12 joiner_enforceable_hard fields per FACTORY_POLICY_V1 §4.0.2,
+ * returns first violation found, or OK if all pass.  Populates `out`
+ * with field_tlv + reason on violation. */
+int ss_validate_policy_against_prefs(const ss_factory_policy_t *policy,
+				       const ss_client_signing_prefs_t *prefs,
+				       ss_policy_validation_result_t *out);
+
 #endif  /* SUPERSCALAR_CLN_FACTORY_POLICY_H */
