@@ -4226,6 +4226,55 @@ static void continue_after_funding(struct command *cmd,
 	ss_save_factory(cmd, fi);
 }
 
+/* ============================================================================
+ * B1.3: Build the TLV-diff factory_policy blob for a single LSP-owned
+ * factory, for attachment to FACTORY_INFO_RESPONSE.
+ *
+ * Today this only maps a handful of fields off factory_instance_t — arity,
+ * lifetime, early-warning.  Most of ss_factory_policy_t stays at canonical
+ * defaults.  Subsequent commits (B1.5+ / Phase D) will populate from CLI
+ * options + wallet.db settings as those plumbing pieces land.
+ *
+ * Returns blob length, or 0 if buffer is too small / cannot encode.
+ * ========================================================================= */
+static size_t ss_build_factory_policy_blob(const factory_instance_t *fi,
+					    uint8_t *buf, size_t cap)
+{
+	if (!fi || !buf) return 0;
+
+	ss_factory_policy_t defaults;
+	ss_factory_policy_init_defaults(&defaults);
+
+	ss_factory_policy_t p;
+	ss_factory_policy_init_defaults(&p);
+
+	/* Map operator-set fields off the factory_instance_t.  factory_t
+	 * arity_t values (1=ARITY_1, 2=ARITY_2, 3=ARITY_PS) align with the
+	 * policy enum's ARITY_1/_2/_PS, so a direct cast is safe.  Sentinel
+	 * 0 means "auto" — leave at default ARITY_PS. */
+	if (fi->arity_mode != 0)
+		p.arity_mode = (ss_arity_mode_t)fi->arity_mode;
+
+	if (fi->expiry_block > fi->creation_block) {
+		uint32_t lifetime = fi->expiry_block - fi->creation_block;
+		p.lifetime_blocks = lifetime;
+		/* re-derive lifetime-dependent default fields so the diff
+		 * doesn't accidentally encode stale derived values */
+		if (p.joiner_admission_window_blocks
+		    == defaults.joiner_admission_window_blocks)
+			p.joiner_admission_window_blocks = lifetime
+				- p.dying_period_blocks;
+		if (p.state_replay_defense_window_blocks
+		    == defaults.state_replay_defense_window_blocks)
+			p.state_replay_defense_window_blocks = lifetime;
+	}
+
+	if (fi->early_warning_time > 0)
+		p.block_early_count = fi->early_warning_time;
+
+	return ss_factory_policy_encode_diff(&p, &defaults, buf, cap);
+}
+
 /* Phase 4: passive last_seen tracking. Updates every factory's join_queue
  * entry whose client_node_id matches the BOLT-8 sender. Called from the
  * top of dispatch_superscalar_submsg so ANY wire message from a known
@@ -9112,14 +9161,24 @@ realloc_all_nonces_done:
 
 		size_t n_facts = ss_state.n_factories;
 		if (n_facts > 32) n_facts = 32;
-		size_t total = 13 + n_facts * 47;
-		uint8_t *resp = tal_arr(cmd, uint8_t, total);
+		/* B1.3: payload layout is now
+		 *   [8 req_id][4 snap_block][1 n_facts][47 × n_facts]
+		 *   [for each emitted factory: [2 BE policy_blob_len][blob]]
+		 * The trailer is backward-compatible — older clients consume
+		 * exactly 13 + n_facts*47 bytes and ignore the rest. */
+		#define SS_POLICY_BLOB_MAX 256
+		size_t cap = 13 + n_facts * 47 + n_facts * (2 + SS_POLICY_BLOB_MAX);
+		size_t total = cap;  /* will be tightened below */
+		uint8_t *resp = tal_arr(cmd, uint8_t, cap);
 		uint8_t *p = resp;
 		for (int i = 7; i >= 0; i--) *p++ = (uint8_t)(req_id >> (i*8));
 		uint32_t snap = ss_state.current_blockheight;
 		for (int i = 3; i >= 0; i--) *p++ = (uint8_t)(snap >> (i*8));
 		uint8_t *n_facts_field = p;
 		*p++ = (uint8_t)n_facts;
+		/* Track which factories we emitted (and in what slot) so the
+		 * trailer policy blobs come out in the same order. */
+		factory_instance_t *emitted_facts[32] = {0};
 		size_t emitted = 0;
 		for (size_t fi_i = 0; fi_i < ss_state.n_factories && emitted < n_facts; fi_i++) {
 			factory_instance_t *xfi = ss_state.factories[fi_i];
@@ -9135,17 +9194,36 @@ realloc_all_nonces_done:
 			bool accepting = xfi->is_lsp && xfi->lifecycle == FACTORY_LIFECYCLE_INIT;
 			*p++ = accepting ? 1 : 0;
 			*p++ = 0; *p++ = 0;
+			emitted_facts[emitted] = xfi;
 			emitted++;
 		}
 		if (emitted != n_facts) {
 			*n_facts_field = (uint8_t)emitted;
-			total = 13 + emitted * 47;
 		}
+
+		/* B1.3: append per-factory policy blob trailer in emission
+		 * order.  One [u16 BE length][length bytes] per factory.
+		 * Length=0 is valid (means "all defaults"). */
+		for (size_t e = 0; e < emitted; e++) {
+			uint8_t pbuf[SS_POLICY_BLOB_MAX];
+			size_t plen = ss_build_factory_policy_blob(
+				emitted_facts[e], pbuf, sizeof(pbuf));
+			if (plen > SS_POLICY_BLOB_MAX) plen = 0;  /* defensive */
+			p[0] = (uint8_t)(plen >> 8);
+			p[1] = (uint8_t)plen;
+			p += 2;
+			if (plen > 0) {
+				memcpy(p, pbuf, plen);
+				p += plen;
+			}
+		}
+		total = (size_t)(p - resp);
+		#undef SS_POLICY_BLOB_MAX
 
 		send_factory_msg(cmd, peer_id, SS_SUBMSG_FACTORY_INFO_RESPONSE,
 				 resp, total);
 		plugin_log(plugin_handle, LOG_INFORM,
-			   "Sent FACTORY_INFO_RESPONSE to %s (req_id=%llu, %zu bytes, %zu factories)",
+			   "Sent FACTORY_INFO_RESPONSE to %s (req_id=%llu, %zu bytes, %zu factories, +policy)",
 			   peer_id, (unsigned long long)req_id, total, emitted);
 		tal_free(resp);
 		break;

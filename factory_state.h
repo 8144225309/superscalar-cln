@@ -1,5 +1,4 @@
 /* Factory instance state management for the SuperScalar CLN plugin.
-#include "factory_policy.h"
 
  *
  * Each factory_instance tracks:
@@ -18,6 +17,7 @@
 #include <stddef.h>
 #include "ceremony.h"
 #include "nonce_exchange.h"
+#include "factory_policy.h"
 
 /* Max participants in a single factory (LSP + clients).
  * Matches FACTORY_MAX_SIGNERS in libsuperscalar v0.1.9. */
