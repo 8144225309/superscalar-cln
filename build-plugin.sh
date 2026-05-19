@@ -27,7 +27,7 @@ cd "$CLN_DIR"
 
 # Copy plugin sources
 cp "$PLUGIN_SRC/superscalar.c" "$PLUGIN_SRC/factory_state.h" "$PLUGIN_SRC/factory_policy.h" \
-   "$PLUGIN_SRC/factory_state.c" "$PLUGIN_SRC/persist.c" \
+   "$PLUGIN_SRC/factory_state.c" "$PLUGIN_SRC/factory_policy.c" "$PLUGIN_SRC/persist.c" \
    "$PLUGIN_SRC/persist.h" "$PLUGIN_SRC/nonce_exchange.c" \
    "$PLUGIN_SRC/nonce_exchange.h" "$PLUGIN_SRC/fee_stubs.c" \
    "$PLUGIN_SRC/ceremony.h" "$PLUGIN_SRC/sweep_builder.c" \
@@ -85,7 +85,7 @@ CFLAGS="-DCLN_NEXT_VERSION=\"v25.12\" \
   -DCOMPAT_V081=1 -DCOMPAT_V082=1 -DCOMPAT_V090=1 -DCOMPAT_V0100=1 \
   -DCOMPAT_V0121=1"
 
-for src in superscalar factory_state persist nonce_exchange fee_stubs sweep_builder ceremony_wire; do
+for src in superscalar factory_state factory_policy persist nonce_exchange fee_stubs sweep_builder ceremony_wire; do
   cc $CFLAGS -c plugins/$src.c -o plugins/$src.o
 done
 
@@ -94,7 +94,7 @@ done
 # Slim libsuperscalar provides factory/musig/DW functions.
 # No --allow-multiple-definition needed.
 cc -Og -fsanitize=address -fsanitize=undefined -o plugins/superscalar \
-  plugins/superscalar.o plugins/factory_state.o plugins/nonce_exchange.o \
+  plugins/superscalar.o plugins/factory_state.o plugins/factory_policy.o plugins/nonce_exchange.o \
   plugins/persist.o plugins/fee_stubs.o plugins/sweep_builder.o \
   plugins/ceremony_wire.o \
   plugins/libplugin.o \

@@ -372,6 +372,26 @@ typedef struct ss_client_signing_prefs {
 void ss_client_signing_prefs_init_defaults(ss_client_signing_prefs_t *prefs);
 
 /* ============================================================================
+ * Wire codec — TLV-diff-from-defaults (§4 of FACTORY_POLICY_V1).
+ *
+ * Encoder: writes TLVs for every field where p differs from `defaults`.
+ *   schema_version is ALWAYS emitted first (per §4.1.1).
+ *   Returns total bytes written, or 0 on buffer overflow.
+ *
+ * Decoder: initialises p to canonical defaults, then overwrites each
+ *   field for which a TLV is present.  Unknown TLV IDs are skipped
+ *   silently for forward compatibility.
+ *   Returns 1 on success, 0 if buf is truncated or malformed.
+ * ========================================================================= */
+
+size_t ss_factory_policy_encode_diff(const ss_factory_policy_t *p,
+				       const ss_factory_policy_t *defaults,
+				       uint8_t *buf, size_t cap);
+
+int ss_factory_policy_decode(const uint8_t *buf, size_t len,
+			       ss_factory_policy_t *p);
+
+/* ============================================================================
  * Validation result — populated by the validator (B1-step-5).
  *
  * field_tlv is the TLV ID of the first violating field; on success it is
