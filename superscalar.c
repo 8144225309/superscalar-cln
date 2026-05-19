@@ -50,6 +50,7 @@
 #include <superscalar/fee_estimator.h>
 #include <superscalar/tx_builder.h>
 #include <common/bech32.h>
+#include <wire/onion_wiregen.h>
 
 /* Phase 3c3: static sanity — fee_estimator_storage on factory_instance_t
  * must be large enough for a fee_estimator_static_t. Checked at compile
@@ -4723,50 +4724,55 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 						plugin_log(plugin_handle, LOG_BROKEN,
 							   "Client: keypair create failed");
 					} else {
-						nonce_bundle_t psig_nb;
-						memset(&psig_nb, 0, sizeof(psig_nb));
-						memcpy(psig_nb.instance_id, fi->instance_id, 32);
-						psig_nb.n_participants = nb->n_participants;
-						psig_nb.n_nodes = factory->n_nodes;
-						psig_nb.n_entries = 0;
+						nonce_bundle_t *psig_nb = calloc(1, sizeof(*psig_nb));
+						if (!psig_nb) {
+							plugin_log(plugin_handle, LOG_BROKEN,
+								"Client: psig_nb alloc failed");
+						} else {
+							memcpy(psig_nb->instance_id, fi->instance_id, 32);
+							psig_nb->n_participants = nb->n_participants;
+							psig_nb->n_nodes = factory->n_nodes;
+							psig_nb->n_entries = 0;
 
-						musig_nonce_pool_t *sp =
-							(musig_nonce_pool_t *)fi->nonce_pool;
+							musig_nonce_pool_t *sp =
+								(musig_nonce_pool_t *)fi->nonce_pool;
 
-						for (size_t si = 0; si < fi->n_secnonces; si++) {
-							uint32_t pi = fi->secnonce_pool_idx[si];
-							uint32_t ni = fi->secnonce_node_idx[si];
-							secp256k1_musig_secnonce *sn =
-								&sp->nonces[pi].secnonce;
+							for (size_t si = 0; si < fi->n_secnonces; si++) {
+								uint32_t pi = fi->secnonce_pool_idx[si];
+								uint32_t ni = fi->secnonce_node_idx[si];
+								secp256k1_musig_secnonce *sn =
+									&sp->nonces[pi].secnonce;
 
-							int slot = factory_find_signer_slot(
-								factory, ni, fi->our_participant_idx);
-							if (slot < 0) continue;
+								int slot = factory_find_signer_slot(
+									factory, ni, fi->our_participant_idx);
+								if (slot < 0) continue;
 
-							secp256k1_musig_partial_sig psig;
-							if (!musig_create_partial_sig(
-								ctx, &psig, sn, &kp,
-								&factory->nodes[ni].signing_session))
-								continue;
+								secp256k1_musig_partial_sig psig;
+								if (!musig_create_partial_sig(
+									ctx, &psig, sn, &kp,
+									&factory->nodes[ni].signing_session))
+									continue;
 
-							musig_partial_sig_serialize(ctx,
-								psig_nb.entries[psig_nb.n_entries].pubnonce,
-								&psig);
-							psig_nb.entries[psig_nb.n_entries].node_idx = ni;
-							psig_nb.entries[psig_nb.n_entries].signer_slot = slot;
-							psig_nb.n_entries++;
+								musig_partial_sig_serialize(ctx,
+									psig_nb->entries[psig_nb->n_entries].pubnonce,
+									&psig);
+								psig_nb->entries[psig_nb->n_entries].node_idx = ni;
+								psig_nb->entries[psig_nb->n_entries].signer_slot = slot;
+								psig_nb->n_entries++;
+							}
+
+							uint8_t pbuf[MAX_WIRE_BUF];
+							size_t plen = nonce_bundle_serialize(
+								psig_nb, pbuf, sizeof(pbuf));
+							send_factory_msg(cmd, peer_id,
+								SS_SUBMSG_PSIG_BUNDLE,
+								pbuf, plen);
+
+							plugin_log(plugin_handle, LOG_INFORM,
+								   "Client: sent PSIG_BUNDLE "
+								   "(%zu psigs)", psig_nb->n_entries);
+							free(psig_nb);
 						}
-
-						uint8_t pbuf[MAX_WIRE_BUF];
-						size_t plen = nonce_bundle_serialize(
-							&psig_nb, pbuf, sizeof(pbuf));
-						send_factory_msg(cmd, peer_id,
-							SS_SUBMSG_PSIG_BUNDLE,
-							pbuf, plen);
-
-						plugin_log(plugin_handle, LOG_INFORM,
-							   "Client: sent PSIG_BUNDLE "
-							   "(%zu psigs)", psig_nb.n_entries);
 					}
 				}
 			} else {
@@ -6036,23 +6042,28 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 			if (fi->dist_session) free(fi->dist_session);
 			fi->dist_session = dsess;
 
-			/* Send DIST_NONCE */
-			nonce_bundle_t nresp;
-			memset(&nresp, 0, sizeof(nresp));
-			memcpy(nresp.instance_id, fi->instance_id, 32);
-			nresp.n_participants = 1 + fi->n_clients;
-			nresp.n_nodes = 1;
-			nresp.n_entries = 1;
-			nresp.entries[0].node_idx = dist_idx;
-			nresp.entries[0].signer_slot = our_idx;
-			musig_pubnonce_serialize(ctx,
-				nresp.entries[0].pubnonce, &pub);
+			/* Send DIST_NONCE (heap alloc: 79KB struct) */
+			uint32_t saved_n_participants;
+			{
+				nonce_bundle_t *nresp = calloc(1, sizeof(*nresp));
+				if (!nresp) break;
+				memcpy(nresp->instance_id, fi->instance_id, 32);
+				nresp->n_participants = 1 + fi->n_clients;
+				nresp->n_nodes = 1;
+				nresp->n_entries = 1;
+				nresp->entries[0].node_idx = dist_idx;
+				nresp->entries[0].signer_slot = our_idx;
+				musig_pubnonce_serialize(ctx,
+					nresp->entries[0].pubnonce, &pub);
 
-			uint8_t nbuf[MAX_WIRE_BUF];
-			size_t nlen = nonce_bundle_serialize(&nresp,
-				nbuf, sizeof(nbuf));
-			send_factory_msg(cmd, peer_id,
-				SS_SUBMSG_DIST_NONCE, nbuf, nlen);
+				uint8_t nbuf[MAX_WIRE_BUF];
+				size_t nlen = nonce_bundle_serialize(nresp,
+					nbuf, sizeof(nbuf));
+				send_factory_msg(cmd, peer_id,
+					SS_SUBMSG_DIST_NONCE, nbuf, nlen);
+				saved_n_participants = nresp->n_participants;
+				free(nresp);
+			}
 
 			/* Finalize standalone session with dist sighash */
 			if (musig_session_finalize_nonces(ctx, dsess,
@@ -6064,25 +6075,27 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 				if (musig_create_partial_sig(ctx, &psig, sec,
 					&kp, dsess)) {
 
-					nonce_bundle_t presp;
-					memset(&presp, 0, sizeof(presp));
-					memcpy(presp.instance_id, fi->instance_id, 32);
-					presp.n_participants = nresp.n_participants;
-					presp.n_nodes = 1;
-					presp.n_entries = 1;
-					presp.entries[0].node_idx = dist_idx;
-					presp.entries[0].signer_slot = our_idx;
-					musig_partial_sig_serialize(ctx,
-						presp.entries[0].pubnonce, &psig);
+					nonce_bundle_t *presp = calloc(1, sizeof(*presp));
+					if (presp) {
+						memcpy(presp->instance_id, fi->instance_id, 32);
+						presp->n_participants = saved_n_participants;
+						presp->n_nodes = 1;
+						presp->n_entries = 1;
+						presp->entries[0].node_idx = dist_idx;
+						presp->entries[0].signer_slot = our_idx;
+						musig_partial_sig_serialize(ctx,
+							presp->entries[0].pubnonce, &psig);
 
-					uint8_t pbuf[MAX_WIRE_BUF];
-					size_t plen = nonce_bundle_serialize(
-						&presp, pbuf, sizeof(pbuf));
-					send_factory_msg(cmd, peer_id,
-						SS_SUBMSG_DIST_PSIG, pbuf, plen);
+						uint8_t pbuf[MAX_WIRE_BUF];
+						size_t plen = nonce_bundle_serialize(
+							presp, pbuf, sizeof(pbuf));
+						send_factory_msg(cmd, peer_id,
+							SS_SUBMSG_DIST_PSIG, pbuf, plen);
+						free(presp);
 
-					plugin_log(plugin_handle, LOG_INFORM,
-						   "Client: sent DIST_NONCE + DIST_PSIG");
+						plugin_log(plugin_handle, LOG_INFORM,
+							   "Client: sent DIST_NONCE + DIST_PSIG");
+					}
 				}
 			} else {
 				/* n>2: can't finalize yet (missing other clients'
@@ -6569,52 +6582,47 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 				   "Client: rotation epoch %u → %u",
 				   old_epoch, new_epoch);
 
-			nonce_bundle_t nb;
-			if (!nonce_bundle_deserialize(&nb, data + 8, len - 8)) {
+			/* Three nonce_bundle_t — heap alloc, 79KB each (~237KB
+			 * total stack avoided). */
+			nonce_bundle_t *nb = calloc(1, sizeof(*nb));
+			if (!nb) break;
+			if (!nonce_bundle_deserialize(nb, data + 8, len - 8)) {
 				plugin_log(plugin_handle, LOG_UNUSUAL,
 					   "Bad ROTATE_PROPOSE nonce bundle");
-				break;
+				free(nb); break;
 			}
 
 			if (!fi) {
-				fi = ss_factory_find(&ss_state, nb.instance_id);
+				fi = ss_factory_find(&ss_state, nb->instance_id);
 			}
 			if (!fi || !fi->lib_factory) {
 				plugin_log(plugin_handle, LOG_UNUSUAL,
 					   "No factory for rotation");
-				break;
+				free(nb); break;
 			}
 
 			factory_t *factory = (factory_t *)fi->lib_factory;
 			secp256k1_context *ctx = global_secp_ctx;
 
-			/* Phase 2b: snapshot current epoch's kickoff witness
-			 * sig BEFORE advancing. Used later to classify a
-			 * spending TX as breach vs normal-exit. */
 			ss_snapshot_current_epoch_kickoff_sig(fi);
 
-			/* Advance our DW counter to match */
 			dw_counter_advance(&factory->counter);
 			fi->epoch = new_epoch;
 
-			/* Rebuild node transactions */
 			for (size_t ni = 0; ni < factory->n_nodes; ni++)
 				factory_rebuild_node_tx(factory, ni);
 
-			/* Re-init signing sessions */
 			factory_sessions_init(factory);
 
-			/* Set LSP nonces on sessions */
-			for (size_t e = 0; e < nb.n_entries; e++) {
+			for (size_t e = 0; e < nb->n_entries; e++) {
 				secp256k1_musig_pubnonce pn;
 				musig_pubnonce_parse(ctx, &pn,
-					nb.entries[e].pubnonce);
+					nb->entries[e].pubnonce);
 				factory_session_set_nonce(factory,
-					nb.entries[e].node_idx,
-					nb.entries[e].signer_slot, &pn);
+					nb->entries[e].node_idx,
+					nb->entries[e].signer_slot, &pn);
 			}
 
-			/* Generate our nonces */
 			int our_idx = fi->our_participant_idx;
 			unsigned char our_sec[32];
 			derive_factory_seckey(our_sec, fi->instance_id, our_idx);
@@ -6623,8 +6631,9 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 				factory, our_idx);
 
 			secp256k1_pubkey our_pub;
-			if (!secp256k1_ec_pubkey_create(ctx, &our_pub, our_sec))
-				break;
+			if (!secp256k1_ec_pubkey_create(ctx, &our_pub, our_sec)) {
+				free(nb); break;
+			}
 
 			if (fi->nonce_pool) {
 				free(fi->nonce_pool);
@@ -6638,12 +6647,12 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 			memcpy(fi->our_seckey, our_sec, 32);
 			fi->n_secnonces = 0;
 
-			nonce_bundle_t resp;
-			memset(&resp, 0, sizeof(resp));
-			memcpy(resp.instance_id, fi->instance_id, 32);
-			resp.n_participants = nb.n_participants;
-			resp.n_nodes = factory->n_nodes;
-			resp.n_entries = 0;
+			nonce_bundle_t *resp = calloc(1, sizeof(*resp));
+			if (!resp) { free(nb); break; }
+			memcpy(resp->instance_id, fi->instance_id, 32);
+			resp->n_participants = nb->n_participants;
+			resp->n_nodes = factory->n_nodes;
+			resp->n_entries = 0;
 
 			size_t pool_entry = 0;
 			for (size_t ni = 0; ni < factory->n_nodes; ni++) {
@@ -6664,41 +6673,40 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 				factory_session_set_nonce(factory, ni,
 					(size_t)slot, &pub);
 				musig_pubnonce_serialize(ctx,
-					resp.entries[resp.n_entries].pubnonce,
+					resp->entries[resp->n_entries].pubnonce,
 					&pub);
-				resp.entries[resp.n_entries].node_idx = ni;
-				resp.entries[resp.n_entries].signer_slot = slot;
-				resp.n_entries++;
+				resp->entries[resp->n_entries].node_idx = ni;
+				resp->entries[resp->n_entries].signer_slot = slot;
+				resp->n_entries++;
 			}
 
-			/* Send ROTATE_NONCE */
 			uint8_t rbuf[MAX_WIRE_BUF];
-			size_t rlen = nonce_bundle_serialize(&resp,
+			size_t rlen = nonce_bundle_serialize(resp,
 				rbuf, sizeof(rbuf));
 			send_factory_msg(cmd, peer_id,
 					 SS_SUBMSG_ROTATE_NONCE,
 					 rbuf, rlen);
+			free(resp);
 
-			/* Finalize and create partial sigs */
 			if (!factory_sessions_finalize(factory)) {
 				plugin_log(plugin_handle, LOG_BROKEN,
 					   "Client: rotate finalize failed");
-				break;
+				free(nb); break;
 			}
 
 			secp256k1_keypair kp;
 			if (!secp256k1_keypair_create(ctx, &kp, our_sec)) {
 				plugin_log(plugin_handle, LOG_BROKEN,
 					   "Client: rotate keypair failed");
-				break;
+				free(nb); break;
 			}
 
-			nonce_bundle_t psig_nb;
-			memset(&psig_nb, 0, sizeof(psig_nb));
-			memcpy(psig_nb.instance_id, fi->instance_id, 32);
-			psig_nb.n_participants = nb.n_participants;
-			psig_nb.n_nodes = factory->n_nodes;
-			psig_nb.n_entries = 0;
+			nonce_bundle_t *psig_nb = calloc(1, sizeof(*psig_nb));
+			if (!psig_nb) { free(nb); break; }
+			memcpy(psig_nb->instance_id, fi->instance_id, 32);
+			psig_nb->n_participants = nb->n_participants;
+			psig_nb->n_nodes = factory->n_nodes;
+			psig_nb->n_entries = 0;
 
 			musig_nonce_pool_t *sp =
 				(musig_nonce_pool_t *)fi->nonce_pool;
@@ -6722,16 +6730,15 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 				}
 
 				musig_partial_sig_serialize(ctx,
-					psig_nb.entries[psig_nb.n_entries].pubnonce,
+					psig_nb->entries[psig_nb->n_entries].pubnonce,
 					&psig);
-				psig_nb.entries[psig_nb.n_entries].node_idx = ni;
-				psig_nb.entries[psig_nb.n_entries].signer_slot = slot;
-				psig_nb.n_entries++;
+				psig_nb->entries[psig_nb->n_entries].node_idx = ni;
+				psig_nb->entries[psig_nb->n_entries].signer_slot = slot;
+				psig_nb->n_entries++;
 			}
 
-			/* Send ROTATE_PSIG */
 			uint8_t pbuf[MAX_WIRE_BUF];
-			size_t plen = nonce_bundle_serialize(&psig_nb,
+			size_t plen = nonce_bundle_serialize(psig_nb,
 				pbuf, sizeof(pbuf));
 			send_factory_msg(cmd, peer_id,
 					 SS_SUBMSG_ROTATE_PSIG,
@@ -6740,7 +6747,9 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 			fi->ceremony = CEREMONY_ROTATING;
 			plugin_log(plugin_handle, LOG_INFORM,
 				   "Client: sent ROTATE_NONCE + ROTATE_PSIG "
-				   "(%zu psigs)", psig_nb.n_entries);
+				   "(%zu psigs)", psig_nb->n_entries);
+			free(psig_nb);
+			free(nb);
 		}
 		break;
 
@@ -6750,22 +6759,24 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 			   peer_id, len);
 		/* LSP side: client sent rotation nonces */
 		if (fi && fi->is_lsp) {
-			nonce_bundle_t cnb;
-			if (!nonce_bundle_deserialize(&cnb, data, len))
-				break;
+			nonce_bundle_t *cnb = calloc(1, sizeof(*cnb));
+			if (!cnb) break;
+			if (!nonce_bundle_deserialize(cnb, data, len)) {
+				free(cnb); break;
+			}
 			factory_t *f = (factory_t *)fi->lib_factory;
-			if (!f) break;
+			if (!f) { free(cnb); break; }
 			secp256k1_context *ctx = global_secp_ctx;
 
 			size_t nonces_set = 0;
-			for (size_t e = 0; e < cnb.n_entries; e++) {
+			for (size_t e = 0; e < cnb->n_entries; e++) {
 				secp256k1_musig_pubnonce pn;
 				if (!musig_pubnonce_parse(ctx, &pn,
-					cnb.entries[e].pubnonce))
+					cnb->entries[e].pubnonce))
 					continue;
 				if (!factory_session_set_nonce(f,
-					cnb.entries[e].node_idx,
-					cnb.entries[e].signer_slot, &pn))
+					cnb->entries[e].node_idx,
+					cnb->entries[e].signer_slot, &pn))
 					continue;
 				nonces_set++;
 			}
@@ -6788,20 +6799,20 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 			}
 
 			/* Cache client nonces for ALL_NONCES round */
-			if (fi->cached_nonces && fi->n_cached_nonces + cnb.n_entries
+			if (fi->cached_nonces && fi->n_cached_nonces + cnb->n_entries
 			    <= fi->cached_nonces_cap) {
 				nonce_entry_t *cache =
 					(nonce_entry_t *)fi->cached_nonces;
 				memcpy(cache + fi->n_cached_nonces,
-				       cnb.entries,
-				       cnb.n_entries * sizeof(nonce_entry_t));
-				fi->n_cached_nonces += cnb.n_entries;
+				       cnb->entries,
+				       cnb->n_entries * sizeof(nonce_entry_t));
+				fi->n_cached_nonces += cnb->n_entries;
 			}
 
 			plugin_log(plugin_handle, LOG_INFORM,
 				   "LSP: rotate nonces set %zu/%zu "
 				   "(cached: %zu total)",
-				   nonces_set, cnb.n_entries,
+				   nonces_set, cnb->n_entries,
 				   fi->n_cached_nonces);
 
 			if (ss_factory_all_nonces_received(fi)) {
@@ -6880,6 +6891,7 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 					fi->ceremony = CEREMONY_ROTATING;
 				}
 			}
+			free(cnb);
 		}
 		break;
 
@@ -6889,29 +6901,31 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 			   peer_id, len);
 		/* LSP side: client sent rotation partial sigs */
 		if (fi && fi->is_lsp) {
-			nonce_bundle_t pnb;
-			if (!nonce_bundle_deserialize(&pnb, data, len))
-				break;
+			nonce_bundle_t *pnb = calloc(1, sizeof(*pnb));
+			if (!pnb) break;
+			if (!nonce_bundle_deserialize(pnb, data, len)) {
+				free(pnb); break;
+			}
 			factory_t *f = (factory_t *)fi->lib_factory;
-			if (!f) break;
+			if (!f) { free(pnb); break; }
 
 			/* Set client psigs */
 			size_t psigs_set = 0;
-			for (size_t e = 0; e < pnb.n_entries; e++) {
+			for (size_t e = 0; e < pnb->n_entries; e++) {
 				secp256k1_musig_partial_sig ps;
 				if (!musig_partial_sig_parse(global_secp_ctx,
-					&ps, pnb.entries[e].pubnonce))
+					&ps, pnb->entries[e].pubnonce))
 					continue;
 				if (!factory_session_set_partial_sig(f,
-					pnb.entries[e].node_idx,
-					pnb.entries[e].signer_slot, &ps))
+					pnb->entries[e].node_idx,
+					pnb->entries[e].signer_slot, &ps))
 					continue;
 				psigs_set++;
 			}
 
 			plugin_log(plugin_handle, LOG_INFORM,
 				   "LSP: rotate client psigs set %zu/%zu",
-				   psigs_set, pnb.n_entries);
+				   psigs_set, pnb->n_entries);
 
 			/* Create LSP's own psigs */
 			secp256k1_keypair lsp_kp;
@@ -6919,7 +6933,7 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 				&lsp_kp, fi->our_seckey)) {
 				plugin_log(plugin_handle, LOG_BROKEN,
 					   "LSP: rotate keypair failed");
-				break;
+				free(pnb); break;
 			}
 
 			musig_nonce_pool_t *lsp_pool =
@@ -6983,8 +6997,9 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 					derive_factory_seckey(rlsp_sk, fi->instance_id, 0);
 					secp256k1_pubkey rlsp_pk;
 					if (!secp256k1_ec_pubkey_create(rdctx,
-						&rlsp_pk, rlsp_sk))
-						break;
+						&rlsp_pk, rlsp_sk)) {
+						free(pnb); break;
+					}
 
 					musig_nonce_pool_t *rdpool = calloc(1,
 						sizeof(musig_nonce_pool_t));
@@ -7059,6 +7074,7 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 					rotate_finish_and_notify(cmd, fi);
 				}
 			}
+			free(pnb);
 		}
 		break;
 
@@ -7237,18 +7253,7 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 		plugin_log(plugin_handle, LOG_INFORM,
 			   "CLOSE_PROPOSE from %s (len=%zu)",
 			   peer_id, len);
-		/* fi is NULL (payload starts with output count, not instance_id) */
-		if (!fi) {
-			for (size_t i = 0; i < ss_state.n_factories; i++) {
-				if (!ss_state.factories[i]->is_lsp) {
-					fi = ss_state.factories[i];
-					break;
-				}
-			}
-		}
-		if (fi && len >= 4) {
-			factory_t *factory = (factory_t *)fi->lib_factory;
-			if (!factory) break;
+		if (len >= 4) {
 			secp256k1_context *ctx = global_secp_ctx;
 
 			/* Parse output distribution */
@@ -7279,6 +7284,22 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 				p += spk_len;
 			}
 
+			/* Lookup factory by instance_id from nonce_bundle.
+			 * The bundle starts at p; its first 32 bytes are the
+			 * instance_id. Old logic picked the first non-LSP
+			 * factory which fails when the client knows more than
+			 * one factory. */
+			if (p + 32 > data + len) break;
+			fi = ss_factory_find(&ss_state, p);
+			if (!fi || fi->is_lsp) {
+				plugin_log(plugin_handle, LOG_BROKEN,
+					"Client: CLOSE_PROPOSE for unknown factory (fi=%p is_lsp=%d)",
+					(void *)fi, fi ? fi->is_lsp : -1);
+				break;
+			}
+			factory_t *factory = (factory_t *)fi->lib_factory;
+			if (!factory) break;
+
 			/* Build unsigned close tx to get sighash */
 			tx_buf_t close_tx;
 			unsigned char sighash[32];
@@ -7298,24 +7319,26 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 				   "Client: close tx built (%zu bytes)",
 				   close_tx.len);
 
-			/* Parse LSP nonces from remainder */
+			/* Parse LSP nonces from remainder (heap alloc: 79KB struct) */
 			size_t hdr_consumed = (size_t)(p - data);
-			nonce_bundle_t cnb;
-			if (hdr_consumed < len &&
-			    nonce_bundle_deserialize(&cnb,
-				p, len - hdr_consumed)) {
-				/* Re-init just node 0 session for close signing */
-				factory_session_init_node(factory, 0);
+			if (hdr_consumed < len) {
+				nonce_bundle_t *cnb = calloc(1, sizeof(*cnb));
+				if (!cnb) break;
+				if (nonce_bundle_deserialize(cnb,
+					p, len - hdr_consumed)) {
+					factory_session_init_node(factory, 0);
 
-				for (size_t e = 0; e < cnb.n_entries; e++) {
-					secp256k1_musig_pubnonce pn;
-					musig_pubnonce_parse(ctx, &pn,
-						cnb.entries[e].pubnonce);
-					factory_session_set_nonce(factory,
-						cnb.entries[e].node_idx,
-						cnb.entries[e].signer_slot,
-						&pn);
+					for (size_t e = 0; e < cnb->n_entries; e++) {
+						secp256k1_musig_pubnonce pn;
+						musig_pubnonce_parse(ctx, &pn,
+							cnb->entries[e].pubnonce);
+						factory_session_set_nonce(factory,
+							cnb->entries[e].node_idx,
+							cnb->entries[e].signer_slot,
+							&pn);
+					}
 				}
+				free(cnb);
 			}
 
 			/* Generate our nonces */
@@ -7344,24 +7367,27 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 			fi->n_secnonces = 1;
 			factory_session_set_nonce(factory, 0, our_idx, &pub);
 
-			/* Send CLOSE_NONCE */
-			nonce_bundle_t nresp;
-			memset(&nresp, 0, sizeof(nresp));
-			memcpy(nresp.instance_id, fi->instance_id, 32);
-			nresp.n_participants = 2;
-			nresp.n_nodes = 1;
-			nresp.n_entries = 1;
-			nresp.entries[0].node_idx = 0;
-			nresp.entries[0].signer_slot = our_idx;
-			musig_pubnonce_serialize(ctx,
-				nresp.entries[0].pubnonce, &pub);
+			/* Send CLOSE_NONCE (heap alloc: 79KB struct) */
+			{
+				nonce_bundle_t *nresp = calloc(1, sizeof(*nresp));
+				if (!nresp) break;
+				memcpy(nresp->instance_id, fi->instance_id, 32);
+				nresp->n_participants = 2;
+				nresp->n_nodes = 1;
+				nresp->n_entries = 1;
+				nresp->entries[0].node_idx = 0;
+				nresp->entries[0].signer_slot = our_idx;
+				musig_pubnonce_serialize(ctx,
+					nresp->entries[0].pubnonce, &pub);
 
-			uint8_t nbuf[MAX_WIRE_BUF];
-			size_t nlen = nonce_bundle_serialize(&nresp,
-				nbuf, sizeof(nbuf));
-			send_factory_msg(cmd, peer_id,
-					 SS_SUBMSG_CLOSE_NONCE,
-					 nbuf, nlen);
+				uint8_t nbuf[MAX_WIRE_BUF];
+				size_t nlen = nonce_bundle_serialize(nresp,
+					nbuf, sizeof(nbuf));
+				send_factory_msg(cmd, peer_id,
+						 SS_SUBMSG_CLOSE_NONCE,
+						 nbuf, nlen);
+				free(nresp);
+			}
 
 			/* Finalize node 0 and create partial sig */
 			factory_session_finalize_node(factory, 0);
@@ -7379,26 +7405,28 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 			if (musig_create_partial_sig(ctx, &psig, sn, &kp,
 				&factory->nodes[0].signing_session)) {
 
-				nonce_bundle_t presp;
-				memset(&presp, 0, sizeof(presp));
-				memcpy(presp.instance_id, fi->instance_id, 32);
-				presp.n_participants = 2;
-				presp.n_nodes = 1;
-				presp.n_entries = 1;
-				presp.entries[0].node_idx = 0;
-				presp.entries[0].signer_slot = our_idx;
-				musig_partial_sig_serialize(ctx,
-					presp.entries[0].pubnonce, &psig);
+				nonce_bundle_t *presp = calloc(1, sizeof(*presp));
+				if (presp) {
+					memcpy(presp->instance_id, fi->instance_id, 32);
+					presp->n_participants = 2;
+					presp->n_nodes = 1;
+					presp->n_entries = 1;
+					presp->entries[0].node_idx = 0;
+					presp->entries[0].signer_slot = our_idx;
+					musig_partial_sig_serialize(ctx,
+						presp->entries[0].pubnonce, &psig);
 
-				uint8_t pbuf[MAX_WIRE_BUF];
-				size_t plen = nonce_bundle_serialize(&presp,
-					pbuf, sizeof(pbuf));
-				send_factory_msg(cmd, peer_id,
-					SS_SUBMSG_CLOSE_PSIG,
-					pbuf, plen);
+					uint8_t pbuf[MAX_WIRE_BUF];
+					size_t plen = nonce_bundle_serialize(presp,
+						pbuf, sizeof(pbuf));
+					send_factory_msg(cmd, peer_id,
+						SS_SUBMSG_CLOSE_PSIG,
+						pbuf, plen);
+					free(presp);
 
-				plugin_log(plugin_handle, LOG_INFORM,
-					   "Client: sent CLOSE_NONCE + CLOSE_PSIG");
+					plugin_log(plugin_handle, LOG_INFORM,
+						   "Client: sent CLOSE_NONCE + CLOSE_PSIG");
+				}
 			}
 
 			tx_buf_free(&close_tx);
@@ -7410,15 +7438,12 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 		plugin_log(plugin_handle, LOG_INFORM,
 			   "CLOSE_NONCE from %s (len=%zu)",
 			   peer_id, len);
-		/* LSP side: client sent close nonces.
-		 * Task #95: nonce_bundle_t is ~79KB (MAX_NONCE_ENTRIES=1024).
-		 * Stack-allocating it caused the plugin to exit silently
-		 * during cooperative close — libplugin's stack isn't big
-		 * enough. Heap-allocate to match the other handlers. */
 		if (fi && fi->is_lsp) {
 			nonce_bundle_t *cnb = calloc(1, sizeof(*cnb));
 			if (!cnb) break;
 			if (!nonce_bundle_deserialize(cnb, data, len)) {
+				plugin_log(plugin_handle, LOG_UNUSUAL,
+					   "CLOSE_NONCE: deserialize failed");
 				free(cnb);
 				break;
 			}
@@ -7439,7 +7464,6 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 			}
 			free(cnb);
 
-			/* Finalize just node 0 (close tx) */
 			if (!factory_session_finalize_node(f, 0))
 				plugin_log(plugin_handle, LOG_BROKEN,
 					   "LSP: close finalize failed");
@@ -7490,7 +7514,23 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 
 			musig_nonce_pool_t *lsp_pool =
 				(musig_nonce_pool_t *)fi->nonce_pool;
-			if (lsp_pool && fi->n_secnonces > 0) {
+			/* Guard: secp256k1_musig_partial_sign aborts the
+			 * process if secnonce was wiped (single-use safety)
+			 * or session was never properly finalized. Refuse
+			 * partial_sign unless finalize ran cleanly — the
+			 * indicator is nonces_collected == n_signers AND
+			 * the session reached agg state (msg32 non-zero). */
+			int finalize_ran = 0;
+			for (int z = 0; z < 32; z++) {
+				if (f->nodes[0].signing_session.msg32[z]) {
+					finalize_ran = 1;
+					break;
+				}
+			}
+			if (lsp_pool && fi->n_secnonces > 0
+			    && finalize_ran
+			    && (size_t)f->nodes[0].signing_session.nonces_collected
+				   == f->nodes[0].n_signers) {
 				uint32_t pi = fi->secnonce_pool_idx[0];
 				secp256k1_musig_secnonce *sn =
 					&lsp_pool->nonces[pi].secnonce;
@@ -7505,6 +7545,14 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 					plugin_log(plugin_handle, LOG_INFORM,
 						   "LSP: created own close psig");
 				}
+			} else {
+				plugin_log(plugin_handle, LOG_BROKEN,
+					"LSP: skipping partial_sign — session not finalized "
+					"(finalize_ran=%d collected=%d n_signers=%zu pool=%p n_sec=%u)",
+					finalize_ran,
+					f->nodes[0].signing_session.nonces_collected,
+					f->nodes[0].n_signers,
+					(void *)lsp_pool, fi->n_secnonces);
 			}
 
 			/* Try to complete just node 0 (close tx) */
@@ -9945,21 +9993,19 @@ static struct command_result *handle_htlc_accepted(struct command *cmd,
 	if (max_early_warning > 0
 	    && cltv_expiry < ss_state.current_blockheight
 			     + max_early_warning + 1) {
-		/* Task #94: previously returned result=fail with the
-		 * deprecated failure_code field. Modern CLN requires
-		 * failure_message (BOLT-4 hex) or failure_onion; sending
-		 * neither + result=fail crashes lightningd with FATAL
-		 * SIGNAL 6 in htlc_accepted_hook_deserialize. Downgraded
-		 * to LOG_UNUSUAL + continue until we wire a proper
-		 * failure_message via libcommon's towire_temporary_*. */
-		plugin_log(plugin_handle, LOG_UNUSUAL,
-			   "htlc_accepted: cltv_expiry=%u below early_warning "
-			   "threshold (current=%u + ewt=%u + 1 = %u) — "
-			   "allowing for now; proper rejection pending "
-			   "failure_message wiring (Task #94)",
-			   cltv_expiry, ss_state.current_blockheight,
-			   max_early_warning,
-			   ss_state.current_blockheight + max_early_warning + 1);
+		plugin_log(plugin_handle, LOG_INFORM,
+			   "htlc_accepted: rejecting cltv=%u (need >= %u for ewt=%u)",
+			   cltv_expiry,
+			   ss_state.current_blockheight + max_early_warning + 1,
+			   max_early_warning);
+
+		u8 *failmsg = towire_incorrect_cltv_expiry(cmd, cltv_expiry,
+							    NULL);
+		struct json_stream *response = jsonrpc_stream_success(cmd);
+		json_add_string(response, "result", "fail");
+		json_add_hex(response, "failure_message", failmsg,
+			     tal_count(failmsg));
+		return command_finished(cmd, response);
 	}
 
 	return command_hook_success(cmd);
@@ -12332,7 +12378,13 @@ static struct command_result *json_factory_close(struct command *cmd,
 	fi->secnonce_pool_idx[0] = 0;
 	fi->secnonce_node_idx[0] = 0;
 	fi->n_secnonces = 1;
-	factory_session_set_nonce(factory, 0, 0, &pubnonce);
+	if (!factory_session_set_nonce(factory, 0, 0, &pubnonce)) {
+		plugin_log(plugin_handle, LOG_BROKEN,
+			"factory-close: LSP set_nonce(0,0) rejected "
+			"(n_signers=%zu collected=%d)",
+			factory->nodes[0].n_signers,
+			factory->nodes[0].signing_session.nonces_collected);
+	}
 
 	/* Build CLOSE_PROPOSE payload:
 	 * n_outputs(4) + per output: amount(8) + spk_len(2) + spk(var)
@@ -12355,16 +12407,17 @@ static struct command_result *json_factory_close(struct command *cmd,
 		p += sl;
 	}
 
-	/* Append nonce bundle */
-	nonce_bundle_t nb;
-	memset(&nb, 0, sizeof(nb));
-	memcpy(nb.instance_id, fi->instance_id, 32);
-	nb.n_participants = n_participants;
-	nb.n_nodes = 1;
-	nb.n_entries = 1;
-	nb.entries[0].node_idx = 0;
-	nb.entries[0].signer_slot = 0;
-	musig_pubnonce_serialize(ctx, nb.entries[0].pubnonce, &pubnonce);
+	/* Append nonce bundle (heap alloc: 79KB struct) */
+	nonce_bundle_t *nb = calloc(1, sizeof(*nb));
+	if (!nb)
+		return command_fail(cmd, LIGHTNINGD, "nb alloc failed");
+	memcpy(nb->instance_id, fi->instance_id, 32);
+	nb->n_participants = n_participants;
+	nb->n_nodes = 1;
+	nb->n_entries = 1;
+	nb->entries[0].node_idx = 0;
+	nb->entries[0].signer_slot = 0;
+	musig_pubnonce_serialize(ctx, nb->entries[0].pubnonce, &pubnonce);
 
 	for (size_t pk = 0; pk < n_participants && pk < MAX_PARTICIPANTS; pk++) {
 		unsigned char sk2[32];
@@ -12373,12 +12426,13 @@ static struct command_result *json_factory_close(struct command *cmd,
 		if (!secp256k1_ec_pubkey_create(ctx, &ppk, sk2))
 			continue;
 		size_t pklen = 33;
-		secp256k1_ec_pubkey_serialize(ctx, nb.pubkeys[pk], &pklen,
+		secp256k1_ec_pubkey_serialize(ctx, nb->pubkeys[pk], &pklen,
 			&ppk, SECP256K1_EC_COMPRESSED);
 	}
 
 	uint8_t nbuf[MAX_WIRE_BUF];
-	size_t nlen = nonce_bundle_serialize(&nb, nbuf, sizeof(nbuf));
+	size_t nlen = nonce_bundle_serialize(nb, nbuf, sizeof(nbuf));
+	free(nb);
 	memcpy(p, nbuf, nlen);
 	size_t plen = (size_t)(p - payload) + nlen;
 
@@ -12583,18 +12637,19 @@ static struct command_result *json_factory_rotate(struct command *cmd,
 	}
 	fi->nonce_pool = pool;
 
-	/* Build nonce bundle for rotation */
-	nonce_bundle_t nb;
-	memset(&nb, 0, sizeof(nb));
-	memcpy(nb.instance_id, fi->instance_id, 32);
-	nb.n_participants = n_participants;
-	nb.n_nodes = factory->n_nodes;
-	nb.n_entries = 0;
+	/* Build nonce bundle for rotation (heap alloc: 79KB struct) */
+	nonce_bundle_t *nb = calloc(1, sizeof(*nb));
+	if (!nb)
+		return command_fail(cmd, LIGHTNINGD, "nb alloc failed");
+	memcpy(nb->instance_id, fi->instance_id, 32);
+	nb->n_participants = n_participants;
+	nb->n_nodes = factory->n_nodes;
+	nb->n_entries = 0;
 
 	for (size_t pk = 0; pk < n_participants && pk < MAX_PARTICIPANTS; pk++) {
 		size_t pklen = 33;
 		secp256k1_ec_pubkey_serialize(ctx,
-			nb.pubkeys[pk], &pklen,
+			nb->pubkeys[pk], &pklen,
 			&pubkeys[pk], SECP256K1_EC_COMPRESSED);
 	}
 
@@ -12615,10 +12670,10 @@ static struct command_result *json_factory_rotate(struct command *cmd,
 
 		factory_session_set_nonce(factory, ni, (size_t)slot, &pubnonce);
 		musig_pubnonce_serialize(ctx,
-			nb.entries[nb.n_entries].pubnonce, &pubnonce);
-		nb.entries[nb.n_entries].node_idx = ni;
-		nb.entries[nb.n_entries].signer_slot = slot;
-		nb.n_entries++;
+			nb->entries[nb->n_entries].pubnonce, &pubnonce);
+		nb->entries[nb->n_entries].node_idx = ni;
+		nb->entries[nb->n_entries].signer_slot = slot;
+		nb->n_entries++;
 	}
 
 	/* Cache LSP rotation nonces for ALL_NONCES round (3+ party) */
@@ -12627,16 +12682,17 @@ static struct command_result *json_factory_rotate(struct command *cmd,
 	fi->cached_nonces = calloc(fi->cached_nonces_cap,
 		sizeof(nonce_entry_t));
 	fi->n_cached_nonces = 0;
-	if (fi->cached_nonces && nb.n_entries <= fi->cached_nonces_cap) {
-		memcpy(fi->cached_nonces, nb.entries,
-		       nb.n_entries * sizeof(nonce_entry_t));
-		fi->n_cached_nonces = nb.n_entries;
+	if (fi->cached_nonces && nb->n_entries <= fi->cached_nonces_cap) {
+		memcpy(fi->cached_nonces, nb->entries,
+		       nb->n_entries * sizeof(nonce_entry_t));
+		fi->n_cached_nonces = nb->n_entries;
 	}
 
 	/* Serialize and send ROTATE_PROPOSE to all clients.
 	 * Payload: [4 bytes: old_epoch] [4 bytes: new_epoch] + nonce_bundle */
 	uint8_t nbuf[MAX_WIRE_BUF];
-	size_t nlen = nonce_bundle_serialize(&nb, nbuf, sizeof(nbuf));
+	size_t nlen = nonce_bundle_serialize(nb, nbuf, sizeof(nbuf));
+	free(nb);
 
 	/* Prepend epoch info: old(4) + new(4) + bundle */
 	uint8_t payload[8 + MAX_WIRE_BUF];
