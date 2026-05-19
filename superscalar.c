@@ -1980,6 +1980,57 @@ static struct command_result *withdraw_funding_err(struct command *cmd,
 /* Send a SuperScalar message wrapped in factory_piggyback (submsg 4).
  * Wire format: type(2) + submsg_id=4(2) + TLV[0]=protocol_id(34) +
  *              TLV[1024]=payload(4+len) where payload = ss_submsg(2)+data */
+
+/* ============================================================================
+ * Task #120: send_factory_msg auto-reconnect.
+ *
+ * Every outgoing factory custommsg now goes through a connect-first dance.
+ * CLN's `connect` is idempotent: a no-op for already-peered nodes, a fresh
+ * BOLT-8 handshake otherwise.  Address resolution is delegated to CLN's
+ * gossip (listnodes lookup happens inside CLN when id-only connect runs).
+ *
+ * This protects ceremony fan-outs (FACTORY_PROPOSE / NONCE_BUNDLE /
+ * PSIG / DIST) where the LSP and clients may have dropped the BOLT-8
+ * transport between join_request and trigger_ceremony.  The RPC-level
+ * auto-connect (task #118) handles first contact for browse and join;
+ * once one connect succeeds, gossip carries the address for all
+ * subsequent ceremony messages on this base helper.
+ * ============================================================================ */
+struct ss_send_ctx {
+	char *peer_id;
+	char *hex_payload;
+};
+
+static struct command_result *ss_send_step_sendcustommsg(
+	struct command *cmd, const char *method UNUSED,
+	const char *buf UNUSED, const jsmntok_t *result UNUSED, void *arg)
+{
+	struct ss_send_ctx *sc = arg;
+	struct out_req *req = jsonrpc_request_start(cmd, "sendcustommsg",
+		rpc_done, rpc_err, cmd);
+	json_add_string(req->js, "node_id", sc->peer_id);
+	json_add_string(req->js, "msg", sc->hex_payload);
+	send_outreq(req);
+	return command_still_pending(cmd);
+}
+
+static struct command_result *ss_send_step_connect_failed(
+	struct command *cmd, const char *method UNUSED,
+	const char *buf, const jsmntok_t *result, void *arg)
+{
+	struct ss_send_ctx *sc = arg;
+	const jsmntok_t *m = json_get_member(buf, result, "message");
+	const char *msg = m ? json_strdup(cmd, buf, m) : "connect failed";
+	plugin_log(plugin_handle, LOG_UNUSUAL,
+		   "send_factory_msg: connect to %s failed (%s); "
+		   "attempting sendcustommsg anyway",
+		   sc->peer_id, msg);
+	/* Hail Mary: the connect may have failed due to a transient gossip
+	 * miss while a BOLT-8 handshake is in flight. Try the send anyway —
+	 * if the peer is genuinely offline it'll fail with a clearer error. */
+	return ss_send_step_sendcustommsg(cmd, NULL, NULL, NULL, sc);
+}
+
 static void send_factory_msg(struct command *cmd, const char *peer_id,
 			     uint16_t ss_submsg, const uint8_t *data,
 			     size_t data_len)
@@ -2027,10 +2078,15 @@ static void send_factory_msg(struct command *cmd, const char *peer_id,
 	for (size_t h = 0; h < actual_len; h++)
 		sprintf(hex + h*2, "%02x", wire[h]);
 
-	struct out_req *req = jsonrpc_request_start(cmd,
-		"sendcustommsg", rpc_done, rpc_err, cmd);
-	json_add_string(req->js, "node_id", peer_id);
-	json_add_string(req->js, "msg", hex);
+	/* Task #120: auto-reconnect via idempotent connect-first. */
+	struct ss_send_ctx *sc = tal(cmd, struct ss_send_ctx);
+	sc->peer_id = tal_strdup(sc, peer_id);
+	sc->hex_payload = tal_strdup(sc, hex);
+
+	struct out_req *req = jsonrpc_request_start(cmd, "connect",
+		ss_send_step_sendcustommsg,
+		ss_send_step_connect_failed, sc);
+	json_add_string(req->js, "id", sc->peer_id);
 	send_outreq(req);
 	free(wire);
 }
