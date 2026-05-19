@@ -9383,6 +9383,95 @@ realloc_all_nonces_done:
 			break;
 		}
 
+		/* B1.4: per-factory policy trailer (one entry per factory in
+		 * flat-list order):
+		 *   [u16 BE policy_blob_len][policy_blob_len bytes blob]
+		 * Backward-compat: if message ends at the flat list (older
+		 * LSP), every factory's policy is "all defaults".  We decode
+		 * the blobs and expose the joiner-relevant fields as a JSON
+		 * array; the wallet UI renders them so the user sees what
+		 * the LSP is advertising BEFORE deciding to join. */
+		if (offset < len && n_factories > 0) {
+			json_array_start(js, "factory_policies");
+			for (uint8_t i = 0; i < n_factories; i++) {
+				if (offset + 2 > len) break;
+				uint16_t blob_len =
+					((uint16_t)data[offset] << 8)
+					| (uint16_t)data[offset + 1];
+				offset += 2;
+				if ((size_t)offset + blob_len > len) break;
+				ss_factory_policy_t pol;
+				ss_factory_policy_init_defaults(&pol);
+				if (blob_len > 0)
+					ss_factory_policy_decode(
+						data + offset, blob_len, &pol);
+				offset += blob_len;
+
+				/* Echo the matching instance_id so the wallet
+				 * can correlate to the entry in the "factories"
+				 * array above. */
+				char iid_hex[65];
+				for (int j = 0; j < 32; j++)
+					sprintf(iid_hex + j*2, "%02x",
+						data[13 + i*47 + j]);
+				iid_hex[64] = 0;
+
+				json_object_start(js, NULL);
+				json_add_string(js, "instance_id", iid_hex);
+				json_add_u32(js, "schema_version",
+					pol.schema_version);
+				/* Tree shape */
+				json_add_u32(js, "arity_mode",
+					(uint32_t)pol.arity_mode);
+				json_add_u32(js, "leaf_arity",
+					(uint32_t)pol.leaf_arity);
+				/* Lifecycle */
+				json_add_u32(js, "lifetime_blocks",
+					pol.lifetime_blocks);
+				json_add_u32(js, "dying_period_blocks",
+					pol.dying_period_blocks);
+				json_add_u32(js, "block_early_count",
+					(uint32_t)pol.block_early_count);
+				/* Economics — what the user pays */
+				json_add_u64(js, "per_client_capacity_sat",
+					pol.per_client_capacity_sat);
+				json_add_u64(js, "lsp_fee_sat",
+					pol.lsp_fee_sat);
+				json_add_u32(js, "lsp_fee_ppm",
+					pol.lsp_fee_ppm);
+				json_add_u64(js, "join_fee_sat",
+					pol.join_fee_sat);
+				/* The 12 joiner_enforceable_hard fields that
+				 * the B1.5 validator will check */
+				json_add_u64(js, "htlc_min_sat",
+					pol.htlc_min_sat);
+				json_add_u64(js, "htlc_max_sat",
+					pol.htlc_max_sat);
+				json_add_u32(js, "max_concurrent_htlcs_per_channel",
+					(uint32_t)pol.max_concurrent_htlcs_per_channel);
+				json_add_u64(js, "max_in_flight_msat_per_channel",
+					pol.max_in_flight_msat_per_channel);
+				json_add_u32(js, "min_final_cltv_expiry_delta",
+					pol.min_final_cltv_expiry_delta);
+				json_add_u32(js, "cltv_expiry_delta_forward",
+					pol.cltv_expiry_delta_forward);
+				json_add_u64(js, "min_capacity_per_join_sat",
+					pol.min_capacity_per_join_sat);
+				json_add_u64(js, "max_capacity_per_join_sat",
+					pol.max_capacity_per_join_sat);
+				json_add_u32(js, "proof_tier_required",
+					(uint32_t)pol.proof_tier_required);
+				json_add_u32(js, "rotation_interval_blocks",
+					pol.rotation_interval_blocks);
+				json_add_bool(js, "allow_tier_b_rollover",
+					pol.allow_tier_b_rollover);
+				json_add_u32(js, "state_replay_defense_window_blocks",
+					pol.state_replay_defense_window_blocks);
+				json_object_end(js);
+			}
+			json_array_end(js);
+		}
+
 		plugin_log(plugin_handle, LOG_INFORM,
 			   "factory-browse-host: resolved req_id=%llu with %u factories from %s",
 			   (unsigned long long)req_id, (unsigned)n_factories, peer_id);
