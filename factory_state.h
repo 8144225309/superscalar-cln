@@ -1,4 +1,6 @@
 /* Factory instance state management for the SuperScalar CLN plugin.
+#include "factory_policy.h"
+
  *
  * Each factory_instance tracks:
  * - Participants (LSP + N clients)

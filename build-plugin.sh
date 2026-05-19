@@ -26,7 +26,7 @@ PLUGIN_SRC="${PLUGIN_SRC:-$(dirname $0)}"
 cd "$CLN_DIR"
 
 # Copy plugin sources
-cp "$PLUGIN_SRC/superscalar.c" "$PLUGIN_SRC/factory_state.h" \
+cp "$PLUGIN_SRC/superscalar.c" "$PLUGIN_SRC/factory_state.h" "$PLUGIN_SRC/factory_policy.h" \
    "$PLUGIN_SRC/factory_state.c" "$PLUGIN_SRC/persist.c" \
    "$PLUGIN_SRC/persist.h" "$PLUGIN_SRC/nonce_exchange.c" \
    "$PLUGIN_SRC/nonce_exchange.h" "$PLUGIN_SRC/fee_stubs.c" \
