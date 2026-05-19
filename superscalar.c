@@ -10725,10 +10725,173 @@ static struct command_result *handle_openchannel(struct command *cmd,
 struct browse_preflight_ctx {
 	const char *node_id_str;
 	uint32_t since_block;
+	char *address;  /* Task #118: optional connect address hint */
 };
 
 /* Bug C fix: listpeers preflight succeeded. Check the peer is actually
  * connected before allocating a slot and sending the wire request. */
+
+/* ============================================================================
+ * Task #118: ss_ensure_peer_connected — async helper used by browse-host /
+ * join-request RPCs to ensure BOLT-8 peering before sending custommsg.
+ *
+ * Flow:
+ *   listpeers id=node_id
+ *      \-> if connected:  call done_cb(cmd, user)
+ *      \-> if not connected AND address provided: connect id=node_id host=address
+ *           \-> on success: done_cb(cmd, user)
+ *           \-> on failure: err_cb(cmd, user, msg)
+ *      \-> if not connected AND no address: err_cb(cmd, user, "no address hint")
+ *
+ * The caller passes a tal-allocated user-context pointer and the two
+ * callbacks; this helper takes ownership of bridging through the listpeers
+ * + optional connect calls.
+ *
+ * In the auto-connect path we let CLN handle gossip lookup: if the caller
+ * passes a bare pubkey to connect (no host), CLN walks the node_announcement
+ * gossip itself.  Most useful for testnet4 fleets where addresses arent
+ * yet learned via gossip — the wallet passes the address explicitly from
+ * the rendezvous vouch.
+ * ============================================================================ */
+struct ss_ensure_connect_ctx {
+	char *node_id_str;
+	char *address;  /* may be NULL */
+	void *user;
+	struct command_result *(*done_cb)(struct command *cmd, void *user);
+	struct command_result *(*err_cb)(struct command *cmd, void *user,
+					 const char *errmsg);
+};
+
+static struct command_result *ss_ensure_connect_done(
+	struct command *cmd, const char *method UNUSED,
+	const char *buf UNUSED, const jsmntok_t *result UNUSED, void *arg)
+{
+	struct ss_ensure_connect_ctx *ec = arg;
+	plugin_log(plugin_handle, LOG_INFORM,
+		   "auto-connect to %s succeeded", ec->node_id_str);
+	return ec->done_cb(cmd, ec->user);
+}
+
+static struct command_result *ss_ensure_connect_failed(
+	struct command *cmd, const char *method UNUSED,
+	const char *buf, const jsmntok_t *result, void *arg)
+{
+	struct ss_ensure_connect_ctx *ec = arg;
+	const jsmntok_t *m = json_get_member(buf, result, "message");
+	const char *msg = m ? json_strdup(cmd, buf, m) : "connect failed";
+	plugin_log(plugin_handle, LOG_UNUSUAL,
+		   "auto-connect to %s failed: %s", ec->node_id_str, msg);
+	return ec->err_cb(cmd, ec->user, msg);
+}
+
+static struct command_result *ss_ensure_connect_listpeers_ok(
+	struct command *cmd, const char *method UNUSED,
+	const char *buf, const jsmntok_t *result, void *arg)
+{
+	struct ss_ensure_connect_ctx *ec = arg;
+
+	bool connected = false;
+	const jsmntok_t *peers = json_get_member(buf, result, "peers");
+	if (peers && peers->type == JSMN_ARRAY && peers->size > 0) {
+		const jsmntok_t *peer = peers + 1;
+		const jsmntok_t *conn = json_get_member(buf, peer, "connected");
+		if (conn) json_to_bool(buf, conn, &connected);
+	}
+
+	if (connected) {
+		return ec->done_cb(cmd, ec->user);
+	}
+
+	plugin_log(plugin_handle, LOG_INFORM,
+		   "auto-connect: peer %s not connected, attempting connect "
+		   "(address_hint=%s)",
+		   ec->node_id_str, ec->address ? ec->address : "(none, will use gossip)");
+
+	struct out_req *req = jsonrpc_request_start(cmd, "connect",
+		ss_ensure_connect_done, ss_ensure_connect_failed, ec);
+	json_add_string(req->js, "id", ec->node_id_str);
+	if (ec->address && *ec->address)
+		json_add_string(req->js, "host", ec->address);
+	return send_outreq(req);
+}
+
+static struct command_result *ss_ensure_peer_connected(
+	struct command *cmd,
+	const char *node_id_str,
+	const char *address_hint,  /* may be NULL */
+	void *user,
+	struct command_result *(*done_cb)(struct command *, void *),
+	struct command_result *(*err_cb)(struct command *, void *,
+					 const char *errmsg))
+{
+	struct ss_ensure_connect_ctx *ec = tal(cmd, struct ss_ensure_connect_ctx);
+	ec->node_id_str = tal_strdup(ec, node_id_str);
+	ec->address = address_hint ? tal_strdup(ec, address_hint) : NULL;
+	ec->user = user;
+	ec->done_cb = done_cb;
+	ec->err_cb = err_cb;
+
+	struct out_req *req = jsonrpc_request_start(cmd, "listpeers",
+		ss_ensure_connect_listpeers_ok,
+		ss_ensure_connect_failed, ec);
+	json_add_string(req->js, "id", node_id_str);
+	return send_outreq(req);
+}
+
+
+/* Task #118: invoked after ss_ensure_peer_connected verifies peer is up.
+ * Carries out the original browse_preflight_ok body (slot alloc + send). */
+static struct command_result *browse_send_now(struct command *cmd, void *user)
+{
+	struct browse_preflight_ctx *ctx = user;
+
+	int slot = ss_browse_alloc_slot();
+	if (slot < 0) {
+		ss_audit_log(LOG_UNUSUAL, "slot_exhausted",
+			     "\"rpc\":\"factory-browse-host\","
+			     "\"peer\":\"%s\",\"max\":%d",
+			     ctx->node_id_str, SS_BROWSE_MAX_PENDING);
+		return command_fail(cmd, SS_ERR_SLOT_EXHAUSTED,
+			"factory-browse-host: too many pending requests "
+			"(max %d). Try again later.",
+			SS_BROWSE_MAX_PENDING);
+	}
+
+	uint64_t req_id = ss_fresh_request_id();
+	ss_browse_pending[slot].request_id = req_id;
+	ss_browse_pending[slot].cmd = cmd;
+	ss_browse_pending[slot].deadline = time(NULL) + ss_browse_timeout_secs;
+
+	uint8_t payload[12];
+	uint8_t *p = payload;
+	for (int i = 7; i >= 0; i--) *p++ = (uint8_t)(req_id >> (i*8));
+	for (int i = 3; i >= 0; i--)
+		*p++ = (uint8_t)(ctx->since_block >> (i*8));
+
+	send_factory_msg_browse(cmd, ctx->node_id_str,
+				SS_SUBMSG_FACTORY_INFO_REQUEST,
+				payload, sizeof(payload));
+
+	plugin_log(plugin_handle, LOG_INFORM,
+		   "factory-browse-host: sent FACTORY_INFO_REQUEST to %s "
+		   "(req_id=%llu since_block=%u)",
+		   ctx->node_id_str, (unsigned long long)req_id,
+		   ctx->since_block);
+
+	return command_still_pending(cmd);
+}
+
+static struct command_result *browse_autoconnect_failed(struct command *cmd,
+							void *user UNUSED,
+							const char *errmsg)
+{
+	return command_fail(cmd, LIGHTNINGD,
+		"factory-browse-host: cannot reach peer (%s). "
+		"Either pass an `address` parameter (e.g. 127.0.0.1:9735), or "
+		"first run `lightning-cli connect <node_id>@<host>:<port>`.",
+		errmsg);
+}
+
 static struct command_result *browse_preflight_ok(struct command *cmd,
 						  const char *method,
 						  const char *buf,
@@ -11082,28 +11245,27 @@ static struct command_result *json_factory_browse_host(struct command *cmd,
 						       const jsmntok_t *params)
 {
 	const char *node_id_str = NULL;
+	const char *address_str = NULL;
 	uint32_t *since_block_opt = NULL;
 
 	if (!param(cmd, buf, params,
 		   p_req("node_id", param_string, &node_id_str),
 		   p_opt("since_block", param_u32, &since_block_opt),
+		   p_opt("address", param_string, &address_str),
 		   NULL))
 		return command_param_failed();
 
-	/* Bug C fix: preflight listpeers check before allocating a slot.
-	 * Avoids sending into the void when the target peer is unknown
-	 * or disconnected, and gives the user a clear, fast error
-	 * instead of a hanging RPC. */
+	/* Task #118: route through ss_ensure_peer_connected — auto-connect
+	 * if not currently peered AND caller supplied an address hint. */
 	struct browse_preflight_ctx *ctx =
 		tal(cmd, struct browse_preflight_ctx);
 	ctx->node_id_str = tal_strdup(ctx, node_id_str);
 	ctx->since_block = since_block_opt ? *since_block_opt : 0;
+	ctx->address = address_str ? tal_strdup(ctx, address_str) : NULL;
 
-	struct out_req *req = jsonrpc_request_start(cmd, "listpeers",
-						    browse_preflight_ok,
-						    browse_preflight_err, ctx);
-	json_add_string(req->js, "id", ctx->node_id_str);
-	return send_outreq(req);
+	return ss_ensure_peer_connected(cmd, ctx->node_id_str, ctx->address, ctx,
+		browse_send_now,
+		browse_autoconnect_failed);
 }
 
 /* ============================================================================
@@ -11331,20 +11493,57 @@ static struct command_result *join_preflight_err(struct command *cmd,
 		"for %s: %s", ctx->lsp_node_id_str, errmsg);
 }
 
+/* Task #118: join_request stash struct for auto-connect detour. */
+struct ss_join_ctx {
+	char *lsp_node_id_str;
+	char *instance_id_str;
+	char *address;
+	uint64_t contribution_sats;
+};
+
+static struct command_result *join_send_now(struct command *cmd, void *user);
+static struct command_result *join_autoconnect_failed(struct command *cmd,
+						      void *user,
+						      const char *errmsg);
+
 static struct command_result *json_factory_join_request(struct command *cmd,
 							const char *buf,
 							const jsmntok_t *params)
 {
 	const char *lsp_node_id_str = NULL;
 	const char *instance_id_str = NULL;
+	const char *address_str = NULL;
 	uint64_t *contribution_sats = NULL;
 
 	if (!param(cmd, buf, params,
 		   p_req("lsp_node_id", param_string, &lsp_node_id_str),
 		   p_req("instance_id", param_string, &instance_id_str),
 		   p_req("contribution_sats", param_u64, &contribution_sats),
+		   p_opt("address", param_string, &address_str),
 		   NULL))
 		return command_param_failed();
+
+	/* Stash for auto-connect detour. */
+	struct ss_join_ctx *ctx = tal(cmd, struct ss_join_ctx);
+	ctx->lsp_node_id_str = tal_strdup(ctx, lsp_node_id_str);
+	ctx->instance_id_str = tal_strdup(ctx, instance_id_str);
+	ctx->contribution_sats = *contribution_sats;
+	ctx->address = address_str ? tal_strdup(ctx, address_str) : NULL;
+
+	return ss_ensure_peer_connected(cmd, ctx->lsp_node_id_str, ctx->address,
+		ctx, join_send_now, join_autoconnect_failed);
+}
+
+/* Task #118: the original json_factory_join_request body, lifted to a
+ * post-auto-connect callback.  Re-derives uint8 buffers inside. */
+static struct command_result *join_send_now(struct command *cmd, void *user)
+{
+	struct ss_join_ctx *ctx = user;
+	const char *lsp_node_id_str = ctx->lsp_node_id_str;
+	const char *instance_id_str = ctx->instance_id_str;
+	uint64_t contribution_sats_val = ctx->contribution_sats;
+	uint64_t *contribution_sats = &contribution_sats_val;
+
 
 	uint8_t lsp_pk[33], iid[32];
 	if (!ss_decode_node_id_hex(lsp_node_id_str, lsp_pk))
@@ -11405,6 +11604,18 @@ static struct command_result *json_factory_join_request(struct command *cmd,
 
 	return command_still_pending(cmd);
 }
+
+static struct command_result *join_autoconnect_failed(struct command *cmd,
+						      void *user UNUSED,
+						      const char *errmsg)
+{
+	return command_fail(cmd, LIGHTNINGD,
+		"factory-join-request: cannot reach LSP (%s). "
+		"Either pass an `address` parameter (e.g. 127.0.0.1:9735), or "
+		"first run `lightning-cli connect <node_id>@<host>:<port>`.",
+		errmsg);
+}
+
 
 /* ----- factory-cancel-join ------------------------------------------------ */
 
