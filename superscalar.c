@@ -449,6 +449,234 @@ static const struct ss_pending_proposal_entry *ss_pending_proposals_get(
 	return NULL;
 }
 
+/* ============================================================================
+ * B3 follow-up (task #115): client-signing-prefs-get / -set RPCs.
+ *
+ * Persistence: flat JSON file in the plugin cwd (= lightning data dir).
+ * On init, load from disk or fall back to canonical defaults.  On set,
+ * write the new prefs to disk before returning.  When the wallet daemon
+ * SQLite (PR #30) lands, this migrates to wallet-set-setting via the
+ * usual dual-write pattern.
+ *
+ * Used by the B1.5 validator hook and json_factory_review_proposal — both
+ * read from g_signing_prefs instead of calling init_defaults inline.
+ * ========================================================================= */
+
+#define SS_SIGNING_PREFS_FILE "superscalar_signing_prefs.json"
+
+/* Stock libplugin has param_array but no param_object; tiny helper. */
+static struct command_result *ss_param_object(struct command *cmd, const char *name,
+					      const char *buffer, const jsmntok_t *tok,
+					      const jsmntok_t **obj)
+{
+	if (tok->type == JSMN_OBJECT) {
+		*obj = tok;
+		return NULL;
+	}
+	return command_fail_badparam(cmd, name, buffer, tok, "should be a json object");
+}
+
+static ss_client_signing_prefs_t g_signing_prefs;
+static bool g_signing_prefs_loaded = false;
+
+static void ss_signing_prefs_load_or_default(void)
+{
+	if (g_signing_prefs_loaded)
+		return;
+	ss_client_signing_prefs_init_defaults(&g_signing_prefs);
+	g_signing_prefs_loaded = true;
+
+	FILE *f = fopen(SS_SIGNING_PREFS_FILE, "rb");
+	if (!f)
+		return;
+	char buf[8192];
+	size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+	fclose(f);
+	buf[n] = '\0';
+
+	/* Tiny lenient parser — keys are unique and we wrote this file, so
+	 * substring-scan-for-key-then-strtoull is fine.  Skip a field if
+	 * absent: defaults already in place. */
+	const char *p;
+#define LOAD_U64(field) do { \
+		p = strstr(buf, "\"" #field "\""); \
+		if (p) { p = strchr(p, ':'); \
+			if (p) g_signing_prefs.field = (uint64_t)strtoull(p + 1, NULL, 10); } \
+	} while (0)
+#define LOAD_U32(field) do { \
+		p = strstr(buf, "\"" #field "\""); \
+		if (p) { p = strchr(p, ':'); \
+			if (p) g_signing_prefs.field = (uint32_t)strtoul(p + 1, NULL, 10); } \
+	} while (0)
+#define LOAD_U16(field) do { \
+		p = strstr(buf, "\"" #field "\""); \
+		if (p) { p = strchr(p, ':'); \
+			if (p) g_signing_prefs.field = (uint16_t)strtoul(p + 1, NULL, 10); } \
+	} while (0)
+#define LOAD_BOOL(field) do { \
+		p = strstr(buf, "\"" #field "\""); \
+		if (p) { p = strchr(p, ':'); \
+			if (p) { while (*++p == ' '); \
+				g_signing_prefs.field = (*p == 't'); } } \
+	} while (0)
+	LOAD_U64(max_htlc_min_sat);
+	LOAD_U64(min_htlc_max_sat);
+	LOAD_U16(min_max_concurrent_htlcs);
+	LOAD_U64(min_max_in_flight_msat);
+	LOAD_U32(max_min_final_cltv_delta);
+	LOAD_U32(max_cltv_delta_forward);
+	LOAD_U64(max_min_capacity_per_join_sat);
+	LOAD_U64(min_max_capacity_per_join_sat);
+	LOAD_BOOL(require_strict_proof_tier);
+	{
+		const char *q = strstr(buf, "\"max_proof_tier\"");
+		if (q) { q = strchr(q, ':');
+			if (q) g_signing_prefs.max_proof_tier = (ss_proof_tier_t)strtoul(q + 1, NULL, 10); }
+	}
+	LOAD_U32(min_rotation_interval_blocks);
+	LOAD_BOOL(require_tier_b_rollover);
+	LOAD_U32(min_state_replay_defense_window_blocks);
+#undef LOAD_U64
+#undef LOAD_U32
+#undef LOAD_U16
+#undef LOAD_BOOL
+}
+
+static int ss_signing_prefs_persist(void)
+{
+	FILE *f = fopen(SS_SIGNING_PREFS_FILE ".tmp", "wb");
+	if (!f)
+		return -1;
+	fprintf(f, "{\n");
+	fprintf(f, "  \"max_htlc_min_sat\": %" PRIu64 ",\n", g_signing_prefs.max_htlc_min_sat);
+	fprintf(f, "  \"min_htlc_max_sat\": %" PRIu64 ",\n", g_signing_prefs.min_htlc_max_sat);
+	fprintf(f, "  \"min_max_concurrent_htlcs\": %u,\n", (unsigned)g_signing_prefs.min_max_concurrent_htlcs);
+	fprintf(f, "  \"min_max_in_flight_msat\": %" PRIu64 ",\n", g_signing_prefs.min_max_in_flight_msat);
+	fprintf(f, "  \"max_min_final_cltv_delta\": %u,\n", g_signing_prefs.max_min_final_cltv_delta);
+	fprintf(f, "  \"max_cltv_delta_forward\": %u,\n", g_signing_prefs.max_cltv_delta_forward);
+	fprintf(f, "  \"max_min_capacity_per_join_sat\": %" PRIu64 ",\n", g_signing_prefs.max_min_capacity_per_join_sat);
+	fprintf(f, "  \"min_max_capacity_per_join_sat\": %" PRIu64 ",\n", g_signing_prefs.min_max_capacity_per_join_sat);
+	fprintf(f, "  \"require_strict_proof_tier\": %s,\n", g_signing_prefs.require_strict_proof_tier ? "true" : "false");
+	fprintf(f, "  \"max_proof_tier\": %u,\n", (unsigned)g_signing_prefs.max_proof_tier);
+	fprintf(f, "  \"min_rotation_interval_blocks\": %u,\n", g_signing_prefs.min_rotation_interval_blocks);
+	fprintf(f, "  \"require_tier_b_rollover\": %s,\n", g_signing_prefs.require_tier_b_rollover ? "true" : "false");
+	fprintf(f, "  \"min_state_replay_defense_window_blocks\": %u\n", g_signing_prefs.min_state_replay_defense_window_blocks);
+	fprintf(f, "}\n");
+	fclose(f);
+	if (rename(SS_SIGNING_PREFS_FILE ".tmp", SS_SIGNING_PREFS_FILE) != 0)
+		return -1;
+	return 0;
+}
+
+static void ss_signing_prefs_emit_json(struct json_stream *js,
+				       const ss_client_signing_prefs_t *p)
+{
+	json_add_u64(js, "max_htlc_min_sat", p->max_htlc_min_sat);
+	json_add_u64(js, "min_htlc_max_sat", p->min_htlc_max_sat);
+	json_add_u32(js, "min_max_concurrent_htlcs", p->min_max_concurrent_htlcs);
+	json_add_u64(js, "min_max_in_flight_msat", p->min_max_in_flight_msat);
+	json_add_u32(js, "max_min_final_cltv_delta", p->max_min_final_cltv_delta);
+	json_add_u32(js, "max_cltv_delta_forward", p->max_cltv_delta_forward);
+	json_add_u64(js, "max_min_capacity_per_join_sat", p->max_min_capacity_per_join_sat);
+	json_add_u64(js, "min_max_capacity_per_join_sat", p->min_max_capacity_per_join_sat);
+	json_add_bool(js, "require_strict_proof_tier", p->require_strict_proof_tier);
+	json_add_u32(js, "max_proof_tier", (uint32_t)p->max_proof_tier);
+	json_add_u32(js, "min_rotation_interval_blocks", p->min_rotation_interval_blocks);
+	json_add_bool(js, "require_tier_b_rollover", p->require_tier_b_rollover);
+	json_add_u32(js, "min_state_replay_defense_window_blocks",
+		     p->min_state_replay_defense_window_blocks);
+}
+
+static struct command_result *json_client_signing_prefs_get(
+	struct command *cmd, const char *buf, const jsmntok_t *params)
+{
+	if (!param(cmd, buf, params, NULL))
+		return command_param_failed();
+
+	ss_signing_prefs_load_or_default();
+
+	struct json_stream *js = jsonrpc_stream_success(cmd);
+	json_object_start(js, "prefs");
+	ss_signing_prefs_emit_json(js, &g_signing_prefs);
+	json_object_end(js);
+	json_add_bool(js, "is_default", false);
+	return command_finished(cmd, js);
+}
+
+static struct command_result *json_client_signing_prefs_set(
+	struct command *cmd, const char *buf, const jsmntok_t *params)
+{
+	const jsmntok_t *prefs_tok;
+
+	if (!param(cmd, buf, params,
+		   p_req("prefs", ss_param_object, &prefs_tok),
+		   NULL))
+		return command_param_failed();
+
+	if (prefs_tok->type != JSMN_OBJECT)
+		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+				    "prefs must be an object");
+
+	ss_signing_prefs_load_or_default();
+
+	const jsmntok_t *t;
+#define APPLY_U64(field) do { \
+		t = json_get_member(buf, prefs_tok, #field); \
+		if (t) json_to_u64(buf, t, &g_signing_prefs.field); \
+	} while (0)
+#define APPLY_U32(field) do { \
+		t = json_get_member(buf, prefs_tok, #field); \
+		if (t) json_to_u32(buf, t, &g_signing_prefs.field); \
+	} while (0)
+#define APPLY_U16(field) do { \
+		t = json_get_member(buf, prefs_tok, #field); \
+		uint32_t tmp; \
+		if (t && json_to_u32(buf, t, &tmp)) \
+			g_signing_prefs.field = (uint16_t)tmp; \
+	} while (0)
+#define APPLY_BOOL(field) do { \
+		t = json_get_member(buf, prefs_tok, #field); \
+		bool tmp; \
+		if (t && json_to_bool(buf, t, &tmp)) \
+			g_signing_prefs.field = tmp; \
+	} while (0)
+	APPLY_U64(max_htlc_min_sat);
+	APPLY_U64(min_htlc_max_sat);
+	APPLY_U16(min_max_concurrent_htlcs);
+	APPLY_U64(min_max_in_flight_msat);
+	APPLY_U32(max_min_final_cltv_delta);
+	APPLY_U32(max_cltv_delta_forward);
+	APPLY_U64(max_min_capacity_per_join_sat);
+	APPLY_U64(min_max_capacity_per_join_sat);
+	APPLY_BOOL(require_strict_proof_tier);
+	{
+		uint32_t tier_u32;
+		t = json_get_member(buf, prefs_tok, "max_proof_tier");
+		if (t && json_to_u32(buf, t, &tier_u32))
+			g_signing_prefs.max_proof_tier = (ss_proof_tier_t)tier_u32;
+	}
+	APPLY_U32(min_rotation_interval_blocks);
+	APPLY_BOOL(require_tier_b_rollover);
+	APPLY_U32(min_state_replay_defense_window_blocks);
+#undef APPLY_U64
+#undef APPLY_U32
+#undef APPLY_U16
+#undef APPLY_BOOL
+
+	if (ss_signing_prefs_persist() != 0)
+		plugin_log(plugin_handle, LOG_UNUSUAL,
+			   "Could not persist " SS_SIGNING_PREFS_FILE
+			   " — prefs apply in memory but won't survive restart");
+	else
+		plugin_log(plugin_handle, LOG_INFORM,
+			   "Updated " SS_SIGNING_PREFS_FILE);
+
+	struct json_stream *js = jsonrpc_stream_success(cmd);
+	json_add_bool(js, "ok", true);
+	return command_finished(cmd, js);
+}
+
+
 /* Forward decl: ss_audit_log is defined below ss_fresh_request_id, but the
  * peer-table helpers (which appear above the helper definition) call it. */
 static void ss_audit_log(enum log_level lvl, const char *event,
@@ -4651,12 +4879,10 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 				const ss_factory_policy_t *check_policy =
 					cached ? cached : &fallback;
 
-				ss_client_signing_prefs_t prefs;
-				ss_client_signing_prefs_init_defaults(&prefs);
-
+				ss_signing_prefs_load_or_default();
 				ss_policy_validation_result_t res;
 				int rc = ss_validate_policy_against_prefs(
-					check_policy, &prefs, &res);
+					check_policy, &g_signing_prefs, &res);
 				/* Record outcome in the pending-proposal cache so
 				 * the wallet UI can show it via factory-review-proposal. */
 				if (pp_entry) {
@@ -10586,6 +10812,103 @@ static struct command_result *browse_preflight_err(struct command *cmd,
 		ctx->node_id_str, errmsg);
 }
 
+
+/* ============================================================================
+ * B4 follow-up: factory-approve-proposal / factory-refuse-proposal RPCs.
+ *
+ * Today's behaviour: ADVISORY ACK ONLY.  The B1.5 validator auto-decides
+ * every FACTORY_PROPOSE the moment it arrives — auto-sign on OK,
+ * auto-drop on HARD_FAIL.  By the time the wallet UI calls these RPCs
+ * the outcome is already on the wire.  These handlers verify a matching
+ * pending_proposals slot exists and acknowledge the user's preference,
+ * but they do not roll back a signature already sent or revive a
+ * dropped proposal.
+ *
+ * Phase D scope: add a PENDING_USER_DECISION state to the validator so
+ * the plugin waits for explicit approve/refuse before responding.  Then
+ * these RPCs become load-bearing.
+ * ========================================================================= */
+
+static struct command_result *ss_lookup_proposal_for_action(
+	struct command *cmd, const char *buf, const jsmntok_t *params,
+	struct ss_pending_proposal_entry **out_slot)
+{
+	const char *iid_hex = NULL, *lsp_hex = NULL;
+	if (!param(cmd, buf, params,
+		   p_req("instance_id", param_string, &iid_hex),
+		   p_req("lsp_peer_id", param_string, &lsp_hex),
+		   NULL))
+		return command_param_failed();
+
+	uint8_t iid[32];
+	if (strlen(iid_hex) != 64 || !hex_decode(iid_hex, 64, iid, 32))
+		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+				    "instance_id must be 64 hex chars");
+	uint8_t lsp_pk[33];
+	if (strlen(lsp_hex) != 66 || !hex_decode(lsp_hex, 66, lsp_pk, 33))
+		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+				    "lsp_peer_id must be 66 hex chars");
+
+	for (int i = 0; i < SS_POLICY_CACHE_SIZE; i++) {
+		struct ss_pending_proposal_entry *e = &ss_pending_proposals[i];
+		if (e->used
+		    && memcmp(e->lsp_peer_id, lsp_pk, 33) == 0
+		    && memcmp(e->instance_id, iid, 32) == 0) {
+			*out_slot = e;
+			return NULL;
+		}
+	}
+	*out_slot = NULL;
+	return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+			    "no pending proposal matches instance_id + lsp_peer_id");
+}
+
+static struct command_result *json_factory_approve_proposal(
+	struct command *cmd, const char *buf, const jsmntok_t *params)
+{
+	struct ss_pending_proposal_entry *slot;
+	struct command_result *err = ss_lookup_proposal_for_action(cmd, buf, params, &slot);
+	if (err) return err;
+
+	plugin_log(plugin_handle, LOG_INFORM,
+		   "factory-approve-proposal (advisory): user approved proposal "
+		   "for instance, but validator already auto-decided this "
+		   "ceremony (result=%d).  Phase D will gate signing on user input.",
+		   slot->last_validate_result);
+
+	struct json_stream *js = jsonrpc_stream_success(cmd);
+	json_add_bool(js, "ok", true);
+	json_add_string(js, "note",
+		"Advisory ack only — plugin auto-decided when proposal arrived. "
+		"Phase D will add a pending-user-decision gate.");
+	json_add_u32(js, "validator_result", (uint32_t)slot->last_validate_result);
+	return command_finished(cmd, js);
+}
+
+static struct command_result *json_factory_refuse_proposal(
+	struct command *cmd, const char *buf, const jsmntok_t *params)
+{
+	struct ss_pending_proposal_entry *slot;
+	struct command_result *err = ss_lookup_proposal_for_action(cmd, buf, params, &slot);
+	if (err) return err;
+
+	plugin_log(plugin_handle, LOG_INFORM,
+		   "factory-refuse-proposal (advisory): user refused proposal "
+		   "for instance, but validator already auto-decided this "
+		   "ceremony (result=%d).  Phase D will gate signing on user input.",
+		   slot->last_validate_result);
+
+	struct json_stream *js = jsonrpc_stream_success(cmd);
+	json_add_bool(js, "ok", true);
+	json_add_string(js, "note",
+		"Advisory ack only — plugin auto-decided when proposal arrived. "
+		"Phase D will add a pending-user-decision gate so refuse "
+		"sends CEREMONY_ABORT (submsg 0x0149).");
+	json_add_u32(js, "validator_result", (uint32_t)slot->last_validate_result);
+	return command_finished(cmd, js);
+}
+
+
 /* B2: factory-review-proposal RPC — read-only view of the most recent
  * FACTORY_PROPOSE we received for a given (lsp_peer_id, instance_id).
  *
@@ -10652,9 +10975,9 @@ static struct command_result *json_factory_review_proposal(
 	const ss_factory_policy_t *adv = ss_policy_cache_get(
 		pp->lsp_peer_id, iid);
 
-	/* User prefs — defaults today; Phase D loads from wallet.db. */
-	ss_client_signing_prefs_t prefs;
-	ss_client_signing_prefs_init_defaults(&prefs);
+	/* User prefs from persisted client-signing-prefs (task #115). */
+	ss_signing_prefs_load_or_default();
+	const ss_client_signing_prefs_t *prefs_ref = &g_signing_prefs;
 
 	struct json_stream *js = jsonrpc_stream_success(cmd);
 	json_add_string(js, "instance_id", iid_hex);
@@ -10719,21 +11042,21 @@ static struct command_result *json_factory_review_proposal(
 
 	/* User's current signing prefs (the thresholds the validator uses). */
 	json_object_start(js, "user_prefs");
-	json_add_u64(js, "max_htlc_min_sat", prefs.max_htlc_min_sat);
-	json_add_u64(js, "min_htlc_max_sat", prefs.min_htlc_max_sat);
+	json_add_u64(js, "max_htlc_min_sat", prefs_ref->max_htlc_min_sat);
+	json_add_u64(js, "min_htlc_max_sat", prefs_ref->min_htlc_max_sat);
 	json_add_u32(js, "min_max_concurrent_htlcs",
-		(uint32_t)prefs.min_max_concurrent_htlcs);
-	json_add_u64(js, "min_max_in_flight_msat", prefs.min_max_in_flight_msat);
-	json_add_u32(js, "max_min_final_cltv_delta", prefs.max_min_final_cltv_delta);
-	json_add_u32(js, "max_cltv_delta_forward", prefs.max_cltv_delta_forward);
+		(uint32_t)prefs_ref->min_max_concurrent_htlcs);
+	json_add_u64(js, "min_max_in_flight_msat", prefs_ref->min_max_in_flight_msat);
+	json_add_u32(js, "max_min_final_cltv_delta", prefs_ref->max_min_final_cltv_delta);
+	json_add_u32(js, "max_cltv_delta_forward", prefs_ref->max_cltv_delta_forward);
 	json_add_u64(js, "max_min_capacity_per_join_sat",
-		prefs.max_min_capacity_per_join_sat);
+		prefs_ref->max_min_capacity_per_join_sat);
 	json_add_u64(js, "min_max_capacity_per_join_sat",
-		prefs.min_max_capacity_per_join_sat);
+		prefs_ref->min_max_capacity_per_join_sat);
 	json_add_u32(js, "min_rotation_interval_blocks",
-		prefs.min_rotation_interval_blocks);
+		prefs_ref->min_rotation_interval_blocks);
 	json_add_u32(js, "min_state_replay_defense_window_blocks",
-		prefs.min_state_replay_defense_window_blocks);
+		prefs_ref->min_state_replay_defense_window_blocks);
 	json_object_end(js);
 
 	/* Validator outcome from the most recent FACTORY_PROPOSE. */
@@ -18653,6 +18976,10 @@ static const char *init(struct command *init_cmd,
 	/* Phase 3: load client-side outgoing_joins persistent state. */
 	ss_load_outgoing_joins(init_cmd);
 
+	/* Task #115: load persisted client signing prefs (or fall back to
+	 * canonical defaults) before any FACTORY_PROPOSE can arrive. */
+	ss_signing_prefs_load_or_default();
+
 	/* Load persisted factories from datastore */
 	ss_load_factories(init_cmd);
 
@@ -21199,8 +21526,24 @@ static const struct plugin_command commands[] = {
 		json_dev_factory_mark_cpfp_parent_confirmed,
 	},
 	{
+		"client-signing-prefs-get",
+		json_client_signing_prefs_get,
+	},
+	{
+		"client-signing-prefs-set",
+		json_client_signing_prefs_set,
+	},
+	{
 		"factory-browse-host",
 		json_factory_browse_host,
+	},
+	{
+		"factory-approve-proposal",
+		json_factory_approve_proposal,
+	},
+	{
+		"factory-refuse-proposal",
+		json_factory_refuse_proposal,
 	},
 	{
 		"factory-review-proposal",
