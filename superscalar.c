@@ -2155,6 +2155,17 @@ static size_t ss_send_factory_ready(struct command *cmd,
 	send_factory_msg(cmd, peer_hex, SS_SUBMSG_FACTORY_READY,
 			 payload, payload_len);
 	free(payload);
+
+	/* Task #92: ceremony just completed on the LSP side — promote
+	 * lifecycle out of the in-flight CEREMONY_RUNNING state. Legacy
+	 * factory-create stayed at INIT here (and factory-open-channels
+	 * later promoted INIT → ACTIVE); we add SIGNED for the new
+	 * deferred flow so factory-list distinguishes "tree signed,
+	 * channels pending" from "INIT, ceremony not yet started".
+	 * factory-open-channels accepts both INIT and SIGNED as valid
+	 * starting points and promotes either to ACTIVE. */
+	if (fi->lifecycle == FACTORY_LIFECYCLE_CEREMONY_RUNNING)
+		fi->lifecycle = FACTORY_LIFECYCLE_SIGNED;
 	return payload_len;
 }
 
@@ -2439,9 +2450,29 @@ static struct command_result *fundchannel_start_ok(struct command *cmd,
 		spk[i] = (uint8_t)b;
 	}
 
-	/* Funding amount: half of factory total for 2 participants (demo) */
+	/* Task #93: must match the amount we requested in
+	 * fundchannel_start (open_factory_channels), which is derived
+	 * from fi->funding_amount_sats × (1 - L-stock pct) / n_clients.
+	 * Previously hardcoded to DEFAULT_FUNDING_SATS — coincidentally
+	 * matched while open_factory_channels also defaulted to 500k,
+	 * but now diverges and CLN rejects fundchannel_complete with
+	 * "Output to open channel is 500000sat, should be 24000sat". */
 	struct amount_sat funding_amt;
-	funding_amt.satoshis = DEFAULT_FUNDING_SATS;
+	{
+		uint64_t amt = fi->clients[ci].allocation_sats;
+		if (amt == 0) {
+			uint64_t total = fi->funding_amount_sats;
+			uint64_t lstock = total * 20 / 100;
+			uint64_t client_pool = total > lstock
+				? total - lstock : 0;
+			amt = fi->n_clients > 0
+				? client_pool / fi->n_clients
+				: client_pool;
+			if (amt == 0)
+				amt = DEFAULT_FUNDING_SATS;
+		}
+		funding_amt.satoshis = amt;
+	}
 
 	plugin_log(plugin_handle, LOG_INFORM,
 		   "fundchannel_start ok for client %zu, building PSBT "
@@ -2551,9 +2582,27 @@ static void open_factory_channels(struct command *cmd,
 			fundchannel_start_ok, rpc_err, ctx);
 		json_add_string(req->js, "id", nid);
 		{
+			/* Task #93: compute per-client channel size from the
+			 * factory's actual funding, NOT a 500k fallback.
+			 * Mirrors apply_allocations_to_leaves: 20% L-stock,
+			 * rest split equally among n_clients. Previously the
+			 * code defaulted to DEFAULT_FUNDING_SATS=500_000 sat
+			 * whenever allocations weren't explicit, producing
+			 * channels whose total_msat (500k) was divorced from
+			 * the actual on-chain UTXO amount — making force-close
+			 * publish a TX that wouldn't validate at consensus. */
 			uint64_t amt = fi->clients[ci].allocation_sats;
-			if (amt == 0)
-				amt = DEFAULT_FUNDING_SATS;
+			if (amt == 0) {
+				uint64_t total = fi->funding_amount_sats;
+				uint64_t lstock = total * 20 / 100;
+				uint64_t client_pool = total > lstock
+					? total - lstock : 0;
+				amt = fi->n_clients > 0
+					? client_pool / fi->n_clients
+					: client_pool;
+				if (amt == 0)
+					amt = DEFAULT_FUNDING_SATS; /* safety net */
+			}
 			char amt_str[32];
 			snprintf(amt_str, sizeof(amt_str), "%"PRIu64"sat", amt);
 			json_add_string(req->js, "amount", amt_str);
@@ -5893,6 +5942,17 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 
 			fi->ceremony = CEREMONY_COMPLETE;
 
+			/* Task #92: client-side ceremony complete — promote
+			 * lifecycle to SIGNED so factory-list reports the same
+			 * state on LSP and client. Deferred clients arrive
+			 * here from CEREMONY_RUNNING; legacy clients arrive
+			 * from INIT. Either becomes SIGNED. The openchannel
+			 * hook (which is the next step) doesn't gate on
+			 * lifecycle — it just looks up by instance_id. */
+			if (fi->lifecycle == FACTORY_LIFECYCLE_CEREMONY_RUNNING
+			    || fi->lifecycle == FACTORY_LIFECYCLE_INIT)
+				fi->lifecycle = FACTORY_LIFECYCLE_SIGNED;
+
 			/* With signed TXs now on the client side, chain[0] of
 			 * every PS leaf has is_signed=1. Persist them. */
 			ss_save_all_ps_chain0(cmd, fi);
@@ -7350,23 +7410,34 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 		plugin_log(plugin_handle, LOG_INFORM,
 			   "CLOSE_NONCE from %s (len=%zu)",
 			   peer_id, len);
-		/* LSP side: client sent close nonces */
+		/* LSP side: client sent close nonces.
+		 * Task #95: nonce_bundle_t is ~79KB (MAX_NONCE_ENTRIES=1024).
+		 * Stack-allocating it caused the plugin to exit silently
+		 * during cooperative close — libplugin's stack isn't big
+		 * enough. Heap-allocate to match the other handlers. */
 		if (fi && fi->is_lsp) {
-			nonce_bundle_t cnb;
-			if (!nonce_bundle_deserialize(&cnb, data, len))
+			nonce_bundle_t *cnb = calloc(1, sizeof(*cnb));
+			if (!cnb) break;
+			if (!nonce_bundle_deserialize(cnb, data, len)) {
+				free(cnb);
 				break;
+			}
 			factory_t *f = (factory_t *)fi->lib_factory;
-			if (!f) break;
+			if (!f) {
+				free(cnb);
+				break;
+			}
 
-			for (size_t e = 0; e < cnb.n_entries; e++) {
+			for (size_t e = 0; e < cnb->n_entries; e++) {
 				secp256k1_musig_pubnonce pn;
 				if (!musig_pubnonce_parse(global_secp_ctx, &pn,
-					cnb.entries[e].pubnonce))
+					cnb->entries[e].pubnonce))
 					continue;
 				factory_session_set_nonce(f,
-					cnb.entries[e].node_idx,
-					cnb.entries[e].signer_slot, &pn);
+					cnb->entries[e].node_idx,
+					cnb->entries[e].signer_slot, &pn);
 			}
+			free(cnb);
 
 			/* Finalize just node 0 (close tx) */
 			if (!factory_session_finalize_node(f, 0))
@@ -7387,23 +7458,29 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 		plugin_log(plugin_handle, LOG_INFORM,
 			   "CLOSE_PSIG from %s (len=%zu)",
 			   peer_id, len);
-		/* LSP side: client sent close partial sig */
+		/* LSP side: client sent close partial sig.
+		 * Task #95: same heap-vs-stack fix as CLOSE_NONCE — the
+		 * 79KB nonce_bundle_t blows libplugin's stack. */
 		if (fi && fi->is_lsp) {
-			nonce_bundle_t pnb;
-			if (!nonce_bundle_deserialize(&pnb, data, len))
+			nonce_bundle_t *pnb = calloc(1, sizeof(*pnb));
+			if (!pnb) break;
+			if (!nonce_bundle_deserialize(pnb, data, len)) {
+				free(pnb);
 				break;
+			}
 			factory_t *f = (factory_t *)fi->lib_factory;
-			if (!f) break;
+			if (!f) { free(pnb); break; }
 
-			for (size_t e = 0; e < pnb.n_entries; e++) {
+			for (size_t e = 0; e < pnb->n_entries; e++) {
 				secp256k1_musig_partial_sig ps;
 				if (!musig_partial_sig_parse(global_secp_ctx,
-					&ps, pnb.entries[e].pubnonce))
+					&ps, pnb->entries[e].pubnonce))
 					continue;
 				factory_session_set_partial_sig(f,
-					pnb.entries[e].node_idx,
-					pnb.entries[e].signer_slot, &ps);
+					pnb->entries[e].node_idx,
+					pnb->entries[e].signer_slot, &ps);
 			}
+			free(pnb);
 
 			/* Create LSP's own partial sig */
 			secp256k1_keypair lsp_kp;
@@ -9125,6 +9202,10 @@ realloc_all_nonces_done:
 			case FACTORY_LIFECYCLE_CLOSED_UNILATERAL:  lc_name = "closed_unilateral"; break;
 			case FACTORY_LIFECYCLE_CLOSED_BREACHED:    lc_name = "closed_breached"; break;
 			case FACTORY_LIFECYCLE_ABORTED:            lc_name = "aborted"; break;
+			case FACTORY_LIFECYCLE_AWAITING_JOINS:     lc_name = "awaiting_joins"; break;
+			case FACTORY_LIFECYCLE_READY_TO_TRIGGER:   lc_name = "ready_to_trigger"; break;
+			case FACTORY_LIFECYCLE_CEREMONY_RUNNING:   lc_name = "ceremony_running"; break;
+			case FACTORY_LIFECYCLE_SIGNED:             lc_name = "signed"; break;
 			default: lc_name = "unknown"; break;
 			}
 			json_add_string(js, "lifecycle", lc_name);
@@ -9864,16 +9945,21 @@ static struct command_result *handle_htlc_accepted(struct command *cmd,
 	if (max_early_warning > 0
 	    && cltv_expiry < ss_state.current_blockheight
 			     + max_early_warning + 1) {
-		plugin_log(plugin_handle, LOG_INFORM,
-			   "htlc_accepted: rejecting HTLC cltv_expiry=%u "
-			   "(need >= %u + %u + 1 = %u)",
+		/* Task #94: previously returned result=fail with the
+		 * deprecated failure_code field. Modern CLN requires
+		 * failure_message (BOLT-4 hex) or failure_onion; sending
+		 * neither + result=fail crashes lightningd with FATAL
+		 * SIGNAL 6 in htlc_accepted_hook_deserialize. Downgraded
+		 * to LOG_UNUSUAL + continue until we wire a proper
+		 * failure_message via libcommon's towire_temporary_*. */
+		plugin_log(plugin_handle, LOG_UNUSUAL,
+			   "htlc_accepted: cltv_expiry=%u below early_warning "
+			   "threshold (current=%u + ewt=%u + 1 = %u) — "
+			   "allowing for now; proper rejection pending "
+			   "failure_message wiring (Task #94)",
 			   cltv_expiry, ss_state.current_blockheight,
 			   max_early_warning,
 			   ss_state.current_blockheight + max_early_warning + 1);
-		struct json_stream *js = jsonrpc_stream_success(cmd);
-		json_add_string(js, "result", "fail");
-		json_add_u32(js, "failure_code", 0x1000 | 14);
-		return command_finished(cmd, js);
 	}
 
 	return command_hook_success(cmd);
@@ -10491,6 +10577,10 @@ static struct command_result *json_factory_incoming_joins(struct command *cmd,
 			fi->lifecycle == FACTORY_LIFECYCLE_ACTIVE ? "active" :
 			fi->lifecycle == FACTORY_LIFECYCLE_DYING ? "dying" :
 			fi->lifecycle == FACTORY_LIFECYCLE_EXPIRED ? "expired" :
+			fi->lifecycle == FACTORY_LIFECYCLE_AWAITING_JOINS ? "awaiting_joins" :
+			fi->lifecycle == FACTORY_LIFECYCLE_READY_TO_TRIGGER ? "ready_to_trigger" :
+			fi->lifecycle == FACTORY_LIFECYCLE_CEREMONY_RUNNING ? "ceremony_running" :
+			fi->lifecycle == FACTORY_LIFECYCLE_SIGNED ? "signed" :
 			"other");
 
 		json_array_start(js, "joins");
@@ -11526,6 +11616,14 @@ static struct command_result *json_factory_list(struct command *cmd,
 				? "closed_breached" :
 			fi->lifecycle == FACTORY_LIFECYCLE_ABORTED
 				? "aborted" :
+			fi->lifecycle == FACTORY_LIFECYCLE_AWAITING_JOINS
+				? "awaiting_joins" :
+			fi->lifecycle == FACTORY_LIFECYCLE_READY_TO_TRIGGER
+				? "ready_to_trigger" :
+			fi->lifecycle == FACTORY_LIFECYCLE_CEREMONY_RUNNING
+				? "ceremony_running" :
+			fi->lifecycle == FACTORY_LIFECYCLE_SIGNED
+				? "signed" :
 			"unknown");
 		if (fi->closed_externally_at_block > 0)
 			json_add_u32(js, "closed_externally_at_block",
@@ -11938,6 +12036,10 @@ static const char *lifecycle_name_ext(factory_lifecycle_t l)
 	case FACTORY_LIFECYCLE_CLOSED_UNILATERAL:  return "closed_unilateral";
 	case FACTORY_LIFECYCLE_CLOSED_BREACHED:    return "closed_breached";
 	case FACTORY_LIFECYCLE_ABORTED:            return "aborted";
+	case FACTORY_LIFECYCLE_AWAITING_JOINS:     return "awaiting_joins";
+	case FACTORY_LIFECYCLE_READY_TO_TRIGGER:   return "ready_to_trigger";
+	case FACTORY_LIFECYCLE_CEREMONY_RUNNING:   return "ceremony_running";
+	case FACTORY_LIFECYCLE_SIGNED:             return "signed";
 	default:                                    return "unknown";
 	}
 }
@@ -20593,5 +20695,12 @@ int main(int argc, char *argv[])
 				  "times out and is reaped. Default 30.",
 				  u32_option, u32_jsonfmt,
 				  &ss_join_timeout_secs),
+		    plugin_option("superscalar-wallet-db",
+				  "string",
+				  "Override path for the wallet.db that the C "
+				  "plugin opens read-only at restart. Should "
+				  "match the Node-side soupwallet-db-path.",
+				  charp_option, charp_jsonfmt,
+				  &ss_wallet_db_path_override),
 		    NULL);
 }

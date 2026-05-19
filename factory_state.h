@@ -87,6 +87,12 @@ typedef enum {
 	FACTORY_LIFECYCLE_AWAITING_JOINS = 9,
 	FACTORY_LIFECYCLE_READY_TO_TRIGGER = 10,
 	FACTORY_LIFECYCLE_CEREMONY_RUNNING = 11,
+	/* Ceremony done — signed tree on both sides + funding TX broadcast,
+	 * but channels not yet opened on top of the leaves. Operator's next
+	 * step is factory-open-channels which promotes this to ACTIVE.
+	 * Distinguishes "INIT, ceremony hasn't run" (legacy meaning of INIT)
+	 * from "ceremony done, channels pending". */
+	FACTORY_LIFECYCLE_SIGNED = 12,
 } factory_lifecycle_t;
 
 /* Helper: a factory in any closed terminal state should not be scanned,
