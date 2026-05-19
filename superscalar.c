@@ -384,6 +384,71 @@ static const ss_factory_policy_t *ss_policy_cache_get(
 	return NULL;
 }
 
+/* B2: cache of most-recently-received FACTORY_PROPOSE parameters per
+ * (lsp_peer_id, instance_id).  Populated by the client-side FACTORY_PROPOSE
+ * handler immediately after parse — BEFORE the B1.5 validator runs — so the
+ * wallet UI can render even refused proposals (the user can see WHY a
+ * proposal was rejected, not just "rejected").  Read by the
+ * factory-review-proposal RPC. */
+struct ss_pending_proposal_entry {
+	uint8_t  lsp_peer_id[33];
+	uint8_t  instance_id[32];
+	uint64_t funding_sats;
+	uint32_t n_participants;
+	uint32_t our_pidx;
+	uint64_t allocs[MAX_FACTORY_PARTICIPANTS];
+	uint8_t  n_allocs;
+	/* Validation outcome from the most recent FACTORY_PROPOSE for this
+	 * (lsp, instance) — populated alongside the cache write. */
+	int      last_validate_result;   /* SS_POLICY_VALIDATE_* */
+	uint16_t last_validate_field_tlv;
+	char     last_validate_reason[128];
+	uint32_t received_at_block;
+	bool     used;
+};
+static struct ss_pending_proposal_entry ss_pending_proposals[SS_POLICY_CACHE_SIZE];
+
+static struct ss_pending_proposal_entry *ss_pending_proposals_slot(
+	const uint8_t lsp_peer_id[33], const uint8_t instance_id[32])
+{
+	int free_slot = -1;
+	int oldest = 0;
+	uint32_t oldest_age = UINT32_MAX;
+	for (int i = 0; i < SS_POLICY_CACHE_SIZE; i++) {
+		struct ss_pending_proposal_entry *e = &ss_pending_proposals[i];
+		if (e->used
+		    && memcmp(e->lsp_peer_id, lsp_peer_id, 33) == 0
+		    && memcmp(e->instance_id, instance_id, 32) == 0)
+			return e;
+		if (!e->used && free_slot < 0) free_slot = i;
+		if (e->used && e->received_at_block < oldest_age) {
+			oldest_age = e->received_at_block;
+			oldest = i;
+		}
+	}
+	int target = (free_slot >= 0) ? free_slot : oldest;
+	struct ss_pending_proposal_entry *e = &ss_pending_proposals[target];
+	memset(e, 0, sizeof(*e));
+	memcpy(e->lsp_peer_id, lsp_peer_id, 33);
+	memcpy(e->instance_id, instance_id, 32);
+	e->used = true;
+	return e;
+}
+
+static const struct ss_pending_proposal_entry *ss_pending_proposals_get(
+	const uint8_t lsp_peer_id[33], const uint8_t instance_id[32])
+{
+	if (!lsp_peer_id || !instance_id) return NULL;
+	for (int i = 0; i < SS_POLICY_CACHE_SIZE; i++) {
+		struct ss_pending_proposal_entry *e = &ss_pending_proposals[i];
+		if (e->used
+		    && memcmp(e->lsp_peer_id, lsp_peer_id, 33) == 0
+		    && memcmp(e->instance_id, instance_id, 32) == 0)
+			return e;
+	}
+	return NULL;
+}
+
 /* Forward decl: ss_audit_log is defined below ss_fresh_request_id, but the
  * peer-table helpers (which appear above the helper definition) call it. */
 static void ss_audit_log(enum log_level lvl, const char *event,
@@ -4492,55 +4557,6 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 				break;
 			}
 
-			/* B1.5: policy validation gate.  Look up the LSP's
-			 * advertised policy (cached at browse time) and check
-			 * it against client_signing_prefs.  Hard-fail = refuse
-			 * to sign — bail out without generating nonces.  No
-			 * advertised policy => no promise to compare against;
-			 * we still apply user prefs against the canonical
-			 * defaults so a permissive-by-omission LSP can't slip
-			 * a hostile policy by hiding it. */
-			{
-				uint8_t lsp_pk_validate[33];
-				if (ss_peer_id_hex_to_bytes(peer_id, lsp_pk_validate)) {
-					const ss_factory_policy_t *cached =
-						ss_policy_cache_get(lsp_pk_validate,
-							nb->instance_id);
-					ss_factory_policy_t fallback;
-					ss_factory_policy_init_defaults(&fallback);
-					const ss_factory_policy_t *check_policy =
-						cached ? cached : &fallback;
-
-					ss_client_signing_prefs_t prefs;
-					ss_client_signing_prefs_init_defaults(&prefs);
-
-					ss_policy_validation_result_t res;
-					int rc = ss_validate_policy_against_prefs(
-						check_policy, &prefs, &res);
-					if (rc == SS_POLICY_VALIDATE_HARD_FAIL) {
-						plugin_log(plugin_handle, LOG_BROKEN,
-							"REFUSING to sign FACTORY_PROPOSE from %s — "
-							"policy violates client_signing_prefs: "
-							"field_tlv=0x%04x reason=\"%s\"%s",
-							peer_id,
-							(unsigned)res.field_tlv,
-							res.reason,
-							cached ? "" : " (no advertised policy cached; "
-								   "checked defaults)");
-						ss_audit_log(LOG_BROKEN,
-							"policy_violation_refused_sign",
-							"{\"peer\":\"%s\",\"field_tlv\":%u,"
-							"\"reason\":\"%s\",\"had_cached_policy\":%s}",
-							peer_id,
-							(unsigned)res.field_tlv,
-							res.reason,
-							cached ? "true" : "false");
-						free(nb);
-						break;
-					}
-				}
-			}
-
 			/* Read funding amount (0 if old 4-byte trailer). In the
 			 * new format the famt+pidx come right after the bundle. */
 			uint64_t propose_funding_sats = 0;
@@ -4585,6 +4601,92 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 				plugin_log(plugin_handle, LOG_INFORM,
 					   "FACTORY_PROPOSE carries %u allocations",
 					   propose_n_alloc);
+			}
+
+			/* B2: snapshot the parsed proposal into the pending
+			 * cache BEFORE the B1.5 validator decides whether to
+			 * refuse.  This way the factory-review-proposal RPC
+			 * can render either an accepted-pending or refused
+			 * proposal — important for letting the user see WHY
+			 * a proposal was rejected, not just that it was. */
+			uint8_t lsp_pk_bytes[33];
+			bool lsp_pk_ok = ss_peer_id_hex_to_bytes(peer_id, lsp_pk_bytes);
+			struct ss_pending_proposal_entry *pp_entry = NULL;
+			if (lsp_pk_ok) {
+				pp_entry = ss_pending_proposals_slot(lsp_pk_bytes,
+					nb->instance_id);
+				if (pp_entry) {
+					pp_entry->funding_sats = propose_funding_sats;
+					pp_entry->n_participants = nb->n_participants;
+					pp_entry->our_pidx = our_pidx;
+					pp_entry->n_allocs = propose_n_alloc;
+					for (uint8_t ai = 0;
+					     ai < propose_n_alloc
+					     && ai < MAX_FACTORY_PARTICIPANTS;
+					     ai++)
+						pp_entry->allocs[ai] = propose_allocs[ai];
+					pp_entry->received_at_block =
+						ss_state.current_blockheight;
+					pp_entry->last_validate_result =
+						SS_POLICY_VALIDATE_OK;  /* will overwrite */
+					pp_entry->last_validate_field_tlv = 0xFFFF;
+					pp_entry->last_validate_reason[0] = '\0';
+				}
+			}
+
+			/* B1.5: policy validation gate (moved here from before
+			 * param parse so B2's cache write captures the proposal
+			 * even on refusal).  Look up LSP's advertised policy +
+			 * user's client_signing_prefs; hard-fail = refuse to
+			 * sign, no nonces generated.  If no policy was cached
+			 * for this (peer, instance) we still validate against
+			 * canonical defaults so a permissive-by-omission LSP
+			 * cannot bypass the check by simply not advertising. */
+			if (lsp_pk_ok) {
+				const ss_factory_policy_t *cached =
+					ss_policy_cache_get(lsp_pk_bytes,
+						nb->instance_id);
+				ss_factory_policy_t fallback;
+				ss_factory_policy_init_defaults(&fallback);
+				const ss_factory_policy_t *check_policy =
+					cached ? cached : &fallback;
+
+				ss_client_signing_prefs_t prefs;
+				ss_client_signing_prefs_init_defaults(&prefs);
+
+				ss_policy_validation_result_t res;
+				int rc = ss_validate_policy_against_prefs(
+					check_policy, &prefs, &res);
+				/* Record outcome in the pending-proposal cache so
+				 * the wallet UI can show it via factory-review-proposal. */
+				if (pp_entry) {
+					pp_entry->last_validate_result = rc;
+					pp_entry->last_validate_field_tlv = res.field_tlv;
+					strncpy(pp_entry->last_validate_reason,
+						res.reason,
+						sizeof(pp_entry->last_validate_reason) - 1);
+				}
+				if (rc == SS_POLICY_VALIDATE_HARD_FAIL) {
+					plugin_log(plugin_handle, LOG_BROKEN,
+						"REFUSING to sign FACTORY_PROPOSE from %s — "
+						"policy violates client_signing_prefs: "
+						"field_tlv=0x%04x reason=\"%s\"%s",
+						peer_id,
+						(unsigned)res.field_tlv,
+						res.reason,
+						cached ? "" : " (no advertised policy cached; "
+							   "checked defaults)");
+					ss_audit_log(LOG_BROKEN,
+						"policy_violation_refused_sign",
+						"{\"peer\":\"%s\",\"field_tlv\":%u,"
+						"\"reason\":\"%s\",\"had_cached_policy\":%s}",
+						peer_id,
+						(unsigned)res.field_tlv,
+						res.reason,
+						cached ? "true" : "false");
+					free(nb);
+					break;
+				}
 			}
 
 			fi = ss_factory_new(&ss_state, nb->instance_id);
@@ -10482,6 +10584,174 @@ static struct command_result *browse_preflight_err(struct command *cmd,
 	return command_fail(cmd, LIGHTNINGD,
 		"factory-browse-host: peer connectivity check failed for %s: %s",
 		ctx->node_id_str, errmsg);
+}
+
+/* B2: factory-review-proposal RPC — read-only view of the most recent
+ * FACTORY_PROPOSE we received for a given (lsp_peer_id, instance_id).
+ *
+ * Used by the wallet UI to render a pre-sign confirmation modal: shows
+ * the proposal (allocations, funding) plus the LSP's advertised policy
+ * plus the validator outcome, so the user sees what they would be
+ * signing AND whether it passes their prefs.
+ *
+ * Params:
+ *   instance_id (required, 64-hex)
+ *   lsp_peer_id (optional, 66-hex) — if omitted, scan all entries
+ *
+ * Returns 404-ish error if no proposal cached for that (lsp, instance);
+ * else JSON with proposed/advertised_policy/user_prefs/validation. */
+static struct command_result *json_factory_review_proposal(
+	struct command *cmd, const char *buf, const jsmntok_t *params)
+{
+	const char *iid_hex = NULL;
+	const char *lsp_hex = NULL;
+	if (!param(cmd, buf, params,
+		   p_req("instance_id", param_string, &iid_hex),
+		   p_opt("lsp_peer_id", param_string, &lsp_hex),
+		   NULL))
+		return command_param_failed();
+
+	if (strlen(iid_hex) != 64)
+		return command_fail(cmd, LIGHTNINGD,
+			"instance_id must be 64 hex chars");
+
+	uint8_t iid[32];
+	for (int j = 0; j < 32; j++) {
+		unsigned int b;
+		if (sscanf(iid_hex + j*2, "%2x", &b) != 1)
+			return command_fail(cmd, LIGHTNINGD,
+				"instance_id is not valid hex");
+		iid[j] = (uint8_t)b;
+	}
+
+	const struct ss_pending_proposal_entry *pp = NULL;
+	uint8_t lsp_pk_arg[33];
+	if (lsp_hex && strlen(lsp_hex) == 66
+	    && ss_peer_id_hex_to_bytes(lsp_hex, lsp_pk_arg)) {
+		pp = ss_pending_proposals_get(lsp_pk_arg, iid);
+	} else {
+		/* Scan for the first match against any LSP. */
+		for (int i = 0; i < SS_POLICY_CACHE_SIZE; i++) {
+			const struct ss_pending_proposal_entry *e =
+				&ss_pending_proposals[i];
+			if (e->used && memcmp(e->instance_id, iid, 32) == 0) {
+				pp = e;
+				break;
+			}
+		}
+	}
+
+	if (!pp)
+		return command_fail(cmd, LIGHTNINGD,
+			"no FACTORY_PROPOSE cached for instance_id %s%s%s",
+			iid_hex,
+			lsp_hex ? " from lsp_peer_id " : "",
+			lsp_hex ? lsp_hex : "");
+
+	/* Look up advertised policy for the same key, if cached. */
+	const ss_factory_policy_t *adv = ss_policy_cache_get(
+		pp->lsp_peer_id, iid);
+
+	/* User prefs — defaults today; Phase D loads from wallet.db. */
+	ss_client_signing_prefs_t prefs;
+	ss_client_signing_prefs_init_defaults(&prefs);
+
+	struct json_stream *js = jsonrpc_stream_success(cmd);
+	json_add_string(js, "instance_id", iid_hex);
+	char lsp_hex_out[67];
+	for (int j = 0; j < 33; j++)
+		sprintf(lsp_hex_out + j*2, "%02x", pp->lsp_peer_id[j]);
+	lsp_hex_out[66] = '\0';
+	json_add_string(js, "lsp_peer_id", lsp_hex_out);
+	json_add_u32(js, "received_at_block", pp->received_at_block);
+
+	/* Proposed parameters from the wire (what we'd sign if accepted). */
+	json_object_start(js, "proposed");
+	json_add_u64(js, "funding_sats", pp->funding_sats);
+	json_add_u32(js, "n_participants", pp->n_participants);
+	json_add_u32(js, "our_pidx", pp->our_pidx);
+	if (pp->our_pidx < pp->n_allocs)
+		json_add_u64(js, "our_allocation_sats",
+			pp->allocs[pp->our_pidx]);
+	json_array_start(js, "all_allocations");
+	for (uint8_t i = 0; i < pp->n_allocs; i++)
+		json_add_u64(js, NULL, pp->allocs[i]);
+	json_array_end(js);
+	/* Derived: our allocation as a percentage of total funding. */
+	if (pp->funding_sats > 0
+	    && pp->our_pidx < pp->n_allocs) {
+		uint64_t our_alloc = pp->allocs[pp->our_pidx];
+		uint64_t pct_x100 = (our_alloc * 10000) / pp->funding_sats;
+		json_add_u64(js, "our_allocation_pct_x100", pct_x100);
+	}
+	json_object_end(js);
+
+	/* The LSP's advertised policy at browse time, if any. */
+	if (adv) {
+		json_object_start(js, "advertised_policy");
+		json_add_u32(js, "schema_version", adv->schema_version);
+		json_add_u32(js, "arity_mode", (uint32_t)adv->arity_mode);
+		json_add_u32(js, "leaf_arity", (uint32_t)adv->leaf_arity);
+		json_add_u32(js, "lifetime_blocks", adv->lifetime_blocks);
+		json_add_u32(js, "dying_period_blocks", adv->dying_period_blocks);
+		json_add_u64(js, "per_client_capacity_sat",
+			adv->per_client_capacity_sat);
+		json_add_u64(js, "lsp_fee_sat", adv->lsp_fee_sat);
+		json_add_u32(js, "lsp_fee_ppm", adv->lsp_fee_ppm);
+		json_add_u64(js, "htlc_min_sat", adv->htlc_min_sat);
+		json_add_u64(js, "htlc_max_sat", adv->htlc_max_sat);
+		json_add_u64(js, "min_capacity_per_join_sat",
+			adv->min_capacity_per_join_sat);
+		json_add_u64(js, "max_capacity_per_join_sat",
+			adv->max_capacity_per_join_sat);
+		json_add_u32(js, "proof_tier_required",
+			(uint32_t)adv->proof_tier_required);
+		json_add_u32(js, "rotation_interval_blocks",
+			adv->rotation_interval_blocks);
+		json_add_bool(js, "allow_tier_b_rollover",
+			adv->allow_tier_b_rollover);
+		json_add_u32(js, "state_replay_defense_window_blocks",
+			adv->state_replay_defense_window_blocks);
+		json_object_end(js);
+	} else {
+		json_add_bool(js, "advertised_policy_known", false);
+	}
+
+	/* User's current signing prefs (the thresholds the validator uses). */
+	json_object_start(js, "user_prefs");
+	json_add_u64(js, "max_htlc_min_sat", prefs.max_htlc_min_sat);
+	json_add_u64(js, "min_htlc_max_sat", prefs.min_htlc_max_sat);
+	json_add_u32(js, "min_max_concurrent_htlcs",
+		(uint32_t)prefs.min_max_concurrent_htlcs);
+	json_add_u64(js, "min_max_in_flight_msat", prefs.min_max_in_flight_msat);
+	json_add_u32(js, "max_min_final_cltv_delta", prefs.max_min_final_cltv_delta);
+	json_add_u32(js, "max_cltv_delta_forward", prefs.max_cltv_delta_forward);
+	json_add_u64(js, "max_min_capacity_per_join_sat",
+		prefs.max_min_capacity_per_join_sat);
+	json_add_u64(js, "min_max_capacity_per_join_sat",
+		prefs.min_max_capacity_per_join_sat);
+	json_add_u32(js, "min_rotation_interval_blocks",
+		prefs.min_rotation_interval_blocks);
+	json_add_u32(js, "min_state_replay_defense_window_blocks",
+		prefs.min_state_replay_defense_window_blocks);
+	json_object_end(js);
+
+	/* Validator outcome from the most recent FACTORY_PROPOSE. */
+	json_object_start(js, "validation");
+	const char *result_name;
+	switch (pp->last_validate_result) {
+	case SS_POLICY_VALIDATE_OK:        result_name = "ok"; break;
+	case SS_POLICY_VALIDATE_HARD_FAIL: result_name = "hard_fail"; break;
+	case SS_POLICY_VALIDATE_SOFT_FAIL: result_name = "soft_fail"; break;
+	default:                            result_name = "unknown"; break;
+	}
+	json_add_string(js, "result", result_name);
+	json_add_u32(js, "field_tlv", (uint32_t)pp->last_validate_field_tlv);
+	json_add_string(js, "reason",
+		pp->last_validate_reason[0] ? pp->last_validate_reason : "");
+	json_object_end(js);
+
+	return command_finished(cmd, js);
 }
 
 static struct command_result *json_factory_browse_host(struct command *cmd,
@@ -20931,6 +21201,10 @@ static const struct plugin_command commands[] = {
 	{
 		"factory-browse-host",
 		json_factory_browse_host,
+	},
+	{
+		"factory-review-proposal",
+		json_factory_review_proposal,
 	},
 	{
 		"factory-join-request",
