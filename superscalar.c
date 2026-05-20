@@ -334,6 +334,200 @@ static bool ss_peer_id_hex_to_bytes(const char *hex, uint8_t out[33])
 /* B1.5: insert or update a policy in the cache.  If a slot for this
  * (peer, instance_id) already exists, overwrite it; else find an unused
  * slot; else evict the oldest (simple LRU by cached_at_block). */
+static void ss_policy_cache_persist(void);
+static void ss_policy_cache_put(const uint8_t lsp_peer_id[33], const uint8_t instance_id[32], const ss_factory_policy_t *policy);
+
+/* ============================================================================
+ * Phase C: policy cache persistence (flat JSON file).
+ * ============================================================================ */
+#define SS_POLICY_CACHE_FILE   "superscalar_policy_cache.json"
+
+static void ss_policy_cache_persist(void)
+{
+	FILE *f = fopen(SS_POLICY_CACHE_FILE ".tmp", "wb");
+	if (!f) return;
+	fprintf(f, "{\n  \"version\": 1,\n  \"entries\": [\n");
+	bool first = true;
+	for (int i = 0; i < SS_POLICY_CACHE_SIZE; i++) {
+		struct ss_policy_cache_entry *e = &ss_policy_cache[i];
+		if (!e->used) continue;
+		if (!first) fprintf(f, ",\n");
+		first = false;
+		char lsp_hex[67], iid_hex[65];
+		for (int j = 0; j < 33; j++) sprintf(lsp_hex + j*2, "%02x", e->lsp_peer_id[j]);
+		lsp_hex[66] = 0;
+		for (int j = 0; j < 32; j++) sprintf(iid_hex + j*2, "%02x", e->instance_id[j]);
+		iid_hex[64] = 0;
+		fprintf(f, "    {\"lsp\":\"%s\",\"iid\":\"%s\",\"cached_at_block\":%u,",
+			lsp_hex, iid_hex, e->cached_at_block);
+		uint8_t buf[1024];
+		ss_factory_policy_t defaults;
+		ss_factory_policy_init_defaults(&defaults);
+		size_t plen = ss_factory_policy_encode_diff(&e->policy, &defaults, buf, sizeof(buf));
+		fprintf(f, "\"diff_hex\":\"");
+		for (size_t k = 0; k < plen; k++) fprintf(f, "%02x", buf[k]);
+		fprintf(f, "\"}");
+	}
+	fprintf(f, "\n  ]\n}\n");
+	fclose(f);
+	rename(SS_POLICY_CACHE_FILE ".tmp", SS_POLICY_CACHE_FILE);
+}
+
+static void ss_policy_cache_load_from_disk(void)
+{
+	FILE *f = fopen(SS_POLICY_CACHE_FILE, "rb");
+	if (!f) return;
+	char *blob = NULL;
+	size_t cap = 0, n = 0;
+	while (!feof(f)) {
+		if (n + 4096 > cap) { cap = cap ? cap * 2 : 8192; blob = realloc(blob, cap); if (!blob) { fclose(f); return; } }
+		size_t r = fread(blob + n, 1, cap - n, f);
+		if (r == 0) break;
+		n += r;
+	}
+	fclose(f);
+	if (!blob) return;
+	if (n >= cap) n = cap - 1;
+	blob[n] = '\0';
+
+	int loaded = 0;
+	const char *p = blob;
+	while ((p = strstr(p, "\"lsp\":\""))) {
+		p += 7;
+		const char *lsp_end = strchr(p, '"');
+		if (!lsp_end || lsp_end - p != 66) break;
+		uint8_t lsp_pk[33];
+		bool ok = true;
+		for (int j = 0; j < 33; j++) {
+			unsigned int b;
+			if (sscanf(p + j*2, "%2x", &b) != 1) { ok = false; break; }
+			lsp_pk[j] = (uint8_t)b;
+		}
+		if (!ok) { p = lsp_end; continue; }
+		const char *iid_key = strstr(lsp_end, "\"iid\":\"");
+		if (!iid_key) break;
+		iid_key += 7;
+		const char *iid_end = strchr(iid_key, '"');
+		if (!iid_end || iid_end - iid_key != 64) { p = iid_end ? iid_end : lsp_end; continue; }
+		uint8_t iid[32];
+		for (int j = 0; j < 32; j++) {
+			unsigned int b;
+			if (sscanf(iid_key + j*2, "%2x", &b) != 1) { ok = false; break; }
+			iid[j] = (uint8_t)b;
+		}
+		if (!ok) { p = iid_end; continue; }
+		const char *dh_key = strstr(iid_end, "\"diff_hex\":\"");
+		if (!dh_key) { p = iid_end; continue; }
+		dh_key += 12;
+		const char *dh_end = strchr(dh_key, '"');
+		if (!dh_end) break;
+		size_t hex_len = dh_end - dh_key;
+		if (hex_len % 2 != 0 || hex_len > 2048) { p = dh_end; continue; }
+		size_t diff_len = hex_len / 2;
+		uint8_t *diff = malloc(diff_len ? diff_len : 1);
+		if (!diff) { p = dh_end; continue; }
+		for (size_t k = 0; k < diff_len; k++) {
+			unsigned int b;
+			if (sscanf(dh_key + k*2, "%2x", &b) != 1) { ok = false; break; }
+			diff[k] = (uint8_t)b;
+		}
+		if (ok) {
+			ss_factory_policy_t pol;
+			ss_factory_policy_init_defaults(&pol);
+			if (ss_factory_policy_decode(diff, diff_len, &pol)) {
+				ss_policy_cache_put(lsp_pk, iid, &pol);
+				loaded++;
+			}
+		}
+		free(diff);
+		p = dh_end;
+	}
+	free(blob);
+	if (loaded > 0)
+		plugin_log(plugin_handle, LOG_INFORM,
+			   "Phase C: loaded %d policy cache entries from %s",
+			   loaded, SS_POLICY_CACHE_FILE);
+}
+
+static struct command_result *json_factory_get_cached_policy(
+	struct command *cmd, const char *buf, const jsmntok_t *params)
+{
+	const char *lsp_hex = NULL;
+	const char *iid_hex = NULL;
+	if (!param(cmd, buf, params,
+		   p_opt("lsp_peer_id", param_string, &lsp_hex),
+		   p_opt("instance_id", param_string, &iid_hex),
+		   NULL))
+		return command_param_failed();
+
+	struct json_stream *js = jsonrpc_stream_success(cmd);
+	json_array_start(js, "entries");
+
+	for (int i = 0; i < SS_POLICY_CACHE_SIZE; i++) {
+		struct ss_policy_cache_entry *e = &ss_policy_cache[i];
+		if (!e->used) continue;
+		if (lsp_hex) {
+			uint8_t lsp_pk[33];
+			if (strlen(lsp_hex) != 66) continue;
+			if (!hex_decode(lsp_hex, 66, lsp_pk, 33)) continue;
+			if (memcmp(e->lsp_peer_id, lsp_pk, 33) != 0) continue;
+		}
+		if (iid_hex) {
+			uint8_t iid[32];
+			if (strlen(iid_hex) != 64) continue;
+			if (!hex_decode(iid_hex, 64, iid, 32)) continue;
+			if (memcmp(e->instance_id, iid, 32) != 0) continue;
+		}
+
+		json_object_start(js, NULL);
+		char lh[67], ih[65];
+		for (int j = 0; j < 33; j++) sprintf(lh + j*2, "%02x", e->lsp_peer_id[j]);
+		lh[66] = 0;
+		for (int j = 0; j < 32; j++) sprintf(ih + j*2, "%02x", e->instance_id[j]);
+		ih[64] = 0;
+		json_add_string(js, "lsp_peer_id", lh);
+		json_add_string(js, "instance_id", ih);
+		json_add_u32(js, "cached_at_block", e->cached_at_block);
+
+		json_object_start(js, "policy");
+		const ss_factory_policy_t *p = &e->policy;
+		json_add_u32(js, "schema_version", p->schema_version);
+		json_add_u32(js, "arity_mode", (uint32_t)p->arity_mode);
+		json_add_u32(js, "leaf_arity", p->leaf_arity);
+		json_add_u32(js, "lifetime_blocks", p->lifetime_blocks);
+		json_add_u32(js, "dying_period_blocks", p->dying_period_blocks);
+		json_add_u64(js, "per_client_capacity_sat", p->per_client_capacity_sat);
+		json_add_u64(js, "lsp_fee_sat", p->lsp_fee_sat);
+		json_add_u32(js, "lsp_fee_ppm", p->lsp_fee_ppm);
+		json_add_u64(js, "htlc_min_sat", p->htlc_min_sat);
+		json_add_u64(js, "htlc_max_sat", p->htlc_max_sat);
+		json_add_u32(js, "max_concurrent_htlcs_per_channel",
+			     p->max_concurrent_htlcs_per_channel);
+		json_add_u64(js, "max_in_flight_msat_per_channel",
+			     p->max_in_flight_msat_per_channel);
+		json_add_u32(js, "min_final_cltv_expiry_delta",
+			     p->min_final_cltv_expiry_delta);
+		json_add_u32(js, "cltv_expiry_delta_forward",
+			     p->cltv_expiry_delta_forward);
+		json_add_u64(js, "min_capacity_per_join_sat",
+			     p->min_capacity_per_join_sat);
+		json_add_u64(js, "max_capacity_per_join_sat",
+			     p->max_capacity_per_join_sat);
+		json_add_u32(js, "proof_tier_required",
+			     (uint32_t)p->proof_tier_required);
+		json_add_u32(js, "rotation_interval_blocks", p->rotation_interval_blocks);
+		json_add_bool(js, "allow_tier_b_rollover", p->allow_tier_b_rollover);
+		json_add_u32(js, "state_replay_defense_window_blocks",
+			     p->state_replay_defense_window_blocks);
+		json_object_end(js);
+		json_object_end(js);
+	}
+
+	json_array_end(js);
+	return command_finished(cmd, js);
+}
+
+
 static void ss_policy_cache_put(const uint8_t lsp_peer_id[33],
 				  const uint8_t instance_id[32],
 				  const ss_factory_policy_t *policy)
@@ -350,6 +544,7 @@ static void ss_policy_cache_put(const uint8_t lsp_peer_id[33],
 			/* update in place */
 			memcpy(&e->policy, policy, sizeof(e->policy));
 			e->cached_at_block = ss_state.current_blockheight;
+			ss_policy_cache_persist();
 			return;
 		}
 		if (!e->used && free_slot < 0) free_slot = i;
@@ -365,6 +560,7 @@ static void ss_policy_cache_put(const uint8_t lsp_peer_id[33],
 	memcpy(&e->policy, policy, sizeof(e->policy));
 	e->cached_at_block = ss_state.current_blockheight;
 	e->used = true;
+	ss_policy_cache_persist();
 }
 
 /* B1.5: look up a cached policy.  Returns pointer into the cache (caller
@@ -19914,6 +20110,9 @@ static const char *init(struct command *init_cmd,
 	/* Phase 3: load client-side outgoing_joins persistent state. */
 	ss_load_outgoing_joins(init_cmd);
 
+	/* Phase C: load persisted policy cache. */
+	ss_policy_cache_load_from_disk();
+
 	/* Task #115: load persisted client signing prefs (or fall back to
 	 * canonical defaults) before any FACTORY_PROPOSE can arrive. */
 	ss_signing_prefs_load_or_default();
@@ -22466,6 +22665,10 @@ static const struct plugin_command commands[] = {
 	{
 		"client-list-held-proposals",
 		json_client_list_held_proposals,
+	},
+	{
+		"factory-get-cached-policy",
+		json_factory_get_cached_policy,
 	},
 	{
 		"client-list-recent-sign-queue-events",
