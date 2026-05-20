@@ -405,6 +405,16 @@ struct ss_pending_proposal_entry {
 	char     last_validate_reason[128];
 	uint32_t received_at_block;
 	bool     used;
+	/* D.6: when auto_sign_on_validator_pass=false and validator OK, the
+	 * raw FACTORY_PROPOSE payload is copied here so factory-approve-
+	 * proposal can re-dispatch it through the normal handler later. */
+	uint8_t *held_payload;       /* heap-allocated; freed on approve/refuse */
+	size_t   held_payload_len;
+	/* Set by factory-approve-proposal before re-dispatch so the gate
+	 * lets the next pass through.  Cleared after dispatch completes
+	 * (or on refuse). */
+	bool     user_approved;
+	bool     user_refused;
 };
 static struct ss_pending_proposal_entry ss_pending_proposals[SS_POLICY_CACHE_SIZE];
 
@@ -5007,30 +5017,62 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 					break;
 				}
 
-				/* D.1: gate auto-sign on user prefs. Validator OK
-				 * but user has auto_sign=OFF — cache proposal,
-				 * skip NONCE_BUNDLE.  pending_proposals already
-				 * captured the proposal above, so the wallet can
-				 * render the review modal and the user can
-				 * factory-approve-proposal (D.6) to release. */
-				if (!g_signing_prefs.auto_sign_on_validator_pass) {
+				/* D.1 + D.6: gate auto-sign on user prefs.
+				 * Bypass if the user already approved this slot
+				 * via factory-approve-proposal (which sets
+				 * user_approved and re-dispatches us). */
+				if (!g_signing_prefs.auto_sign_on_validator_pass
+				    && (!pp_entry || !pp_entry->user_approved)) {
+					/* D.6: stash raw payload for later release.
+					 * Free any prior held_payload first
+					 * (a re-PROPOSE for the same slot overrides
+					 * the previous one). */
+					if (pp_entry) {
+						if (pp_entry->held_payload) {
+							free(pp_entry->held_payload);
+							pp_entry->held_payload = NULL;
+							pp_entry->held_payload_len = 0;
+						}
+						pp_entry->held_payload = malloc(len);
+						if (pp_entry->held_payload) {
+							memcpy(pp_entry->held_payload, data, len);
+							pp_entry->held_payload_len = len;
+						}
+						pp_entry->user_approved = false;
+						pp_entry->user_refused  = false;
+					}
 					plugin_log(plugin_handle, LOG_INFORM,
 						   "auto_sign_on_validator_pass=OFF; "
 						   "holding FACTORY_PROPOSE from %s "
-						   "(instance_id_prefix=%02x%02x%02x%02x) "
-						   "for user decision via wallet UI",
+						   "(instance_id_prefix=%02x%02x%02x%02x, "
+						   "%zu bytes saved) for user decision",
 						   peer_id,
 						   nb->instance_id[0], nb->instance_id[1],
-						   nb->instance_id[2], nb->instance_id[3]);
+						   nb->instance_id[2], nb->instance_id[3],
+						   len);
 					ss_audit_log(LOG_INFORM,
 						"propose_held_for_user_decision",
 						"{\"peer\":\"%s\","
-						"\"iid_prefix\":\"%02x%02x%02x%02x\"}",
+						"\"iid_prefix\":\"%02x%02x%02x%02x\","
+						"\"payload_len\":%zu}",
 						peer_id,
 						nb->instance_id[0], nb->instance_id[1],
-						nb->instance_id[2], nb->instance_id[3]);
+						nb->instance_id[2], nb->instance_id[3],
+						len);
 					free(nb);
 					break;
+				}
+
+				/* D.6: if we're here because the user just
+				 * approved a previously-held proposal, clear
+				 * the held state — we're consuming it now. */
+				if (pp_entry && pp_entry->user_approved) {
+					if (pp_entry->held_payload) {
+						free(pp_entry->held_payload);
+						pp_entry->held_payload = NULL;
+						pp_entry->held_payload_len = 0;
+					}
+					pp_entry->user_approved = false;
 				}
 			}
 
@@ -11152,17 +11194,58 @@ static struct command_result *json_factory_approve_proposal(
 	struct command_result *err = ss_lookup_proposal_for_action(cmd, buf, params, &slot);
 	if (err) return err;
 
+	/* D.6: if the slot has a held payload (auto_sign_on_validator_pass=OFF
+	 * caught this proposal earlier), release it by re-dispatching the
+	 * FACTORY_PROPOSE through the same handler.  The gate checks
+	 * user_approved and lets it through to nonce-generation this time. */
+	if (slot->held_payload && slot->held_payload_len > 0) {
+		char peer_hex[67];
+		for (int j = 0; j < 33; j++)
+			sprintf(peer_hex + j*2, "%02x", slot->lsp_peer_id[j]);
+		peer_hex[66] = '\0';
+
+		slot->user_approved = true;
+
+		uint8_t *payload_copy = malloc(slot->held_payload_len);
+		size_t payload_len = slot->held_payload_len;
+		if (payload_copy) memcpy(payload_copy, slot->held_payload, payload_len);
+
+		plugin_log(plugin_handle, LOG_INFORM,
+			   "factory-approve-proposal: releasing held FACTORY_PROPOSE "
+			   "for instance (%zu bytes) — re-dispatching",
+			   payload_len);
+
+		dispatch_superscalar_submsg(cmd, peer_hex,
+			SS_SUBMSG_FACTORY_PROPOSE,
+			payload_copy ? payload_copy : slot->held_payload,
+			payload_len);
+
+		if (payload_copy) free(payload_copy);
+
+		struct json_stream *js = jsonrpc_stream_success(cmd);
+		json_add_bool(js, "ok", true);
+		json_add_string(js, "action", "released");
+		json_add_string(js, "note",
+			"Held FACTORY_PROPOSE re-dispatched. Plugin is now generating "
+			"nonces and sending NONCE_BUNDLE.");
+		return command_finished(cmd, js);
+	}
+
+	/* No held payload — the slot is either pre-D.6 advisory state, or
+	 * auto-sign was ON when the proposal arrived (so it already signed). */
 	plugin_log(plugin_handle, LOG_INFORM,
-		   "factory-approve-proposal (advisory): user approved proposal "
-		   "for instance, but validator already auto-decided this "
-		   "ceremony (result=%d).  Phase D will gate signing on user input.",
+		   "factory-approve-proposal: no held payload in slot — "
+		   "either auto-sign was ON at proposal time (already signed) "
+		   "or proposal already released. validator_result=%d",
 		   slot->last_validate_result);
 
 	struct json_stream *js = jsonrpc_stream_success(cmd);
 	json_add_bool(js, "ok", true);
+	json_add_string(js, "action", "noop");
 	json_add_string(js, "note",
-		"Advisory ack only — plugin auto-decided when proposal arrived. "
-		"Phase D will add a pending-user-decision gate.");
+		"No held proposal to release. Validator already auto-decided "
+		"(auto_sign_on_validator_pass was ON when this proposal arrived) "
+		"or the proposal was already approved/refused.");
 	json_add_u32(js, "validator_result", (uint32_t)slot->last_validate_result);
 	return command_finished(cmd, js);
 }
@@ -11174,18 +11257,29 @@ static struct command_result *json_factory_refuse_proposal(
 	struct command_result *err = ss_lookup_proposal_for_action(cmd, buf, params, &slot);
 	if (err) return err;
 
+	bool was_held = (slot->held_payload != NULL);
+
+	/* D.6: drop any held payload and mark the slot REFUSED. */
+	if (slot->held_payload) {
+		free(slot->held_payload);
+		slot->held_payload = NULL;
+		slot->held_payload_len = 0;
+	}
+	slot->user_refused = true;
+	slot->user_approved = false;
+
 	plugin_log(plugin_handle, LOG_INFORM,
-		   "factory-refuse-proposal (advisory): user refused proposal "
-		   "for instance, but validator already auto-decided this "
-		   "ceremony (result=%d).  Phase D will gate signing on user input.",
-		   slot->last_validate_result);
+		   "factory-refuse-proposal: %s. LSP will time out on this "
+		   "client. CEREMONY_ABORT submsg follows PR 3c (task #81).",
+		   was_held ? "released held proposal + marked REFUSED"
+			    : "marked REFUSED (no held payload)");
 
 	struct json_stream *js = jsonrpc_stream_success(cmd);
 	json_add_bool(js, "ok", true);
-	json_add_string(js, "note",
-		"Advisory ack only — plugin auto-decided when proposal arrived. "
-		"Phase D will add a pending-user-decision gate so refuse "
-		"sends CEREMONY_ABORT (submsg 0x0149).");
+	json_add_string(js, "action", was_held ? "released_and_refused" : "marked_refused");
+	json_add_string(js, "note", was_held
+		? "Held proposal dropped. LSP will time out and proceed without you."
+		: "Slot marked REFUSED. No held proposal to drop (proposal was auto-signed or already decided).");
 	json_add_u32(js, "validator_result", (uint32_t)slot->last_validate_result);
 	return command_finished(cmd, js);
 }
