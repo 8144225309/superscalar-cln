@@ -367,6 +367,13 @@ typedef struct ss_client_signing_prefs {
 
 	/* state_replay_defense_window_blocks: refuse if policy.value < min_acceptable */
 	uint32_t  min_state_replay_defense_window_blocks;  /* default 288 (~2 days) */
+
+	/* D.1 toggle: when true (default), plugin auto-signs every proposal
+	 * that passes the validator.  When false, plugin caches the proposal
+	 * in pending_proposals and does NOT send NONCE_BUNDLE — the wallet
+	 * UI is expected to surface a confirmation prompt and the user must
+	 * call factory-approve-proposal (D.6) to release the held nonces. */
+	bool      auto_sign_on_validator_pass;       /* default true */
 } ss_client_signing_prefs_t;
 
 void ss_client_signing_prefs_init_defaults(ss_client_signing_prefs_t *prefs);

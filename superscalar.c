@@ -536,6 +536,7 @@ static void ss_signing_prefs_load_or_default(void)
 	LOAD_U32(min_rotation_interval_blocks);
 	LOAD_BOOL(require_tier_b_rollover);
 	LOAD_U32(min_state_replay_defense_window_blocks);
+	LOAD_BOOL(auto_sign_on_validator_pass);
 #undef LOAD_U64
 #undef LOAD_U32
 #undef LOAD_U16
@@ -560,7 +561,8 @@ static int ss_signing_prefs_persist(void)
 	fprintf(f, "  \"max_proof_tier\": %u,\n", (unsigned)g_signing_prefs.max_proof_tier);
 	fprintf(f, "  \"min_rotation_interval_blocks\": %u,\n", g_signing_prefs.min_rotation_interval_blocks);
 	fprintf(f, "  \"require_tier_b_rollover\": %s,\n", g_signing_prefs.require_tier_b_rollover ? "true" : "false");
-	fprintf(f, "  \"min_state_replay_defense_window_blocks\": %u\n", g_signing_prefs.min_state_replay_defense_window_blocks);
+	fprintf(f, "  \"min_state_replay_defense_window_blocks\": %u,\n", g_signing_prefs.min_state_replay_defense_window_blocks);
+	fprintf(f, "  \"auto_sign_on_validator_pass\": %s\n", g_signing_prefs.auto_sign_on_validator_pass ? "true" : "false");
 	fprintf(f, "}\n");
 	fclose(f);
 	if (rename(SS_SIGNING_PREFS_FILE ".tmp", SS_SIGNING_PREFS_FILE) != 0)
@@ -585,6 +587,7 @@ static void ss_signing_prefs_emit_json(struct json_stream *js,
 	json_add_bool(js, "require_tier_b_rollover", p->require_tier_b_rollover);
 	json_add_u32(js, "min_state_replay_defense_window_blocks",
 		     p->min_state_replay_defense_window_blocks);
+	json_add_bool(js, "auto_sign_on_validator_pass", p->auto_sign_on_validator_pass);
 }
 
 static struct command_result *json_client_signing_prefs_get(
@@ -658,6 +661,7 @@ static struct command_result *json_client_signing_prefs_set(
 	APPLY_U32(min_rotation_interval_blocks);
 	APPLY_BOOL(require_tier_b_rollover);
 	APPLY_U32(min_state_replay_defense_window_blocks);
+	APPLY_BOOL(auto_sign_on_validator_pass);
 #undef APPLY_U64
 #undef APPLY_U32
 #undef APPLY_U16
@@ -4999,6 +5003,32 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 						(unsigned)res.field_tlv,
 						res.reason,
 						cached ? "true" : "false");
+					free(nb);
+					break;
+				}
+
+				/* D.1: gate auto-sign on user prefs. Validator OK
+				 * but user has auto_sign=OFF — cache proposal,
+				 * skip NONCE_BUNDLE.  pending_proposals already
+				 * captured the proposal above, so the wallet can
+				 * render the review modal and the user can
+				 * factory-approve-proposal (D.6) to release. */
+				if (!g_signing_prefs.auto_sign_on_validator_pass) {
+					plugin_log(plugin_handle, LOG_INFORM,
+						   "auto_sign_on_validator_pass=OFF; "
+						   "holding FACTORY_PROPOSE from %s "
+						   "(instance_id_prefix=%02x%02x%02x%02x) "
+						   "for user decision via wallet UI",
+						   peer_id,
+						   nb->instance_id[0], nb->instance_id[1],
+						   nb->instance_id[2], nb->instance_id[3]);
+					ss_audit_log(LOG_INFORM,
+						"propose_held_for_user_decision",
+						"{\"peer\":\"%s\","
+						"\"iid_prefix\":\"%02x%02x%02x%02x\"}",
+						peer_id,
+						nb->instance_id[0], nb->instance_id[1],
+						nb->instance_id[2], nb->instance_id[3]);
 					free(nb);
 					break;
 				}

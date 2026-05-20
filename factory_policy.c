@@ -143,6 +143,7 @@ void ss_client_signing_prefs_init_defaults(ss_client_signing_prefs_t *prefs)
 	prefs->min_rotation_interval_blocks           = 144;
 	prefs->require_tier_b_rollover                = false;
 	prefs->min_state_replay_defense_window_blocks = 288;
+	prefs->auto_sign_on_validator_pass            = true;
 }
 
 /* ============================================================================
