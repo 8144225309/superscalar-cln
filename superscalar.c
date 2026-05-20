@@ -6381,15 +6381,31 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 							json_add_string(wreq->js,
 								"satoshi", amt_str);
 						}
-						/* Phase 4: caller-supplied feerate override.
-						 * Honors signet 0.1 sat/vb (=100 perkw) etc. */
-						if (fi->requested_feerate_perkw > 0) {
+						/* Phase 4 + audit #5 follow-up: always pass an explicit
+						 * feerate so CLN never tries to auto-estimate (which
+						 * fails on test networks where the estimator isn't
+						 * primed — "Cannot estimate fees (yet)").
+						 *
+						 * Caller value via factory-create feerate_perkw param;
+						 * otherwise fall back to 1000 perkw (~4 sat/vbyte),
+						 * which is conservative for any network. signet practice
+						 * runs pass 100 perkw (0.4 sat/vb). */
+						{
+							uint32_t fr_perkw = fi->requested_feerate_perkw > 0
+								? fi->requested_feerate_perkw
+								: 1000;
 							char fr_str[32];
 							snprintf(fr_str, sizeof(fr_str),
-								 "%uperkw",
-								 fi->requested_feerate_perkw);
+								 "%uperkw", fr_perkw);
 							json_add_string(wreq->js,
 								"feerate", fr_str);
+							plugin_log(plugin_handle, LOG_INFORM,
+								   "withdraw feerate=%uperkw "
+								   "(requested=%u, fallback=%s)",
+								   fr_perkw,
+								   fi->requested_feerate_perkw,
+								   fi->requested_feerate_perkw > 0
+									? "no" : "yes");
 						}
 						send_outreq(wreq);
 
