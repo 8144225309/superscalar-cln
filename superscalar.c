@@ -615,6 +615,8 @@ struct ss_pending_proposal_entry {
 
 static bool ss_decode_node_id_hex(const char *hex, uint8_t out[33]);
 static void ss_lsp_sig_queue_deadline_tick(struct command *cmd);
+static void ss_lsp_sig_queue_persist(void);
+static void ss_lsp_sig_queue_load_from_disk(void);
 
 
 
@@ -747,6 +749,173 @@ static void ss_lsp_sig_queue_mark(
 			e->proposal_blob_len = 0;
 		}
 	}
+	ss_lsp_sig_queue_persist();
+}
+
+
+/* ============================================================================
+ * Audit item #4: LSP signature queue persistence (flat JSON file).
+ *
+ * The ring buffer lives in memory; this layer mirrors mutations to a JSON
+ * file so a plugin restart can re-arm clients that hadn't yet pulled their
+ * AWAITING entries via SIGN_QUEUE_REQUEST. Format matches the policy_cache
+ * pattern (Phase C v1): atomic write via .tmp + rename, one entry per slot.
+ * ============================================================================ */
+#define SS_LSP_SIG_QUEUE_FILE   "superscalar_lsp_sig_queue.json"
+
+static void ss_lsp_sig_queue_persist(void)
+{
+	FILE *f = fopen(SS_LSP_SIG_QUEUE_FILE ".tmp", "wb");
+	if (!f) return;
+	fprintf(f, "{\n  \"version\": 1,\n  \"entries\": [\n");
+	bool first = true;
+	for (int i = 0; i < SS_LSP_SIG_QUEUE_SIZE; i++) {
+		struct ss_lsp_sig_queue_entry *e = &ss_lsp_sig_queue[i];
+		if (!e->used) continue;
+		if (!first) fprintf(f, ",\n");
+		first = false;
+		char iid_hex[65], cli_hex[67], cid_hex[17];
+		for (int j = 0; j < 32; j++)
+			sprintf(iid_hex + j*2, "%02x", e->factory_instance_id[j]);
+		iid_hex[64] = 0;
+		for (int j = 0; j < 33; j++)
+			sprintf(cli_hex + j*2, "%02x", e->client_peer_id[j]);
+		cli_hex[66] = 0;
+		for (int j = 0; j < 8; j++)
+			sprintf(cid_hex + j*2, "%02x", e->ceremony_id[j]);
+		cid_hex[16] = 0;
+		fprintf(f, "    {\"iid\":\"%s\",\"cli\":\"%s\",\"cid\":\"%s\","
+			"\"state\":%u,\"deadline\":%u,\"inserted\":%u,\"blob_hex\":\"",
+			iid_hex, cli_hex, cid_hex,
+			(unsigned)e->state, e->deadline_block, e->inserted_at_block);
+		if (e->proposal_blob) {
+			for (size_t k = 0; k < e->proposal_blob_len; k++)
+				fprintf(f, "%02x", e->proposal_blob[k]);
+		}
+		fprintf(f, "\"}");
+	}
+	fprintf(f, "\n  ]\n}\n");
+	fclose(f);
+	rename(SS_LSP_SIG_QUEUE_FILE ".tmp", SS_LSP_SIG_QUEUE_FILE);
+}
+
+static void ss_lsp_sig_queue_load_from_disk(void)
+{
+	FILE *f = fopen(SS_LSP_SIG_QUEUE_FILE, "rb");
+	if (!f) return;
+	char *blob = NULL;
+	size_t cap = 0, n = 0;
+	while (!feof(f)) {
+		if (n + 4096 > cap) {
+			cap = cap ? cap * 2 : 8192;
+			char *bigger = realloc(blob, cap);
+			if (!bigger) { free(blob); fclose(f); return; }
+			blob = bigger;
+		}
+		size_t r = fread(blob + n, 1, cap - n, f);
+		if (r == 0) break;
+		n += r;
+	}
+	fclose(f);
+	if (!blob) return;
+	if (n >= cap) n = cap - 1;
+	blob[n] = '\0';
+
+	int loaded = 0;
+	const char *p = blob;
+	while ((p = strstr(p, "\"iid\":\""))) {
+		p += 7;
+		const char *iid_end = strchr(p, '"');
+		if (!iid_end || iid_end - p != 64) break;
+		uint8_t iid[32];
+		bool ok = true;
+		for (int j = 0; j < 32; j++) {
+			unsigned int b;
+			if (sscanf(p + j*2, "%2x", &b) != 1) { ok = false; break; }
+			iid[j] = (uint8_t)b;
+		}
+		if (!ok) { p = iid_end; continue; }
+
+		const char *cli_key = strstr(iid_end, "\"cli\":\"");
+		if (!cli_key) break;
+		cli_key += 7;
+		const char *cli_end = strchr(cli_key, '"');
+		if (!cli_end || cli_end - cli_key != 66) { p = iid_end; continue; }
+		uint8_t cli[33];
+		for (int j = 0; j < 33; j++) {
+			unsigned int b;
+			if (sscanf(cli_key + j*2, "%2x", &b) != 1) { ok = false; break; }
+			cli[j] = (uint8_t)b;
+		}
+		if (!ok) { p = cli_end; continue; }
+
+		const char *cid_key = strstr(cli_end, "\"cid\":\"");
+		if (!cid_key) break;
+		cid_key += 7;
+		const char *cid_end = strchr(cid_key, '"');
+		if (!cid_end || cid_end - cid_key != 16) { p = cli_end; continue; }
+		uint8_t cid[8];
+		for (int j = 0; j < 8; j++) {
+			unsigned int b;
+			if (sscanf(cid_key + j*2, "%2x", &b) != 1) { ok = false; break; }
+			cid[j] = (uint8_t)b;
+		}
+		if (!ok) { p = cid_end; continue; }
+
+		const char *state_key = strstr(cid_end, "\"state\":");
+		const char *deadline_key = strstr(cid_end, "\"deadline\":");
+		const char *inserted_key = strstr(cid_end, "\"inserted\":");
+		const char *blob_key = strstr(cid_end, "\"blob_hex\":\"");
+		if (!state_key || !deadline_key || !inserted_key || !blob_key) {
+			p = cid_end; continue;
+		}
+		unsigned int state_u = 0, dl = 0, ins = 0;
+		sscanf(state_key + 8, "%u", &state_u);
+		sscanf(deadline_key + 11, "%u", &dl);
+		sscanf(inserted_key + 11, "%u", &ins);
+
+		blob_key += 12;
+		const char *blob_end = strchr(blob_key, '"');
+		if (!blob_end) { p = cid_end; continue; }
+		size_t hex_len = (size_t)(blob_end - blob_key);
+		if (hex_len % 2 != 0) { p = blob_end; continue; }
+		size_t bytes_len = hex_len / 2;
+		uint8_t *blob_bytes = NULL;
+		if (bytes_len > 0) {
+			blob_bytes = malloc(bytes_len);
+			if (!blob_bytes) { p = blob_end; continue; }
+			for (size_t k = 0; k < bytes_len; k++) {
+				unsigned int b;
+				if (sscanf(blob_key + k*2, "%2x", &b) != 1) {
+					ok = false; break;
+				}
+				blob_bytes[k] = (uint8_t)b;
+			}
+			if (!ok) { free(blob_bytes); p = blob_end; continue; }
+		}
+
+		struct ss_lsp_sig_queue_entry *e =
+			ss_lsp_sig_queue_slot(iid, cli, cid);
+		e->state = (uint8_t)state_u;
+		e->deadline_block = dl;
+		e->inserted_at_block = ins;
+		if (e->proposal_blob) {
+			free(e->proposal_blob);
+			e->proposal_blob = NULL;
+			e->proposal_blob_len = 0;
+		}
+		if (blob_bytes) {
+			e->proposal_blob = blob_bytes;
+			e->proposal_blob_len = bytes_len;
+		}
+		loaded++;
+		p = blob_end;
+	}
+
+	free(blob);
+	plugin_log(plugin_handle, LOG_INFORM,
+		   "LSP sig queue: loaded %d entries from %s",
+		   loaded, SS_LSP_SIG_QUEUE_FILE);
 }
 
 
@@ -1590,6 +1759,7 @@ static void ss_lsp_sig_queue_deadline_tick(struct command *cmd)
 {
 	(void)cmd;
 	uint32_t now = ss_state.current_blockheight;
+	bool dirty = false;
 	for (int i = 0; i < SS_LSP_SIG_QUEUE_SIZE; i++) {
 		struct ss_lsp_sig_queue_entry *e = &ss_lsp_sig_queue[i];
 		if (!e->used) continue;
@@ -1608,7 +1778,9 @@ static void ss_lsp_sig_queue_deadline_tick(struct command *cmd)
 			e->proposal_blob = NULL;
 			e->proposal_blob_len = 0;
 		}
+		dirty = true;
 	}
+	if (dirty) ss_lsp_sig_queue_persist();
 }
 
 static struct command_result *ss_browse_reap_tick(struct command *timer_cmd,
@@ -13350,6 +13522,7 @@ static struct command_result *ss_kickoff_factory_signing(
 						memcpy(qe->proposal_blob, cbuf, blen + 12 + extra);
 						qe->proposal_blob_len = blen + 12 + extra;
 					}
+					ss_lsp_sig_queue_persist();
 				}
 			}
 			free(cbuf);
@@ -20282,6 +20455,7 @@ static const char *init(struct command *init_cmd,
 
 	/* Phase C: load persisted policy cache. */
 	ss_policy_cache_load_from_disk();
+	ss_lsp_sig_queue_load_from_disk();
 
 	/* Task #115: load persisted client signing prefs (or fall back to
 	 * canonical defaults) before any FACTORY_PROPOSE can arrive. */
