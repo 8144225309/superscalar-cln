@@ -418,6 +418,50 @@ struct ss_pending_proposal_entry {
 };
 
 static bool ss_decode_node_id_hex(const char *hex, uint8_t out[33]);
+static void ss_lsp_sig_queue_deadline_tick(struct command *cmd);
+
+
+
+
+/* ============================================================================
+ * Phase D follow-up: ring buffer for SIGN_QUEUE_RESPONSE events the
+ * client receives with non-AWAITING state (MISSED / EXPIRED / REFUSED).
+ *
+ * Used by client-list-recent-sign-queue-events RPC, polled by the
+ * wallet's missed-ceremony banner. 32-slot circular buffer.
+ * ============================================================================ */
+#define SS_RECENT_SQ_EVENTS_SIZE   32
+
+struct ss_recent_sq_event {
+	uint8_t  factory_instance_id[32];
+	uint8_t  lsp_peer_id[33];
+	uint8_t  ceremony_id[8];
+	uint8_t  state;
+	uint32_t deadline_block;
+	uint32_t observed_at_block;
+	bool     used;
+	bool     dismissed;
+};
+static struct ss_recent_sq_event ss_recent_sq_events[SS_RECENT_SQ_EVENTS_SIZE];
+static int ss_recent_sq_next = 0;
+
+static void ss_recent_sq_push(const uint8_t factory_iid[32],
+			      const uint8_t lsp_peer_id[33],
+			      const uint8_t ceremony_id[8],
+			      uint8_t state, uint32_t deadline_block)
+{
+	struct ss_recent_sq_event *e = &ss_recent_sq_events[ss_recent_sq_next];
+	memset(e, 0, sizeof(*e));
+	memcpy(e->factory_instance_id, factory_iid, 32);
+	memcpy(e->lsp_peer_id, lsp_peer_id, 33);
+	memcpy(e->ceremony_id, ceremony_id, 8);
+	e->state = state;
+	e->deadline_block = deadline_block;
+	e->observed_at_block = ss_state.current_blockheight;
+	e->used = true;
+	ss_recent_sq_next = (ss_recent_sq_next + 1) % SS_RECENT_SQ_EVENTS_SIZE;
+}
+
 
 /* ============================================================================
  * Phase D.2: LSP-side per-client signature queue (in-memory).
@@ -1346,9 +1390,38 @@ static struct command_result *ss_join_reap_tick(struct command *timer_cmd,
  * timeout error. Without this active tick, the only reaper is the
  * lazy-reap in ss_browse_alloc_slot — so a single stuck browse RPC
  * stays stuck forever (until another browse runs). */
+static void ss_lsp_sig_queue_deadline_tick(struct command *cmd)
+{
+	(void)cmd;
+	uint32_t now = ss_state.current_blockheight;
+	for (int i = 0; i < SS_LSP_SIG_QUEUE_SIZE; i++) {
+		struct ss_lsp_sig_queue_entry *e = &ss_lsp_sig_queue[i];
+		if (!e->used) continue;
+		if (e->state != SS_SIGQUEUE_AWAITING_YOUR_SIGNATURE) continue;
+		if (e->deadline_block == 0) continue;
+		if (now <= e->deadline_block) continue;
+		plugin_log(plugin_handle, LOG_INFORM,
+			   "LSP sig queue: AWAITING -> MISSED for factory "
+			   "%02x%02x%02x%02x (deadline=%u, now=%u)",
+			   e->factory_instance_id[0], e->factory_instance_id[1],
+			   e->factory_instance_id[2], e->factory_instance_id[3],
+			   e->deadline_block, now);
+		e->state = SS_SIGQUEUE_MISSED;
+		if (e->proposal_blob) {
+			free(e->proposal_blob);
+			e->proposal_blob = NULL;
+			e->proposal_blob_len = 0;
+		}
+	}
+}
+
 static struct command_result *ss_browse_reap_tick(struct command *timer_cmd,
 						  void *unused)
 {
+	/* Phase D follow-up: deadline transitions for the LSP signature
+	 * queue, piggybacked on the same 5s tick. */
+	ss_lsp_sig_queue_deadline_tick(timer_cmd);
+
 	/* Phase 3: also reap join slots in this same timer tick. Avoids
 	 * registering two separate global_timer callbacks which crashes
 	 * the plugin after ~13s. */
@@ -10826,6 +10899,19 @@ realloc_all_nonces_done:
 				"\"deadline_block\":%u,\"blob_len\":%zu}",
 				peer_id, iid_prefix, entry_state, entry_deadline, entry_blob_len);
 
+			/* D follow-up: stash non-AWAITING entries in the ring
+			 * for the wallet missed-ceremony banner. */
+			if (entry_state == SS_SIGQUEUE_MISSED
+			    || entry_state == SS_SIGQUEUE_EXPIRED
+			    || entry_state == SS_SIGQUEUE_REFUSED) {
+				uint8_t lsp_pk[33];
+				if (ss_decode_node_id_hex(peer_id, lsp_pk)) {
+					uint8_t dummy_cid[8] = { 0 };
+					ss_recent_sq_push(entry_iid, lsp_pk,
+						dummy_cid, entry_state, entry_deadline);
+				}
+			}
+
 			/* Re-dispatch AWAITING entries via the existing FACTORY_PROPOSE
 			 * handler — validator runs, then either auto-sign or hold. */
 			if (entry_state == SS_SIGQUEUE_AWAITING_YOUR_SIGNATURE
@@ -11493,6 +11579,66 @@ static struct command_result *json_client_list_held_proposals(
 	}
 
 	json_array_end(js);
+	return command_finished(cmd, js);
+}
+
+static struct command_result *json_client_list_recent_sign_queue_events(
+	struct command *cmd, const char *buf UNUSED, const jsmntok_t *params)
+{
+	if (!param(cmd, buf, params, NULL))
+		return command_param_failed();
+
+	struct json_stream *js = jsonrpc_stream_success(cmd);
+	json_array_start(js, "events");
+	for (int i = 0; i < SS_RECENT_SQ_EVENTS_SIZE; i++) {
+		struct ss_recent_sq_event *e = &ss_recent_sq_events[i];
+		if (!e->used) continue;
+		json_object_start(js, NULL);
+		char iid_hex[65];
+		for (int j = 0; j < 32; j++) sprintf(iid_hex + j*2, "%02x", e->factory_instance_id[j]);
+		iid_hex[64] = 0;
+		json_add_string(js, "instance_id", iid_hex);
+		char lsp_hex[67];
+		for (int j = 0; j < 33; j++) sprintf(lsp_hex + j*2, "%02x", e->lsp_peer_id[j]);
+		lsp_hex[66] = 0;
+		json_add_string(js, "lsp_peer_id", lsp_hex);
+		json_add_u32(js, "state", e->state);
+		json_add_u32(js, "deadline_block", e->deadline_block);
+		json_add_u32(js, "observed_at_block", e->observed_at_block);
+		json_add_bool(js, "dismissed", e->dismissed);
+		json_object_end(js);
+	}
+	json_array_end(js);
+	return command_finished(cmd, js);
+}
+
+static struct command_result *json_client_dismiss_sign_queue_event(
+	struct command *cmd, const char *buf, const jsmntok_t *params)
+{
+	const char *iid_hex = NULL;
+	if (!param(cmd, buf, params,
+		   p_req("instance_id", param_string, &iid_hex),
+		   NULL))
+		return command_param_failed();
+
+	uint8_t iid[32];
+	if (strlen(iid_hex) != 64 || !hex_decode(iid_hex, 64, iid, 32))
+		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+				    "instance_id must be 64 hex chars");
+
+	int dismissed = 0;
+	for (int i = 0; i < SS_RECENT_SQ_EVENTS_SIZE; i++) {
+		struct ss_recent_sq_event *e = &ss_recent_sq_events[i];
+		if (!e->used) continue;
+		if (memcmp(e->factory_instance_id, iid, 32) != 0) continue;
+		if (e->dismissed) continue;
+		e->dismissed = true;
+		dismissed++;
+	}
+
+	struct json_stream *js = jsonrpc_stream_success(cmd);
+	json_add_bool(js, "ok", true);
+	json_add_u32(js, "dismissed_count", dismissed);
 	return command_finished(cmd, js);
 }
 
@@ -19412,6 +19558,41 @@ static struct command_result *handle_connect(struct command *cmd,
 	/* Send our supported protocols to the newly connected peer */
 	send_supported_protocols(cmd, peer_id);
 
+	/* Phase D.4: if we've previously interacted with this peer as an LSP
+	 * (have an outgoing_join or a pending_proposal for them), fire a
+	 * SIGN_QUEUE_REQUEST so we pick up any held / missed / expired
+	 * ceremonies they're tracking for us. */
+	{
+		uint8_t conn_pk[33];
+		bool conn_pk_ok = (strlen(peer_id) == 66
+				   && ss_decode_node_id_hex(peer_id, conn_pk));
+		bool known_lsp = false;
+		if (conn_pk_ok) {
+			for (size_t k = 0; k < ss_state.n_outgoing_joins; k++) {
+				if (memcmp(ss_state.outgoing_joins[k].lsp_node_id,
+					   conn_pk, 33) == 0) { known_lsp = true; break; }
+			}
+			if (!known_lsp) {
+				for (int k = 0; k < SS_POLICY_CACHE_SIZE; k++) {
+					struct ss_pending_proposal_entry *pp = &ss_pending_proposals[k];
+					if (pp->used
+					    && memcmp(pp->lsp_peer_id, conn_pk, 33) == 0) {
+						known_lsp = true;
+						break;
+					}
+				}
+			}
+		}
+		if (known_lsp) {
+			plugin_log(plugin_handle, LOG_INFORM,
+				   "BOLT-8 (re)connect with known LSP %s - "
+				   "firing SIGN_QUEUE_REQUEST", peer_id);
+			send_factory_msg(cmd, peer_id,
+				SS_SUBMSG_SIGN_QUEUE_REQUEST,
+				NULL, 0);
+		}
+	}
+
 	/* Recovery: if a factory we're the LSP for has this peer as a
 	 * client mid-ceremony, re-send the cached payload so the
 	 * ceremony can continue without manual intervention.
@@ -22285,6 +22466,14 @@ static const struct plugin_command commands[] = {
 	{
 		"client-list-held-proposals",
 		json_client_list_held_proposals,
+	},
+	{
+		"client-list-recent-sign-queue-events",
+		json_client_list_recent_sign_queue_events,
+	},
+	{
+		"client-dismiss-sign-queue-event",
+		json_client_dismiss_sign_queue_event,
 	},
 	{
 		"client-signing-prefs-get",
