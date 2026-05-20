@@ -3630,6 +3630,17 @@ static void open_factory_channels(struct command *cmd,
 			     ? fi->early_warning_time
 			     : compute_early_warning_time(fi->n_clients,
 				   ss_effective_arity(fi)));
+		/* Audit #5 follow-up: always pass explicit feerate so CLN never
+		 * tries to auto-estimate (which fails on test networks where the
+		 * fee estimator isn't primed). Same default as the funding withdraw. */
+		{
+			uint32_t fr_perkw = fi->requested_feerate_perkw > 0
+				? fi->requested_feerate_perkw
+				: 1000;
+			char fr_str[32];
+			snprintf(fr_str, sizeof(fr_str), "%uperkw", fr_perkw);
+			json_add_string(req->js, "feerate", fr_str);
+		}
 		send_outreq(req);
 
 		plugin_log(plugin_handle, LOG_INFORM,
