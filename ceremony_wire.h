@@ -40,6 +40,21 @@
 #define SS_SUBMSG_CEREMONY_STATUS_REPLY   0x014C
 
 /* ------------------------------------------------------------------
+ * D.3: signing-availability protocol — client reconnect pull.
+ * Per SIGNING_AVAILABILITY_PROTOCOL.md.
+ * ------------------------------------------------------------------ */
+#define SS_SUBMSG_SIGN_QUEUE_REQUEST      0x014D  /* client -> LSP */
+#define SS_SUBMSG_SIGN_QUEUE_RESPONSE     0x014E  /* LSP -> client */
+
+/* States for an LSP's per-client signature queue entry.  Carried in
+ * the SIGN_QUEUE_RESPONSE state TLV (0x02). */
+#define SS_SIGQUEUE_AWAITING_YOUR_SIGNATURE  0
+#define SS_SIGQUEUE_SIGNED                   1
+#define SS_SIGQUEUE_MISSED                   2
+#define SS_SIGQUEUE_REFUSED                  3
+#define SS_SIGQUEUE_EXPIRED                  4
+
+/* ------------------------------------------------------------------
  * Ceremony type byte (carried inside CEREMONY_START)
  * Per CEREMONY_DESIGN.md §4.1. 0x09 (former PENALTY_BURN) is reserved
  * unused per lib-team correction (2026-05-18).

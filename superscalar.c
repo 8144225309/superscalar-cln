@@ -416,6 +416,100 @@ struct ss_pending_proposal_entry {
 	bool     user_approved;
 	bool     user_refused;
 };
+
+static bool ss_decode_node_id_hex(const char *hex, uint8_t out[33]);
+
+/* ============================================================================
+ * Phase D.2: LSP-side per-client signature queue (in-memory).
+ *
+ * Tracks, per (factory_iid, client_pk, ceremony_id) on the LSP node,
+ * whether the client has signed yet, what state the proposal is in,
+ * and the raw FACTORY_PROPOSE payload we sent (so we can replay it on
+ * the client's reconnect pull).
+ *
+ * Populated by ss_kickoff_factory_signing's fan-out loop (each send to
+ * a client adds an entry).  Updated when LSP processes inbound
+ * NONCE_BUNDLE (state -> SIGNED).  Deadline tick marks remaining
+ * AWAITING entries as MISSED.
+ *
+ * V1: in-memory only.  Lost on plugin restart.  Acceptable for V1 because
+ * LSPs that restart mid-ceremony abort the ceremony anyway.
+ * ============================================================================ */
+#define SS_LSP_SIG_QUEUE_SIZE   256
+
+struct ss_lsp_sig_queue_entry {
+	uint8_t  factory_instance_id[32];
+	uint8_t  client_peer_id[33];
+	uint8_t  ceremony_id[8];
+	uint8_t  state;              /* SS_SIGQUEUE_* */
+	uint32_t deadline_block;
+	uint8_t *proposal_blob;      /* heap-alloc; freed on eviction */
+	size_t   proposal_blob_len;
+	uint32_t inserted_at_block;
+	bool     used;
+};
+static struct ss_lsp_sig_queue_entry ss_lsp_sig_queue[SS_LSP_SIG_QUEUE_SIZE];
+
+/* Find an existing slot for this (factory, client, ceremony) triple, or
+ * allocate one (overwriting the oldest if all slots are full). */
+static struct ss_lsp_sig_queue_entry *ss_lsp_sig_queue_slot(
+	const uint8_t factory_iid[32], const uint8_t client_pk[33],
+	const uint8_t ceremony_id[8])
+{
+	int free_slot = -1;
+	int oldest = 0;
+	uint32_t oldest_age = UINT32_MAX;
+	for (int i = 0; i < SS_LSP_SIG_QUEUE_SIZE; i++) {
+		struct ss_lsp_sig_queue_entry *e = &ss_lsp_sig_queue[i];
+		if (e->used
+		    && memcmp(e->factory_instance_id, factory_iid, 32) == 0
+		    && memcmp(e->client_peer_id, client_pk, 33) == 0
+		    && memcmp(e->ceremony_id, ceremony_id, 8) == 0)
+			return e;
+		if (!e->used && free_slot < 0) free_slot = i;
+		if (e->used && e->inserted_at_block < oldest_age) {
+			oldest_age = e->inserted_at_block;
+			oldest = i;
+		}
+	}
+	int target = (free_slot >= 0) ? free_slot : oldest;
+	struct ss_lsp_sig_queue_entry *e = &ss_lsp_sig_queue[target];
+	if (e->used && e->proposal_blob) {
+		free(e->proposal_blob);
+		e->proposal_blob = NULL;
+		e->proposal_blob_len = 0;
+	}
+	memset(e, 0, sizeof(*e));
+	memcpy(e->factory_instance_id, factory_iid, 32);
+	memcpy(e->client_peer_id, client_pk, 33);
+	memcpy(e->ceremony_id, ceremony_id, 8);
+	e->used = true;
+	return e;
+}
+
+/* Update an existing entry's state by (factory, client) match. */
+static void ss_lsp_sig_queue_mark(
+	const uint8_t factory_iid[32], const uint8_t client_pk[33],
+	uint8_t new_state)
+{
+	for (int i = 0; i < SS_LSP_SIG_QUEUE_SIZE; i++) {
+		struct ss_lsp_sig_queue_entry *e = &ss_lsp_sig_queue[i];
+		if (!e->used) continue;
+		if (memcmp(e->factory_instance_id, factory_iid, 32) != 0) continue;
+		if (memcmp(e->client_peer_id, client_pk, 33) != 0) continue;
+		e->state = new_state;
+		/* Drop the blob once the client has signed/missed/refused
+		 * to free memory — the LSP no longer needs to replay. */
+		if (new_state != SS_SIGQUEUE_AWAITING_YOUR_SIGNATURE
+		    && e->proposal_blob) {
+			free(e->proposal_blob);
+			e->proposal_blob = NULL;
+			e->proposal_blob_len = 0;
+		}
+	}
+}
+
+
 static struct ss_pending_proposal_entry ss_pending_proposals[SS_POLICY_CACHE_SIZE];
 
 static struct ss_pending_proposal_entry *ss_pending_proposals_slot(
@@ -4824,7 +4918,9 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 	    && submsg_id != SS_SUBMSG_CEREMONY_RESULT
 	    && submsg_id != SS_SUBMSG_CEREMONY_ABORT
 	    && submsg_id != SS_SUBMSG_CEREMONY_STATUS_QUERY
-	    && submsg_id != SS_SUBMSG_CEREMONY_STATUS_REPLY) {
+	    && submsg_id != SS_SUBMSG_CEREMONY_STATUS_REPLY
+	    && submsg_id != SS_SUBMSG_SIGN_QUEUE_REQUEST
+	    && submsg_id != SS_SUBMSG_SIGN_QUEUE_RESPONSE) {
 		fi = ss_factory_find(&ss_state, data);
 		if (!fi) {
 			plugin_log(plugin_handle, LOG_UNUSUAL,
@@ -10573,6 +10669,180 @@ realloc_all_nonces_done:
 			   submsg_id, peer_id, len);
 		break;
 
+	case SS_SUBMSG_SIGN_QUEUE_REQUEST: {
+		/* D.3 LSP handler: parse optional TLVs (factory_iid filter,
+		 * since_block filter), then build SIGN_QUEUE_RESPONSE with
+		 * matching entries from ss_lsp_sig_queue. */
+		uint8_t filter_iid[32];
+		bool has_iid_filter = false;
+		uint32_t since_block = 0;
+		size_t p = 0;
+		while (p + 2 <= len) {
+			uint8_t t = data[p++];
+			uint8_t l = data[p++];
+			if (p + l > len) break;
+			if (t == 0x00 && l == 32) {
+				memcpy(filter_iid, data + p, 32);
+				has_iid_filter = true;
+			} else if (t == 0x01 && l == 4) {
+				since_block = ((uint32_t)data[p] << 24)
+					    | ((uint32_t)data[p+1] << 16)
+					    | ((uint32_t)data[p+2] << 8)
+					    | ((uint32_t)data[p+3]);
+			}
+			p += l;
+		}
+
+		/* Build the response payload. */
+		uint8_t client_pk[33];
+		if (!ss_decode_node_id_hex(peer_id, client_pk)) break;
+
+		uint8_t *resp = NULL;
+		size_t resp_cap = 4096;
+		size_t resp_len = 0;
+		resp = malloc(resp_cap);
+		if (!resp) break;
+
+		for (int i = 0; i < SS_LSP_SIG_QUEUE_SIZE; i++) {
+			struct ss_lsp_sig_queue_entry *e = &ss_lsp_sig_queue[i];
+			if (!e->used) continue;
+			if (memcmp(e->client_peer_id, client_pk, 33) != 0) continue;
+			if (has_iid_filter
+			    && memcmp(e->factory_instance_id, filter_iid, 32) != 0) continue;
+			if (e->inserted_at_block < since_block) continue;
+
+			/* Reserve worst-case bytes: 6 TLV headers + 32 + 8 + 1 + 4 + blob */
+			size_t need = resp_len + 6 + 32 + 8 + 1 + 4 + e->proposal_blob_len + 4;
+			if (need > resp_cap) {
+				size_t new_cap = resp_cap;
+				while (new_cap < need) new_cap *= 2;
+				uint8_t *bigger = realloc(resp, new_cap);
+				if (!bigger) break;
+				resp = bigger; resp_cap = new_cap;
+			}
+
+			/* Entry framing: 0xFE 0xFE (sentinel), then TLVs */
+			resp[resp_len++] = 0xFE; resp[resp_len++] = 0xFE;
+
+			/* TLV 0x00: factory_instance_id */
+			resp[resp_len++] = 0x00; resp[resp_len++] = 32;
+			memcpy(resp + resp_len, e->factory_instance_id, 32);
+			resp_len += 32;
+
+			/* TLV 0x01: ceremony_id */
+			resp[resp_len++] = 0x01; resp[resp_len++] = 8;
+			memcpy(resp + resp_len, e->ceremony_id, 8);
+			resp_len += 8;
+
+			/* TLV 0x02: state */
+			resp[resp_len++] = 0x02; resp[resp_len++] = 1;
+			resp[resp_len++] = e->state;
+
+			/* TLV 0x03: deadline_block */
+			resp[resp_len++] = 0x03; resp[resp_len++] = 4;
+			resp[resp_len++] = (e->deadline_block >> 24) & 0xFF;
+			resp[resp_len++] = (e->deadline_block >> 16) & 0xFF;
+			resp[resp_len++] = (e->deadline_block >>  8) & 0xFF;
+			resp[resp_len++] = (e->deadline_block      ) & 0xFF;
+
+			/* TLV 0x04: proposal_blob (only if AWAITING) */
+			if (e->state == SS_SIGQUEUE_AWAITING_YOUR_SIGNATURE
+			    && e->proposal_blob && e->proposal_blob_len > 0
+			    && e->proposal_blob_len < 65535) {
+				resp[resp_len++] = 0x04;
+				/* 2-byte length prefix for blob */
+				resp[resp_len++] = 0xfd;
+				resp[resp_len++] = (e->proposal_blob_len >> 8) & 0xFF;
+				resp[resp_len++] = e->proposal_blob_len & 0xFF;
+				memcpy(resp + resp_len, e->proposal_blob, e->proposal_blob_len);
+				resp_len += e->proposal_blob_len;
+			}
+		}
+
+		plugin_log(plugin_handle, LOG_INFORM,
+			   "SIGN_QUEUE_REQUEST from %s -> sending response "
+			   "(%zu bytes, has_iid_filter=%d)",
+			   peer_id, resp_len, has_iid_filter);
+
+		send_factory_msg(cmd, peer_id, SS_SUBMSG_SIGN_QUEUE_RESPONSE,
+				 resp, resp_len);
+		free(resp);
+		break;
+	}
+
+	case SS_SUBMSG_SIGN_QUEUE_RESPONSE: {
+		/* D.4 client-side: parse entries, log + (for AWAITING)
+		 * re-dispatch as a fresh FACTORY_PROPOSE so the existing
+		 * client-side handler picks it up + runs validator. */
+		plugin_log(plugin_handle, LOG_INFORM,
+			   "SIGN_QUEUE_RESPONSE from %s (len=%zu)",
+			   peer_id, len);
+
+		size_t p = 0;
+		while (p + 2 <= len) {
+			/* Entry sentinel */
+			if (data[p] != 0xFE || data[p+1] != 0xFE) break;
+			p += 2;
+
+			uint8_t entry_iid[32]; bool have_iid = false;
+			uint8_t entry_state = 0xFF;
+			uint32_t entry_deadline = 0;
+			const uint8_t *entry_blob = NULL;
+			size_t entry_blob_len = 0;
+
+			while (p + 2 <= len && !(data[p] == 0xFE && data[p+1] == 0xFE)) {
+				uint8_t t = data[p++];
+				size_t vlen = data[p++];
+				if (vlen == 0xfd && p + 2 <= len) {
+					vlen = ((size_t)data[p] << 8) | data[p+1];
+					p += 2;
+				}
+				if (p + vlen > len) break;
+				switch (t) {
+				case 0x00: if (vlen == 32) { memcpy(entry_iid, data + p, 32); have_iid = true; } break;
+				case 0x02: if (vlen == 1) entry_state = data[p]; break;
+				case 0x03: if (vlen == 4) {
+					entry_deadline = ((uint32_t)data[p] << 24)
+						       | ((uint32_t)data[p+1] << 16)
+						       | ((uint32_t)data[p+2] << 8)
+						       | ((uint32_t)data[p+3]);
+				} break;
+				case 0x04: entry_blob = data + p; entry_blob_len = vlen; break;
+				}
+				p += vlen;
+			}
+
+			if (!have_iid) continue;
+
+			char iid_prefix[9];
+			for (int j = 0; j < 4; j++) sprintf(iid_prefix + j*2, "%02x", entry_iid[j]);
+			iid_prefix[8] = 0;
+
+			plugin_log(plugin_handle, LOG_INFORM,
+				   "SIGN_QUEUE entry: iid_prefix=%s state=%u deadline=%u blob=%zu",
+				   iid_prefix, entry_state, entry_deadline, entry_blob_len);
+			ss_audit_log(LOG_INFORM, "sign_queue_entry",
+				"{\"peer\":\"%s\",\"iid_prefix\":\"%s\",\"state\":%u,"
+				"\"deadline_block\":%u,\"blob_len\":%zu}",
+				peer_id, iid_prefix, entry_state, entry_deadline, entry_blob_len);
+
+			/* Re-dispatch AWAITING entries via the existing FACTORY_PROPOSE
+			 * handler — validator runs, then either auto-sign or hold. */
+			if (entry_state == SS_SIGQUEUE_AWAITING_YOUR_SIGNATURE
+			    && entry_blob && entry_blob_len > 0) {
+				uint8_t *blob_copy = malloc(entry_blob_len);
+				if (blob_copy) {
+					memcpy(blob_copy, entry_blob, entry_blob_len);
+					dispatch_superscalar_submsg(cmd, peer_id,
+						SS_SUBMSG_FACTORY_PROPOSE,
+						blob_copy, entry_blob_len);
+					free(blob_copy);
+				}
+			}
+		}
+		break;
+	}
+
 	default:
 		plugin_log(plugin_handle, LOG_DBG,
 			   "Unknown submsg 0x%04x from %s (len=%zu)",
@@ -11185,6 +11455,45 @@ static struct command_result *ss_lookup_proposal_for_action(
 	*out_slot = NULL;
 	return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
 			    "no pending proposal matches instance_id + lsp_peer_id");
+}
+
+static struct command_result *json_client_list_held_proposals(
+	struct command *cmd, const char *buf UNUSED, const jsmntok_t *params)
+{
+	if (!param(cmd, buf, params, NULL))
+		return command_param_failed();
+
+	struct json_stream *js = jsonrpc_stream_success(cmd);
+	json_array_start(js, "held");
+
+	for (int i = 0; i < SS_POLICY_CACHE_SIZE; i++) {
+		struct ss_pending_proposal_entry *e = &ss_pending_proposals[i];
+		if (!e->used) continue;
+		if (!e->held_payload || e->held_payload_len == 0) continue;
+
+		json_object_start(js, NULL);
+		char iid_hex[65];
+		for (int j = 0; j < 32; j++)
+			sprintf(iid_hex + j*2, "%02x", e->instance_id[j]);
+		iid_hex[64] = '\0';
+		json_add_string(js, "instance_id", iid_hex);
+
+		char lsp_hex[67];
+		for (int j = 0; j < 33; j++)
+			sprintf(lsp_hex + j*2, "%02x", e->lsp_peer_id[j]);
+		lsp_hex[66] = '\0';
+		json_add_string(js, "lsp_peer_id", lsp_hex);
+
+		json_add_u64(js, "funding_sats", e->funding_sats);
+		json_add_u32(js, "n_participants", e->n_participants);
+		json_add_u32(js, "our_pidx", e->our_pidx);
+		json_add_u32(js, "received_at_block", e->received_at_block);
+		json_add_u32(js, "validator_result", (uint32_t)e->last_validate_result);
+		json_object_end(js);
+	}
+
+	json_array_end(js);
+	return command_finished(cmd, js);
 }
 
 static struct command_result *json_factory_approve_proposal(
@@ -12507,6 +12816,30 @@ static struct command_result *ss_kickoff_factory_signing(
 			send_factory_msg(cmd, client_hex,
 				SS_SUBMSG_FACTORY_PROPOSE,
 				cbuf, blen + 12 + extra);
+
+			/* D.2: record this proposal in the LSP signature queue
+			 * so we can replay it if the client reconnects later. */
+			{
+				uint8_t cli_pk[33];
+				if (ss_decode_node_id_hex(client_hex, cli_pk)) {
+					/* ceremony_id is fi->active_ceremony_id (first 8 bytes
+					 * derived from instance + epoch + current_block). */
+					uint8_t cid[8];
+					memcpy(cid, fi->active_ceremony_id, 8);
+					struct ss_lsp_sig_queue_entry *qe =
+						ss_lsp_sig_queue_slot(fi->instance_id, cli_pk, cid);
+					qe->state = SS_SIGQUEUE_AWAITING_YOUR_SIGNATURE;
+					qe->deadline_block = fi->active_ceremony_deadline_block;
+					qe->inserted_at_block = ss_state.current_blockheight;
+					/* Stash a copy of the proposal payload for replay. */
+					if (qe->proposal_blob) free(qe->proposal_blob);
+					qe->proposal_blob = malloc(blen + 12 + extra);
+					if (qe->proposal_blob) {
+						memcpy(qe->proposal_blob, cbuf, blen + 12 + extra);
+						qe->proposal_blob_len = blen + 12 + extra;
+					}
+				}
+			}
 			free(cbuf);
 
 			plugin_log(plugin_handle, LOG_INFORM,
@@ -21948,6 +22281,10 @@ static const struct plugin_command commands[] = {
 	{
 		"dev-factory-mark-cpfp-parent-confirmed",
 		json_dev_factory_mark_cpfp_parent_confirmed,
+	},
+	{
+		"client-list-held-proposals",
+		json_client_list_held_proposals,
 	},
 	{
 		"client-signing-prefs-get",
