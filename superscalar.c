@@ -10984,7 +10984,6 @@ realloc_all_nonces_done:
 	case SS_SUBMSG_CEREMONY_PARTIAL_SIG_REQ:
 	case SS_SUBMSG_CEREMONY_PARTIAL_SIG:
 	case SS_SUBMSG_CEREMONY_RESULT:
-	case SS_SUBMSG_CEREMONY_ABORT:
 	case SS_SUBMSG_CEREMONY_STATUS_QUERY:
 	case SS_SUBMSG_CEREMONY_STATUS_REPLY:
 		plugin_log(plugin_handle, LOG_DBG,
@@ -10993,6 +10992,67 @@ realloc_all_nonces_done:
 			   "processed",
 			   submsg_id, peer_id, len);
 		break;
+
+	case SS_SUBMSG_CEREMONY_ABORT: {
+		/* Audit item #3: explicit client refusal of a ceremony slot.
+		 * Payload is [instance_id(32) || reason(1)]. */
+		if (len < 33) {
+			plugin_log(plugin_handle, LOG_UNUSUAL,
+				   "CEREMONY_ABORT from %s too short (%zu)",
+				   peer_id, len);
+			break;
+		}
+		uint8_t inst_id[32];
+		memcpy(inst_id, data, 32);
+		uint8_t reason = data[32];
+
+		char inst_hex[65];
+		for (int i = 0; i < 32; i++)
+			sprintf(inst_hex + i*2, "%02x", inst_id[i]);
+		inst_hex[64] = '\0';
+
+		const char *rname =
+			reason == SS_CEREMONY_ABORT_USER_REFUSED    ? "USER_REFUSED" :
+			reason == SS_CEREMONY_ABORT_POLICY_VIOLATED ? "POLICY_VIOLATED" :
+			reason == SS_CEREMONY_ABORT_DEADLINE_PASSED ? "DEADLINE_PASSED" :
+			reason == SS_CEREMONY_ABORT_OTHER           ? "OTHER" : "UNKNOWN";
+
+		factory_instance_t *fi = ss_factory_find(&ss_state, inst_id);
+		if (!fi) {
+			plugin_log(plugin_handle, LOG_UNUSUAL,
+				   "CEREMONY_ABORT from %s for unknown instance %s "
+				   "(reason=%s) — ignored",
+				   peer_id, inst_hex, rname);
+			break;
+		}
+
+		/* Find the client slot for the peer that sent the abort. */
+		uint8_t peer_pk[33];
+		bool found = false;
+		if (ss_decode_node_id_hex(peer_id, peer_pk)) {
+			for (size_t ci = 0; ci < fi->n_clients; ci++) {
+				if (memcmp(fi->clients[ci].node_id, peer_pk, 33) == 0) {
+					/* Mark them disconnected so the deadline tick
+					 * cleans up without waiting. */
+					fi->clients[ci].connected = false;
+					found = true;
+					plugin_log(plugin_handle, LOG_INFORM,
+						   "CEREMONY_ABORT: client %zu (%s) "
+						   "refused factory %s reason=%s",
+						   ci, peer_id, inst_hex, rname);
+					break;
+				}
+			}
+		}
+		if (!found) {
+			plugin_log(plugin_handle, LOG_INFORM,
+				   "CEREMONY_ABORT: %s refused factory %s reason=%s "
+				   "(peer not a client of this factory)",
+				   peer_id, inst_hex, rname);
+		}
+		break;
+	}
+
 
 	case SS_SUBMSG_SIGN_QUEUE_REQUEST: {
 		/* D.3 LSP handler: parse optional TLVs (factory_iid filter,
@@ -11957,6 +12017,33 @@ static struct command_result *json_factory_approve_proposal(
 	return command_finished(cmd, js);
 }
 
+
+/* Audit item #3: send a CEREMONY_ABORT (0x014A) submsg to the LSP after the
+ * user refuses a proposal.  Payload is [instance_id(32) || reason(1)].
+ * Best-effort fire-and-forget — if the LSP is unreachable, the existing
+ * deadline machinery still cleans up the ceremony eventually. */
+static void ss_send_ceremony_abort(struct command *cmd,
+				   const uint8_t lsp_peer_id[33],
+				   const uint8_t instance_id[32],
+				   uint8_t reason)
+{
+	char peer_hex[67];
+	for (int i = 0; i < 33; i++)
+		sprintf(peer_hex + i*2, "%02x", lsp_peer_id[i]);
+	peer_hex[66] = '\0';
+
+	uint8_t payload[33];
+	memcpy(payload, instance_id, 32);
+	payload[32] = reason;
+
+	plugin_log(plugin_handle, LOG_INFORM,
+		   "CEREMONY_ABORT -> %s reason=%u",
+		   peer_hex, (unsigned)reason);
+
+	send_factory_msg(cmd, peer_hex, SS_SUBMSG_CEREMONY_ABORT,
+			 payload, sizeof(payload));
+}
+
 static struct command_result *json_factory_refuse_proposal(
 	struct command *cmd, const char *buf, const jsmntok_t *params)
 {
@@ -11975,9 +12062,14 @@ static struct command_result *json_factory_refuse_proposal(
 	slot->user_refused = true;
 	slot->user_approved = false;
 
+	/* Audit item #3: send the explicit ABORT so the LSP doesn't have to wait
+	 * for the deadline. Reason code is USER_REFUSED. */
+	ss_send_ceremony_abort(cmd, slot->lsp_peer_id, slot->instance_id,
+			       SS_CEREMONY_ABORT_USER_REFUSED);
+
 	plugin_log(plugin_handle, LOG_INFORM,
-		   "factory-refuse-proposal: %s. LSP will time out on this "
-		   "client. CEREMONY_ABORT submsg follows PR 3c (task #81).",
+		   "factory-refuse-proposal: %s. Sent CEREMONY_ABORT (USER_REFUSED) "
+		   "to LSP.",
 		   was_held ? "released held proposal + marked REFUSED"
 			    : "marked REFUSED (no held payload)");
 
@@ -11985,8 +12077,8 @@ static struct command_result *json_factory_refuse_proposal(
 	json_add_bool(js, "ok", true);
 	json_add_string(js, "action", was_held ? "released_and_refused" : "marked_refused");
 	json_add_string(js, "note", was_held
-		? "Held proposal dropped. LSP will time out and proceed without you."
-		: "Slot marked REFUSED. No held proposal to drop (proposal was auto-signed or already decided).");
+		? "Held proposal dropped. CEREMONY_ABORT (USER_REFUSED) sent to LSP."
+		: "Slot marked REFUSED. CEREMONY_ABORT (USER_REFUSED) sent to LSP (no held payload).");
 	json_add_u32(js, "validator_result", (uint32_t)slot->last_validate_result);
 	return command_finished(cmd, js);
 }

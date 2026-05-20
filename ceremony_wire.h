@@ -47,6 +47,12 @@
 #define SS_SUBMSG_SIGN_QUEUE_RESPONSE     0x014E  /* LSP -> client */
 #define SS_SUBMSG_FACTORY_PROPOSE_V2      0x014F  /* LSP -> client; carries policy diff trailer (Phase C v2) */
 
+/* CEREMONY_ABORT reason codes (one byte payload, audit item #3) */
+#define SS_CEREMONY_ABORT_USER_REFUSED      0  /* client refused via factory-refuse-proposal */
+#define SS_CEREMONY_ABORT_POLICY_VIOLATED   1  /* validator rejected the proposal */
+#define SS_CEREMONY_ABORT_DEADLINE_PASSED   2  /* client missed deadline window */
+#define SS_CEREMONY_ABORT_OTHER             3  /* unspecified */
+
 /* States for an LSP's per-client signature queue entry.  Carried in
  * the SIGN_QUEUE_RESPONSE state TLV (0x02). */
 #define SS_SIGQUEUE_AWAITING_YOUR_SIGNATURE  0
