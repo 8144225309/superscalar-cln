@@ -45,6 +45,7 @@
  * ------------------------------------------------------------------ */
 #define SS_SUBMSG_SIGN_QUEUE_REQUEST      0x014D  /* client -> LSP */
 #define SS_SUBMSG_SIGN_QUEUE_RESPONSE     0x014E  /* LSP -> client */
+#define SS_SUBMSG_FACTORY_PROPOSE_V2      0x014F  /* LSP -> client; carries policy diff trailer (Phase C v2) */
 
 /* States for an LSP's per-client signature queue entry.  Carried in
  * the SIGN_QUEUE_RESPONSE state TLV (0x02). */

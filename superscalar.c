@@ -5189,7 +5189,8 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 	    && submsg_id != SS_SUBMSG_CEREMONY_STATUS_QUERY
 	    && submsg_id != SS_SUBMSG_CEREMONY_STATUS_REPLY
 	    && submsg_id != SS_SUBMSG_SIGN_QUEUE_REQUEST
-	    && submsg_id != SS_SUBMSG_SIGN_QUEUE_RESPONSE) {
+	    && submsg_id != SS_SUBMSG_SIGN_QUEUE_RESPONSE
+	    && submsg_id != SS_SUBMSG_FACTORY_PROPOSE_V2) {
 		fi = ss_factory_find(&ss_state, data);
 		if (!fi) {
 			plugin_log(plugin_handle, LOG_UNUSUAL,
@@ -5201,6 +5202,61 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 	}
 
 	switch (submsg_id) {
+	case SS_SUBMSG_FACTORY_PROPOSE_V2: {
+		/* Phase C v2: strip trailing [u16 BE policy_len][policy_diff]
+		 * and update the policy cache, then fall through to the V1
+		 * handler with the prefix. */
+		if (len < 2) {
+			plugin_log(plugin_handle, LOG_UNUSUAL,
+				   "FACTORY_PROPOSE_V2 from %s too short (%zu)",
+				   peer_id, len);
+			break;
+		}
+		size_t plen = ((size_t)data[len - 2] << 8) | data[len - 1];
+		if (plen + 2 > len) {
+			plugin_log(plugin_handle, LOG_UNUSUAL,
+				   "FACTORY_PROPOSE_V2 policy_len %zu > payload %zu - 2",
+				   plen, len);
+			break;
+		}
+		const uint8_t *pol_bytes = data + (len - 2 - plen);
+		size_t prefix_len = len - 2 - plen;
+
+		/* Try to decode the policy and update cache. We need the
+		 * instance_id from the bundle prefix — peek at the standard
+		 * V1 trailer to find it. */
+		if (plen > 0) {
+			ss_factory_policy_t pol;
+			ss_factory_policy_init_defaults(&pol);
+			if (ss_factory_policy_decode(pol_bytes, plen, &pol)) {
+				/* Need the instance_id to key the cache.
+				 * The nonce bundle's first 32 bytes are
+				 * the instance_id per nonce_bundle_t
+				 * serialisation order. */
+				if (prefix_len >= 32) {
+					uint8_t lsp_pk[33];
+					if (ss_decode_node_id_hex(peer_id, lsp_pk)) {
+						ss_policy_cache_put(lsp_pk, data, &pol);
+						plugin_log(plugin_handle, LOG_INFORM,
+							   "FACTORY_PROPOSE_V2: cached policy "
+							   "from %s (diff=%zu bytes)",
+							   peer_id, plen);
+					}
+				}
+			} else {
+				plugin_log(plugin_handle, LOG_UNUSUAL,
+					   "FACTORY_PROPOSE_V2 policy decode failed");
+			}
+		}
+
+		/* Dispatch the prefix as a V1 FACTORY_PROPOSE so the
+		 * existing validator + auto-sign gate runs against the
+		 * (now-fresh) cached policy. */
+		dispatch_superscalar_submsg(cmd, peer_id,
+			SS_SUBMSG_FACTORY_PROPOSE, data, prefix_len);
+		break;
+	}
+
 	case SS_SUBMSG_FACTORY_PROPOSE:
 		plugin_log(plugin_handle, LOG_INFORM,
 			   "FACTORY_PROPOSE from %s (len=%zu)",
@@ -13155,9 +13211,31 @@ static struct command_result *ss_kickoff_factory_signing(
 				cbuf[off] = n_alloc; /* 0 when no allocs */
 			}
 
-			send_factory_msg(cmd, client_hex,
-				SS_SUBMSG_FACTORY_PROPOSE,
-				cbuf, blen + 12 + extra);
+			/* Phase C v2: switch to V2 submsg with policy diff
+			 * trailer so the client validator sees THIS
+			 * ceremony's policy, not a stale browse-time cache. */
+			{
+				uint8_t pol_buf[1024];
+				size_t pol_len = ss_build_factory_policy_blob(fi, pol_buf, sizeof(pol_buf));
+				size_t v2_len = blen + 12 + extra + 2 + pol_len;
+				uint8_t *v2 = malloc(v2_len);
+				if (v2) {
+					memcpy(v2, cbuf, blen + 12 + extra);
+					if (pol_len > 0)
+						memcpy(v2 + blen + 12 + extra, pol_buf, pol_len);
+					v2[blen + 12 + extra + pol_len] = (uint8_t)(pol_len >> 8);
+					v2[blen + 12 + extra + pol_len + 1] = (uint8_t)(pol_len & 0xFF);
+					send_factory_msg(cmd, client_hex,
+						SS_SUBMSG_FACTORY_PROPOSE_V2,
+						v2, v2_len);
+					free(v2);
+				} else {
+					/* Fallback: send V1 if alloc fails. */
+					send_factory_msg(cmd, client_hex,
+						SS_SUBMSG_FACTORY_PROPOSE,
+						cbuf, blen + 12 + extra);
+				}
+			}
 
 			/* D.2: record this proposal in the LSP signature queue
 			 * so we can replay it if the client reconnects later. */
