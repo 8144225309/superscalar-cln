@@ -76,4 +76,29 @@ bool ss_db_begin_plugin(void);
 bool ss_db_commit_plugin(void);
 bool ss_db_rollback_plugin(void);
 
+
+/* ============================================================================
+ * Plugin-side helpers for the legacy ss_save_factory call sites. These
+ * replace the jsonrpc_request_start("wallet-set-setting", ...) and
+ * jsonrpc_request_start("wallet-upsert-factory", ...) RPC dual-writes
+ * with direct SQLite writes to ss_plugin_db.
+ *
+ * Wallet UI continues to call the same wallet-* RPCs (now served by
+ * ss_wallet_rpc.c in the C plugin), so the wire shape is preserved.
+ * ============================================================================ */
+
+/* INSERT OR REPLACE on ss_plugin_db.wallet_settings.
+ * Value is JSON-stringified hex of the blob (matching the sidecar format
+ * so old and new readers see the same shape).
+ * Returns true on success. */
+bool ss_db_set_setting_blob(const char *key, const uint8_t *data, size_t len);
+
+/* INSERT OR REPLACE on ss_plugin_db.factories.
+ * archived defaults to 0; pass non-zero to mark a factory as hidden.
+ * Returns true on success. */
+bool ss_db_upsert_factory_row(const uint8_t iid[32], uint32_t my_role,
+                              uint32_t created_at_block, uint32_t state,
+                              uint32_t archived);
+
+
 #endif /* SUPERSCALAR_SS_DB_H */

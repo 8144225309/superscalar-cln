@@ -242,20 +242,18 @@ def main():
         lib.commit()
         plugin.commit()
 
-        print("== Step 1: migrate factory_blob:* rows to lib.factory_state ==")
-        migrate_factory_blobs(src, lib, args.current_block)
-        lib.commit()
+        print("== Step 1: SKIPPED (factory_blob:* rows stay in wallet_settings for now) ==")
+        print("   (lib factory_state restructure deferred until lib team owns the schema)")
 
         print("== Step 2: copy non-blob tables to superscalar-cln.db ==")
         for t in PLUGIN_TABLES:
             copy_table(src, plugin, t)
 
-        print("== Step 3: copy non-factory_blob wallet_settings rows ==")
+        print("== Step 3: copy ALL wallet_settings rows (including factory_blob:*) ==")
         ws_cols = get_columns(plugin, 'wallet_settings')
         if ws_cols:
             rows = src.execute(
-                "SELECT setting_key, setting_value, updated_at FROM wallet_settings "
-                "WHERE setting_key NOT LIKE 'factory_blob:%'"
+                "SELECT setting_key, setting_value, updated_at FROM wallet_settings"
             ).fetchall()
             if rows:
                 plugin.executemany(

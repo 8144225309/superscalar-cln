@@ -5,6 +5,7 @@
  */
 #include "config.h"
 #include "ss_db.h"
+#include "ss_wallet_rpc.h"
 #include <ccan/array_size/array_size.h>
 #include <ccan/tal/str/str.h>
 #include <common/json_param.h>
@@ -1240,6 +1241,13 @@ static bool ss_enable_session_restore = false;
 
 
 static char *ss_resolve_wallet_db_path(const tal_t *ctx) {
+	/* Phase 5 refactor: prefer ss_plugin_db_path_override (the new
+	 * superscalar-cln-db-path option). Existing legacy code paths
+	 * (ss_open_wallet_db_ro and its callers) now read from the new
+	 * file with zero call-site changes. The two back-compat fallbacks
+	 * remain for nodes still using the old option name. */
+	if (ss_plugin_db_path_override && ss_plugin_db_path_override[0])
+		return tal_strdup(ctx, ss_plugin_db_path_override);
 	if (ss_wallet_db_path_override && ss_wallet_db_path_override[0])
 		return tal_strdup(ctx, ss_wallet_db_path_override);
 	const char *env = getenv("SUPERSCALAR_WALLET_DB_PATH");
@@ -1250,11 +1258,12 @@ static char *ss_resolve_wallet_db_path(const tal_t *ctx) {
 		struct passwd *pw = getpwuid(getuid());
 		if (pw && pw->pw_dir) home = pw->pw_dir;
 	}
-	if (xdg && xdg[0])
-		return tal_fmt(ctx, "%s/soupwallet/wallet.db", xdg);
-	if (home && home[0])
-		return tal_fmt(ctx, "%s/.config/soupwallet/wallet.db", home);
-	return tal_strdup(ctx, "/tmp/soupwallet-wallet.db");
+	/* No override + no env var: default to the consolidated DB
+	 * filename (same as what ss_db_init opens). CLN runs plugins
+	 * with cwd = lightning-dir/<network>, so this resolves to the
+	 * per-node file. */
+	(void)xdg; (void)home;  /* legacy fallbacks unused since Phase 5 */
+	return tal_strdup(ctx, "superscalar-cln.db");
 }
 
 /* Open wallet.db read-only. Returns NULL on any failure (caller treats as
@@ -23354,6 +23363,86 @@ static const struct plugin_command commands[] = {
 	{
 		"factory-scan-external-close",
 		json_factory_scan_external_close,
+	},
+	{
+		"wallet-get-iid-counter",
+		json_wallet_get_iid_counter,
+	},
+	{
+		"wallet-increment-iid-counter",
+		json_wallet_increment_iid_counter,
+	},
+	{
+		"wallet-set-iid-counter",
+		json_wallet_set_iid_counter,
+	},
+	{
+		"wallet-upsert-factory",
+		json_wallet_upsert_factory,
+	},
+	{
+		"wallet-get-factory",
+		json_wallet_get_factory,
+	},
+	{
+		"wallet-list-factories-by-role",
+		json_wallet_list_factories_by_role,
+	},
+	{
+		"wallet-upsert-join-queue-entry",
+		json_wallet_upsert_join_queue_entry,
+	},
+	{
+		"wallet-list-join-queue-by-status",
+		json_wallet_list_join_queue_by_status,
+	},
+	{
+		"wallet-count-join-queue-by-status",
+		json_wallet_count_join_queue_by_status,
+	},
+	{
+		"wallet-upsert-outgoing-join",
+		json_wallet_upsert_outgoing_join,
+	},
+	{
+		"wallet-list-outgoing-joins-by-status",
+		json_wallet_list_outgoing_joins_by_status,
+	},
+	{
+		"wallet-save-factory-policy-snapshot",
+		json_wallet_save_factory_policy_snapshot,
+	},
+	{
+		"wallet-get-factory-policy-snapshot",
+		json_wallet_get_factory_policy_snapshot,
+	},
+	{
+		"wallet-set-operator-pref",
+		json_wallet_set_operator_pref,
+	},
+	{
+		"wallet-get-operator-pref",
+		json_wallet_get_operator_pref,
+	},
+	{
+		"wallet-set-signing-pref",
+		json_wallet_set_signing_pref,
+	},
+	{
+		"wallet-get-signing-pref",
+		json_wallet_get_signing_pref,
+	},
+	{
+		"wallet-set-setting",
+		json_wallet_set_setting,
+	},
+	{
+		"wallet-get-setting",
+		json_wallet_get_setting,
+	},
+	{
+		"wallet-status",
+		json_wallet_status,
 	},
 };
 

@@ -457,3 +457,94 @@ bool ss_db_rollback_plugin(void)
 	return ss_db_exec_noresult(ss_plugin_db, "ROLLBACK",
 		"superscalar-cln.db", "ROLLBACK");
 }
+
+
+/* ============================================================================
+ * Helpers used by superscalar.c\x27s legacy ss_save_factory path to replace
+ * the RPC-based dual-write with direct SQLite ops on ss_plugin_db.
+ * ============================================================================ */
+
+bool ss_db_set_setting_blob(const char *key, const uint8_t *data, size_t len)
+{
+	if (!ss_plugin_db) return false;
+
+	/* Hex-encode the blob, then JSON-string-wrap it (with quotes) so the
+	 * stored value matches what the sidecar wrote. Existing
+	 * ss_wallet_db_load_blob_tal in superscalar.c strips the wrapping
+	 * quotes before hex-decoding. */
+	char *value = malloc(len * 2 + 3);
+	if (!value) return false;
+	value[0] = '"';
+	for (size_t i = 0; i < len; i++)
+		sprintf(value + 1 + i*2, "%02x", data[i]);
+	value[1 + len*2] = '"';
+	value[1 + len*2 + 1] = '\0';
+
+	sqlite3_stmt *st = NULL;
+	if (sqlite3_prepare_v2(ss_plugin_db,
+		"INSERT INTO wallet_settings (setting_key, setting_value, updated_at) "
+		"VALUES (?, ?, strftime(\'%s\',\'now\')) "
+		"ON CONFLICT(setting_key) DO UPDATE SET "
+		"  setting_value = excluded.setting_value,"
+		"  updated_at = excluded.updated_at",
+		-1, &st, NULL) != SQLITE_OK) {
+		plugin_log(plugin_handle, LOG_BROKEN,
+			   "ss_db_set_setting_blob prepare failed: %s",
+			   sqlite3_errmsg(ss_plugin_db));
+		free(value);
+		return false;
+	}
+	sqlite3_bind_text(st, 1, key, -1, SQLITE_TRANSIENT);
+	sqlite3_bind_text(st, 2, value, -1, SQLITE_TRANSIENT);
+	int rc = sqlite3_step(st);
+	sqlite3_finalize(st);
+	free(value);
+	if (rc != SQLITE_DONE) {
+		plugin_log(plugin_handle, LOG_BROKEN,
+			   "ss_db_set_setting_blob step failed: %s",
+			   sqlite3_errstr(rc));
+		return false;
+	}
+	return true;
+}
+
+bool ss_db_upsert_factory_row(const uint8_t iid[32], uint32_t my_role,
+			      uint32_t created_at_block, uint32_t state,
+			      uint32_t archived)
+{
+	if (!ss_plugin_db) return false;
+
+	sqlite3_stmt *st = NULL;
+	if (sqlite3_prepare_v2(ss_plugin_db,
+		"INSERT INTO factories "
+		"  (factory_instance_id, my_role, display_label, created_at_block,"
+		"   joined_at_block, state, last_seen_at, archived) "
+		"VALUES (?, ?, NULL, ?, NULL, ?, strftime(\'%s\',\'now\'), ?) "
+		"ON CONFLICT(factory_instance_id) DO UPDATE SET "
+		"  my_role = excluded.my_role,"
+		"  created_at_block = excluded.created_at_block,"
+		"  state = excluded.state,"
+		"  last_seen_at = excluded.last_seen_at,"
+		"  archived = excluded.archived",
+		-1, &st, NULL) != SQLITE_OK) {
+		plugin_log(plugin_handle, LOG_BROKEN,
+			   "ss_db_upsert_factory_row prepare failed: %s",
+			   sqlite3_errmsg(ss_plugin_db));
+		return false;
+	}
+	sqlite3_bind_blob(st, 1, iid, 32, SQLITE_TRANSIENT);
+	sqlite3_bind_int(st, 2, (int)my_role);
+	sqlite3_bind_int(st, 3, (int)created_at_block);
+	sqlite3_bind_int(st, 4, (int)state);
+	sqlite3_bind_int(st, 5, (int)archived);
+	int rc = sqlite3_step(st);
+	sqlite3_finalize(st);
+	if (rc != SQLITE_DONE) {
+		plugin_log(plugin_handle, LOG_BROKEN,
+			   "ss_db_upsert_factory_row step failed: %s",
+			   sqlite3_errstr(rc));
+		return false;
+	}
+	return true;
+}
+
