@@ -1226,6 +1226,18 @@ static struct command_result *json_factory_funding_precheck(
 
 static char *ss_wallet_db_path_override = NULL;  /* set via plugin_option */
 
+/* Lib task #80 / SF-LIB-MUSIG-PERSIST integration flag (default off).
+ * When the lib ships factory_restore_sessions(), this gates whether
+ * ss_load_factories attempts session restore (true) or falls through
+ * to the interim mitigation that resets in-flight ceremonies to
+ * FAILED + AWAITING_JOINS (false).
+ *
+ * Set this to true ONLY once the lib API is available AND verified
+ * via regtest crash-recovery tests. See LIB_TEAM_REPLY_MUSIG_PERSISTENCE.md
+ * for the contract and security invariants. */
+static bool ss_enable_session_restore = false;
+
+
 static char *ss_resolve_wallet_db_path(const tal_t *ctx) {
 	if (ss_wallet_db_path_override && ss_wallet_db_path_override[0])
 		return tal_strdup(ctx, ss_wallet_db_path_override);
@@ -4699,19 +4711,36 @@ static void ss_load_factories(struct command *cmd)
 				 * accept incoming NONCE_BUNDLE/PSIG_BUNDLE and then panic
 				 * at factory_sessions_finalize. Mark it FAILED and reset
 				 * lifecycle to AWAITING_JOINS so the operator can re-fire
-				 * factory-trigger-ceremony. */
+				 * factory-trigger-ceremony.
+				 *
+				 * Integration point for lib task #80: when
+				 * factory_restore_sessions() ships and
+				 * --enable-session-restore=true, replace this block with:
+				 *     if (factory_restore_sessions(f, tx)) continue;
+				 * and fall through to the reset only on restore failure
+				 * (defense in depth). See LIB_TEAM_REPLY_MUSIG_PERSISTENCE.md.
+				 */
 				if (fi->ceremony == CEREMONY_PROPOSED
 				    || fi->ceremony == CEREMONY_FUNDING_PENDING
 				    || fi->ceremony == CEREMONY_NONCES_COLLECTED
 				    || fi->ceremony == CEREMONY_PSIGS_COLLECTED
 				    || fi->ceremony == CEREMONY_ROTATING) {
-					plugin_log(plugin_handle, LOG_UNUSUAL,
-						   "Factory %s loaded with in-flight "
-						   "ceremony=%d; resetting to FAILED + "
-						   "AWAITING_JOINS (session not resumable "
-						   "across restart; lib task #80). Operator "
-						   "can re-fire factory-trigger-ceremony.",
-						   id_hex, (int)fi->ceremony);
+					if (ss_enable_session_restore) {
+						plugin_log(plugin_handle, LOG_UNUSUAL,
+							   "Factory %s: --enable-session-restore=true "
+							   "but lib factory_restore_sessions() not yet "
+							   "linked; falling through to interim reset. "
+							   "Tracks SF-LIB-MUSIG-PERSIST.",
+							   id_hex);
+					} else {
+						plugin_log(plugin_handle, LOG_UNUSUAL,
+							   "Factory %s loaded with in-flight "
+							   "ceremony=%d; resetting to FAILED + "
+							   "AWAITING_JOINS (session not resumable "
+							   "across restart; lib task #80). Operator "
+							   "can re-fire factory-trigger-ceremony.",
+							   id_hex, (int)fi->ceremony);
+					}
 					fi->ceremony = CEREMONY_FAILED;
 					if (fi->is_lsp)
 						fi->lifecycle = FACTORY_LIFECYCLE_AWAITING_JOINS;
@@ -23353,5 +23382,16 @@ int main(int argc, char *argv[])
 				  "match the Node-side soupwallet-db-path.",
 				  charp_option, charp_jsonfmt,
 				  &ss_wallet_db_path_override),
+		    plugin_option("enable-session-restore",
+				  "bool",
+				  "Forward-looking integration point for lib task #80. "
+				  "When the lib ships factory_restore_sessions() and this "
+				  "option is true, ss_load_factories will attempt to "
+				  "restore in-flight MuSig2 sessions instead of resetting "
+				  "them to FAILED. Default false (use interim mitigation). "
+				  "Do NOT enable until the lib API is available and "
+				  "regtest-verified — see LIB_TEAM_REPLY_MUSIG_PERSISTENCE.md.",
+				  bool_option, bool_jsonfmt,
+				  &ss_enable_session_restore),
 		    NULL);
 }
