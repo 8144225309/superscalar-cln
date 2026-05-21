@@ -617,7 +617,9 @@ static bool ss_decode_node_id_hex(const char *hex, uint8_t out[33]);
 static void ss_lsp_sig_queue_deadline_tick(struct command *cmd);
 static void ss_lsp_sig_queue_persist(void);
 static void ss_lsp_sig_queue_load_from_disk(void);
-static bool ss_ceremony_expecting_nonces(const factory_instance_t *fi);static bool ss_ceremony_expecting_psigs(const factory_instance_t *fi);static void ss_send_stale_abort(struct command *cmd, const char *peer_id, const uint8_t instance_id[32]);
+static bool ss_ceremony_expecting_nonces(const factory_instance_t *fi);
+static bool ss_ceremony_expecting_psigs(const factory_instance_t *fi);
+static void ss_send_factory_abort(struct command *cmd, const char *peer_id_hex, const uint8_t instance_id[32], uint8_t reason);
 
 
 
@@ -6152,7 +6154,7 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 				   "NONCE_BUNDLE from %s rejected: ceremony=%d "
 				   "(stale post-restart? lib task #80)",
 				   peer_id, (int)fi->ceremony);
-			ss_send_stale_abort(cmd, peer_id, fi->instance_id);
+			ss_send_factory_abort(cmd, peer_id, fi->instance_id, SS_CEREMONY_ABORT_OTHER);
 			break;
 		}
 		if (fi && fi->is_lsp) {
@@ -6997,7 +6999,7 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 				   "PSIG_BUNDLE from %s rejected: ceremony=%d "
 				   "(stale post-restart? lib task #80)",
 				   peer_id, (int)fi->ceremony);
-			ss_send_stale_abort(cmd, peer_id, fi->instance_id);
+			ss_send_factory_abort(cmd, peer_id, fi->instance_id, SS_CEREMONY_ABORT_OTHER);
 			break;
 		}
 				if (fi && fi->is_lsp) {
@@ -12306,29 +12308,31 @@ static struct command_result *json_factory_approve_proposal(
 }
 
 
-/* Audit item #3: send a CEREMONY_ABORT (0x014A) submsg to the LSP after the
- * user refuses a proposal.  Payload is [instance_id(32) || reason(1)].
- * Best-effort fire-and-forget — if the LSP is unreachable, the existing
- * deadline machinery still cleans up the ceremony eventually. */
-static void ss_send_ceremony_abort(struct command *cmd,
-				   const uint8_t lsp_peer_id[33],
-				   const uint8_t instance_id[32],
-				   uint8_t reason)
+/* Audit item #3 + #5 follow-up: send a CEREMONY_ABORT (0x014A) submsg to a
+ * peer. Payload is [instance_id(32) || reason(1)]. Best-effort fire-and-forget
+ * — if the peer is unreachable, the existing deadline machinery still cleans
+ * up eventually.
+ *
+ * Used by:
+ *   - json_factory_refuse_proposal (reason=USER_REFUSED) — client telling
+ *     the LSP it refused a proposal
+ *   - NONCE_BUNDLE / PSIG_BUNDLE stale-msg guard (reason=OTHER) — LSP
+ *     telling a peer to stop retrying after restart drops the session
+ */
+static void ss_send_factory_abort(struct command *cmd,
+				  const char *peer_id_hex,
+				  const uint8_t instance_id[32],
+				  uint8_t reason)
 {
-	char peer_hex[67];
-	for (int i = 0; i < 33; i++)
-		sprintf(peer_hex + i*2, "%02x", lsp_peer_id[i]);
-	peer_hex[66] = '\0';
-
 	uint8_t payload[33];
 	memcpy(payload, instance_id, 32);
 	payload[32] = reason;
 
 	plugin_log(plugin_handle, LOG_INFORM,
 		   "CEREMONY_ABORT -> %s reason=%u",
-		   peer_hex, (unsigned)reason);
+		   peer_id_hex, (unsigned)reason);
 
-	send_factory_msg(cmd, peer_hex, SS_SUBMSG_CEREMONY_ABORT,
+	send_factory_msg(cmd, peer_id_hex, SS_SUBMSG_CEREMONY_ABORT,
 			 payload, sizeof(payload));
 }
 
@@ -12352,32 +12356,26 @@ static void ss_send_ceremony_abort(struct command *cmd,
 static bool ss_ceremony_expecting_nonces(const factory_instance_t *fi)
 {
 	if (!fi) return false;
+	/* PROPOSED: LSP collecting initial nonces.
+	 * NONCES_COLLECTED: ceremony has all nonces but is still in the
+	 *   finalize/rebuild-tree window; late retransmits arriving here
+	 *   from a slow client are harmless duplicates, not stale.
+	 * ROTATING: rotation-round nonce collection. */
 	return fi->ceremony == CEREMONY_PROPOSED
+	    || fi->ceremony == CEREMONY_NONCES_COLLECTED
 	    || fi->ceremony == CEREMONY_ROTATING;
 }
 
 static bool ss_ceremony_expecting_psigs(const factory_instance_t *fi)
 {
 	if (!fi) return false;
+	/* NONCES_COLLECTED: ceremony is producing psigs for the new tree.
+	 * PSIGS_COLLECTED: all psigs collected but still finalizing the
+	 *   distribution TX; late retransmits here are harmless dups.
+	 * ROTATING: rotation-round psig collection. */
 	return fi->ceremony == CEREMONY_NONCES_COLLECTED
+	    || fi->ceremony == CEREMONY_PSIGS_COLLECTED
 	    || fi->ceremony == CEREMONY_ROTATING;
-}
-
-/* Send CEREMONY_ABORT(OTHER) to the peer for the given factory. Used by the
- * stale-msg guard to tell the sender to stop retransmitting. */
-static void ss_send_stale_abort(struct command *cmd,
-				const char *peer_id,
-				const uint8_t instance_id[32])
-{
-	uint8_t payload[33];
-	memcpy(payload, instance_id, 32);
-	payload[32] = SS_CEREMONY_ABORT_OTHER;
-	plugin_log(plugin_handle, LOG_INFORM,
-		   "stale-msg guard: sending CEREMONY_ABORT(OTHER) to %s "
-		   "(session not resumable across restart; lib task #80)",
-		   peer_id);
-	send_factory_msg(cmd, peer_id, SS_SUBMSG_CEREMONY_ABORT,
-			 payload, sizeof(payload));
 }
 
 
@@ -12401,8 +12399,14 @@ static struct command_result *json_factory_refuse_proposal(
 
 	/* Audit item #3: send the explicit ABORT so the LSP doesn't have to wait
 	 * for the deadline. Reason code is USER_REFUSED. */
-	ss_send_ceremony_abort(cmd, slot->lsp_peer_id, slot->instance_id,
-			       SS_CEREMONY_ABORT_USER_REFUSED);
+	{
+		char lsp_hex[67];
+		for (int i = 0; i < 33; i++)
+			sprintf(lsp_hex + i*2, "%02x", slot->lsp_peer_id[i]);
+		lsp_hex[66] = '\0';
+		ss_send_factory_abort(cmd, lsp_hex, slot->instance_id,
+				      SS_CEREMONY_ABORT_USER_REFUSED);
+	}
 
 	plugin_log(plugin_handle, LOG_INFORM,
 		   "factory-refuse-proposal: %s. Sent CEREMONY_ABORT (USER_REFUSED) "
