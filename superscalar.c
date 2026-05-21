@@ -92,7 +92,7 @@ static void ss_ensure_factory_fee_wired(factory_instance_t *fi)
 	 * retrofit is fine; it's a free no-op in steady state. */
 }
 
-static struct plugin *plugin_handle;
+struct plugin *plugin_handle;
 static superscalar_state_t ss_state;
 static secp256k1_context *global_secp_ctx;
 
