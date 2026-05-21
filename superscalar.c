@@ -4,6 +4,7 @@
  * MuSig2 signing, and factory state management.
  */
 #include "config.h"
+#include "ss_db.h"
 #include <ccan/array_size/array_size.h>
 #include <ccan/tal/str/str.h>
 #include <common/json_param.h>
@@ -20652,6 +20653,21 @@ static const char *init(struct command *init_cmd,
 	ss_load_outgoing_joins(init_cmd);
 
 	/* Phase C: load persisted policy cache. */
+	/* Phase 3 of two-DB / one-plugin refactor: open the two SQLite
+	 * databases this plugin will own (libsuperscalar.db, superscalar-cln.db).
+	 * Per ARCHITECTURE_TWO_DB_ONE_PLUGIN.md. Files are created on first
+	 * start (empty schemas). Phase 4 migration script populates them from
+	 * the old soupwallet.db. Phase 5 cutover removes the sidecar.
+	 *
+	 * Failure to open either DB is fatal — refuse to start. */
+	if (!ss_db_init()) {
+		plugin_log(plugin_handle, LOG_BROKEN,
+			   "ss_db_init() failed; refusing to start. "
+			   "Check the libsuperscalar-db-path and "
+			   "superscalar-cln-db-path options + disk space + perms.");
+		return "ss_db_init failed";
+	}
+
 	ss_policy_cache_load_from_disk();
 	ss_lsp_sig_queue_load_from_disk();
 
@@ -23382,6 +23398,19 @@ int main(int argc, char *argv[])
 				  "match the Node-side soupwallet-db-path.",
 				  charp_option, charp_jsonfmt,
 				  &ss_wallet_db_path_override),
+		    plugin_option("libsuperscalar-db-path",
+				  "string",
+				  "Path to libsuperscalar.db (lib-owned protocol state). "
+				  "Default: <CWD>/libsuperscalar.db. Two-DB refactor; "
+				  "see ARCHITECTURE_TWO_DB_ONE_PLUGIN.md.",
+				  charp_option, charp_jsonfmt,
+				  &ss_lib_db_path_override),
+		    plugin_option("superscalar-cln-db-path",
+				  "string",
+				  "Path to superscalar-cln.db (plugin-owned policy/"
+				  "coordination state). Default: <CWD>/superscalar-cln.db.",
+				  charp_option, charp_jsonfmt,
+				  &ss_plugin_db_path_override),
 		    plugin_option("enable-session-restore",
 				  "bool",
 				  "Forward-looking integration point for lib task #80. "
