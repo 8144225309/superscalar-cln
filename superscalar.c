@@ -4632,7 +4632,7 @@ static void ss_load_factories(struct command *cmd)
 		if (db) {
 			sqlite3_stmt *st = NULL;
 			if (sqlite3_prepare_v2(db,
-				"SELECT factory_instance_id FROM factories "
+				"SELECT factory_instance_id FROM factories WHERE archived = 0 "
 				"ORDER BY created_at_block",
 				-1, &st, NULL) == SQLITE_OK) {
 				size_t cap = 16;
