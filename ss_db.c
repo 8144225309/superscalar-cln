@@ -74,8 +74,10 @@ static const char *ss_plugin_db_schema_v1[] = {
 	"   applied_at INTEGER NOT NULL"
 	");",
 
-	/* Carry-forward of the existing soupwallet.db schema (minus the
-	 * wallet_settings k/v table — its data moves to ss_lib_db). */
+	/* Carry-forward of the existing soupwallet.db schema. The
+	 * wallet_settings k/v table stays as a general key/value store
+	 * for wallet UI use; only the factory_blob:<iid>:* rows migrate
+	 * out to ss_lib_db.factory_state as structured BLOB columns. */
 
 	"CREATE TABLE IF NOT EXISTS factories ("
 	"   factory_instance_id   BLOB PRIMARY KEY,"
@@ -192,6 +194,12 @@ static const char *ss_plugin_db_schema_v1[] = {
 	"   rate_sat_per_unit INTEGER NOT NULL,"
 	"   fetched_at        INTEGER NOT NULL,"
 	"   source            TEXT"
+	");",
+
+	"CREATE TABLE IF NOT EXISTS wallet_settings ("
+	"   setting_key      TEXT PRIMARY KEY,"
+	"   setting_value    TEXT NOT NULL,"
+	"   updated_at       INTEGER NOT NULL"
 	");",
 
 	"INSERT OR IGNORE INTO schema_version (version, applied_at) "
