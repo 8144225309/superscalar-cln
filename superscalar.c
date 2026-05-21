@@ -617,6 +617,7 @@ static bool ss_decode_node_id_hex(const char *hex, uint8_t out[33]);
 static void ss_lsp_sig_queue_deadline_tick(struct command *cmd);
 static void ss_lsp_sig_queue_persist(void);
 static void ss_lsp_sig_queue_load_from_disk(void);
+static bool ss_ceremony_expecting_nonces(const factory_instance_t *fi);static bool ss_ceremony_expecting_psigs(const factory_instance_t *fi);static void ss_send_stale_abort(struct command *cmd, const char *peer_id, const uint8_t instance_id[32]);
 
 
 
@@ -4690,6 +4691,30 @@ static void ss_load_factories(struct command *cmd)
 						      fi->instance_id,
 						      fi->our_participant_idx);
 
+				/* Audit #5 follow-up: reset in-flight ceremony state.
+				 * The in-memory MuSig2 session_t isn't persisted (lib task
+				 * #80). A factory loaded mid-ceremony would otherwise
+				 * accept incoming NONCE_BUNDLE/PSIG_BUNDLE and then panic
+				 * at factory_sessions_finalize. Mark it FAILED and reset
+				 * lifecycle to AWAITING_JOINS so the operator can re-fire
+				 * factory-trigger-ceremony. */
+				if (fi->ceremony == CEREMONY_PROPOSED
+				    || fi->ceremony == CEREMONY_FUNDING_PENDING
+				    || fi->ceremony == CEREMONY_NONCES_COLLECTED
+				    || fi->ceremony == CEREMONY_PSIGS_COLLECTED
+				    || fi->ceremony == CEREMONY_ROTATING) {
+					plugin_log(plugin_handle, LOG_UNUSUAL,
+						   "Factory %s loaded with in-flight "
+						   "ceremony=%d; resetting to FAILED + "
+						   "AWAITING_JOINS (session not resumable "
+						   "across restart; lib task #80). Operator "
+						   "can re-fire factory-trigger-ceremony.",
+						   id_hex, (int)fi->ceremony);
+					fi->ceremony = CEREMONY_FAILED;
+					if (fi->is_lsp)
+						fi->lifecycle = FACTORY_LIFECYCLE_AWAITING_JOINS;
+				}
+
 				/* Load channel mappings from wallet.db */
 				{
 					char ch_key[160];
@@ -6117,6 +6142,19 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 			   "NONCE_BUNDLE: fi=%s is_lsp=%d",
 			   fi ? "found" : "NULL",
 			   fi ? fi->is_lsp : -1);
+		/* Audit #5 follow-up: stale-msg guard. After restart, in-memory
+		 * MuSig2 sessions are gone — see lib task #80. If we receive a
+		 * NONCE_BUNDLE while the ceremony isn't actively collecting
+		 * nonces, send CEREMONY_ABORT(OTHER) so the sender stops
+		 * retrying and skip the broken finalize path. */
+		if (fi && fi->is_lsp && !ss_ceremony_expecting_nonces(fi)) {
+			plugin_log(plugin_handle, LOG_UNUSUAL,
+				   "NONCE_BUNDLE from %s rejected: ceremony=%d "
+				   "(stale post-restart? lib task #80)",
+				   peer_id, (int)fi->ceremony);
+			ss_send_stale_abort(cmd, peer_id, fi->instance_id);
+			break;
+		}
 		if (fi && fi->is_lsp) {
 			/* Heap-allocate: 79KB with MAX_NONCE_ENTRIES=1024 */
 			nonce_bundle_t *cnb = calloc(1, sizeof(*cnb));
@@ -6952,7 +6990,17 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 		plugin_log(plugin_handle, LOG_INFORM,
 			   "PSIG_BUNDLE from %s (len=%zu)",
 			   peer_id, len);
-		if (fi && fi->is_lsp) {
+		/* Audit #5 follow-up: stale-msg guard. See NONCE_BUNDLE case for
+		 * rationale (post-restart, in-memory MuSig2 session is gone). */
+		if (fi && fi->is_lsp && !ss_ceremony_expecting_psigs(fi)) {
+			plugin_log(plugin_handle, LOG_UNUSUAL,
+				   "PSIG_BUNDLE from %s rejected: ceremony=%d "
+				   "(stale post-restart? lib task #80)",
+				   peer_id, (int)fi->ceremony);
+			ss_send_stale_abort(cmd, peer_id, fi->instance_id);
+			break;
+		}
+				if (fi && fi->is_lsp) {
 			/* Heap-allocate: 79KB with MAX_NONCE_ENTRIES=1024 */
 			nonce_bundle_t *pnb = calloc(1, sizeof(*pnb));
 			if (!pnb) break;
@@ -12283,6 +12331,55 @@ static void ss_send_ceremony_abort(struct command *cmd,
 	send_factory_msg(cmd, peer_hex, SS_SUBMSG_CEREMONY_ABORT,
 			 payload, sizeof(payload));
 }
+
+/* ============================================================================
+ * Audit #5 follow-up: stale-msg guard for NONCE_BUNDLE / PSIG_BUNDLE.
+ *
+ * After a plugin restart, the in-memory MuSig2 session_t is gone but the
+ * persisted factory_instance_t reloads with lifecycle/ceremony past
+ * CEREMONY_RUNNING. Stale NONCE_BUNDLEs from reconnecting clients then
+ * hit factory_sessions_finalize against a fresh-but-empty session, which
+ * fails noisily on every retry.
+ *
+ * This helper checks whether the factory is in a state where the given
+ * message is expected. If not, we send CEREMONY_ABORT(OTHER) so the
+ * sender stops retrying, and return false so the caller skips the
+ * broken path.
+ *
+ * Long-term fix is lib task #80 (serialize MuSig2 sessions). Until then
+ * this turns a noisy infinite-retry loop into a single ABORT exchange.
+ * ============================================================================ */
+static bool ss_ceremony_expecting_nonces(const factory_instance_t *fi)
+{
+	if (!fi) return false;
+	return fi->ceremony == CEREMONY_PROPOSED
+	    || fi->ceremony == CEREMONY_ROTATING;
+}
+
+static bool ss_ceremony_expecting_psigs(const factory_instance_t *fi)
+{
+	if (!fi) return false;
+	return fi->ceremony == CEREMONY_NONCES_COLLECTED
+	    || fi->ceremony == CEREMONY_ROTATING;
+}
+
+/* Send CEREMONY_ABORT(OTHER) to the peer for the given factory. Used by the
+ * stale-msg guard to tell the sender to stop retransmitting. */
+static void ss_send_stale_abort(struct command *cmd,
+				const char *peer_id,
+				const uint8_t instance_id[32])
+{
+	uint8_t payload[33];
+	memcpy(payload, instance_id, 32);
+	payload[32] = SS_CEREMONY_ABORT_OTHER;
+	plugin_log(plugin_handle, LOG_INFORM,
+		   "stale-msg guard: sending CEREMONY_ABORT(OTHER) to %s "
+		   "(session not resumable across restart; lib task #80)",
+		   peer_id);
+	send_factory_msg(cmd, peer_id, SS_SUBMSG_CEREMONY_ABORT,
+			 payload, sizeof(payload));
+}
+
 
 static struct command_result *json_factory_refuse_proposal(
 	struct command *cmd, const char *buf, const jsmntok_t *params)
