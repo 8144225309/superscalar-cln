@@ -281,10 +281,10 @@ struct command_result *json_wallet_upsert_factory(
 	if (!param(cmd, buf, params,
 		   p_req("factory_instance_id_hex", param_string, &iid_hex),
 		   p_req("my_role", param_u32, &my_role),
-		   p_opt("display_label", param_string, &display_label),
 		   p_req("created_at_block", param_u32, &created_at_block),
-		   p_opt("joined_at_block", param_u32, &joined_at_block_opt),
 		   p_req("state", param_u32, &state),
+		   p_opt("display_label", param_string, &display_label),
+		   p_opt("joined_at_block", param_u32, &joined_at_block_opt),
 		   p_opt("archived", param_u32, &archived_opt),
 		   NULL))
 		return command_param_failed();
@@ -467,10 +467,10 @@ struct command_result *json_wallet_upsert_join_queue_entry(
 		   p_req("request_id", param_string, &request_id_s),
 		   p_req("contribution_sats", param_string, &contribution_sats_s),
 		   p_req("received_at_block", param_u32, &received_at_block),
+		   p_req("status", param_u32, &status),
 		   p_opt("accepted_at_block", param_u32, &accepted_at_block_opt),
 		   p_opt("decided_at_block", param_u32, &decided_at_block_opt),
 		   p_opt("last_seen_block", param_u32, &last_seen_block_opt),
-		   p_req("status", param_u32, &status),
 		   p_opt("reason", param_string, &reason),
 		   NULL))
 		return command_param_failed();
@@ -647,9 +647,9 @@ struct command_result *json_wallet_upsert_outgoing_join(
 		   p_req("request_id", param_string, &request_id_s),
 		   p_req("contribution_sats", param_string, &contribution_sats_s),
 		   p_req("sent_at_block", param_u32, &sent_at_block),
-		   p_opt("expected_signing_block", param_u32, &expected_signing_block_opt),
 		   p_req("updated_at_block", param_u32, &updated_at_block),
 		   p_req("status", param_u32, &status),
+		   p_opt("expected_signing_block", param_u32, &expected_signing_block_opt),
 		   p_opt("reason", param_string, &reason),
 		   NULL))
 		return command_param_failed();
@@ -833,9 +833,9 @@ struct command_result *json_wallet_set_operator_pref(
 	const char *pref_value_json;
 
 	if (!param(cmd, buf, params,
-		   p_opt("factory_instance_id_hex", param_string, &iid_hex_or_null),
 		   p_req("pref_key", param_string, &pref_key),
 		   p_req("pref_value", param_string, &pref_value_json),
+		   p_opt("factory_instance_id_hex", param_string, &iid_hex_or_null),
 		   NULL))
 		return command_param_failed();
 
@@ -873,8 +873,8 @@ struct command_result *json_wallet_get_operator_pref(
 	const char *iid_hex_or_null = NULL;
 	const char *pref_key;
 	if (!param(cmd, buf, params,
-		   p_opt("factory_instance_id_hex", param_string, &iid_hex_or_null),
 		   p_req("pref_key", param_string, &pref_key),
+		   p_opt("factory_instance_id_hex", param_string, &iid_hex_or_null),
 		   NULL))
 		return command_param_failed();
 
