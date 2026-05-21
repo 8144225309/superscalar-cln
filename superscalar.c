@@ -3636,7 +3636,7 @@ static void open_factory_channels(struct command *cmd,
 		{
 			uint32_t fr_perkw = fi->requested_feerate_perkw > 0
 				? fi->requested_feerate_perkw
-				: 1000;
+				: 253; /* 1 sat/vb floor; CLN min_acceptable */
 			char fr_str[32];
 			snprintf(fr_str, sizeof(fr_str), "%uperkw", fr_perkw);
 			json_add_string(req->js, "feerate", fr_str);
@@ -4557,6 +4557,47 @@ static void ss_reconcile_funding_pending(struct command *cmd,
 		"listtransactions",
 		ss_reconcile_listtx_ok, ss_reconcile_listtx_err, rc);
 	send_outreq(req);
+}
+
+
+/* ============================================================================
+ * Audit #5 follow-up: log the resolved wallet.db path at startup so the
+ * plugin <-> sidecar path agreement is operator-verifiable.
+ *
+ * The soupwallet-cln-plugin sidecar writes coordination state to a SQLite
+ * file. This C plugin reads from that same file at startup via
+ * ss_load_factories. They must agree on the path.
+ *
+ * Each plugin has its own option that resolves to a path:
+ *   - Sidecar:     `soupwallet-db-path=`        (where it writes)
+ *   - This plugin: `superscalar-wallet-db=`     (where we read)
+ *
+ * Both fall back to `~/.config/soupwallet/wallet.db`. If only one is set,
+ * they silently diverge. We log our resolved path at INFORM so the
+ * operator can grep both plugins' init logs and verify they match. If
+ * we resolved to the fallback path (no explicit option), we log at
+ * UNUSUAL since that's the foot-gun.
+ * ============================================================================ */
+static void ss_log_resolved_db_path(void)
+{
+	const char *p = ss_resolve_wallet_db_path(tmpctx);
+	bool is_default_fallback = (ss_wallet_db_path_override == NULL
+				    || ss_wallet_db_path_override[0] == '\0')
+				   && getenv("SUPERSCALAR_WALLET_DB_PATH") == NULL;
+
+	if (is_default_fallback) {
+		plugin_log(plugin_handle, LOG_UNUSUAL,
+			   "wallet.db path resolved to %s via default fallback. "
+			   "If using the soupwallet-cln-plugin sidecar, set "
+			   "superscalar-wallet-db=<path> explicitly so it matches "
+			   "the sidecar's soupwallet-db-path option.",
+			   p ? p : "(null)");
+	} else {
+		plugin_log(plugin_handle, LOG_INFORM,
+			   "wallet.db path: %s. Ensure sidecar's "
+			   "soupwallet-db-path option matches.",
+			   p ? p : "(null)");
+	}
 }
 
 static void ss_load_factories(struct command *cmd)
@@ -6404,7 +6445,7 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 						{
 							uint32_t fr_perkw = fi->requested_feerate_perkw > 0
 								? fi->requested_feerate_perkw
-								: 1000;
+								: 253; /* 1 sat/vb floor; CLN min_acceptable */
 							char fr_str[32];
 							snprintf(fr_str, sizeof(fr_str),
 								 "%uperkw", fr_perkw);
@@ -20488,6 +20529,9 @@ static const char *init(struct command *init_cmd,
 	 * canonical defaults) before any FACTORY_PROPOSE can arrive. */
 	ss_signing_prefs_load_or_default();
 
+	/* Audit #5 follow-up: log our resolved DB path for operator verification. */
+	ss_log_resolved_db_path();
+
 	/* Load persisted factories from datastore */
 	ss_load_factories(init_cmd);
 
@@ -22921,7 +22965,7 @@ json_factory_funding_precheck(struct command *cmd,
 
 	struct funding_precheck_ctx *ctx = tal(cmd, struct funding_precheck_ctx);
 	ctx->funding_sats = *funding_sats;
-	ctx->fee_estimate_sats = fee_estimate_sats_opt ? *fee_estimate_sats_opt : 1000;
+	ctx->fee_estimate_sats = fee_estimate_sats_opt ? *fee_estimate_sats_opt : 253; /* 1 sat/vb floor; CLN min_acceptable */
 	ctx->strict = strict_opt ? *strict_opt : false;
 
 	struct out_req *req = jsonrpc_request_start(cmd, "listfunds",
