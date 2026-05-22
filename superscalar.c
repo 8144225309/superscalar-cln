@@ -7314,6 +7314,22 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 					free(fi->cached_all_nonces_wire);
 					fi->cached_all_nonces_wire = NULL;
 					fi->cached_all_nonces_len = 0;
+
+					/* Bug C: promote all ACCEPTED join_queue entries to
+					 * SIGNED so factory-list stops reporting stale
+					 * "join_queue=N" on completed factories and Bug B's
+					 * retry path stops re-PROPOSing them. ss_save_factory
+					 * below persists the new statuses. */
+					for (size_t jqi = 0; jqi < fi->n_join_queue; jqi++) {
+						if (fi->join_queue[jqi].status ==
+						    JOIN_STATUS_ACCEPTED) {
+							fi->join_queue[jqi].status =
+								JOIN_STATUS_SIGNED;
+							fi->join_queue[jqi].decided_at_block =
+								ss_state.current_blockheight;
+						}
+					}
+
 					size_t ready_bytes = 0;
 					for (size_t ci = 0; ci < fi->n_clients; ci++) {
 						char nid[67];
@@ -7965,6 +7981,21 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 				rotate_finish_and_notify(cmd, fi);
 			} else {
 				fi->ceremony = CEREMONY_COMPLETE;
+
+				/* Bug C: promote all ACCEPTED join_queue entries to
+				 * SIGNED so factory-list stops reporting stale
+				 * "join_queue=N" on completed factories and Bug B's
+				 * retry path stops re-PROPOSing them. ss_save_factory
+				 * below persists the new statuses. */
+				for (size_t jqi = 0; jqi < fi->n_join_queue; jqi++) {
+					if (fi->join_queue[jqi].status ==
+					    JOIN_STATUS_ACCEPTED) {
+						fi->join_queue[jqi].status =
+							JOIN_STATUS_SIGNED;
+						fi->join_queue[jqi].decided_at_block =
+							ss_state.current_blockheight;
+					}
+				}
 				size_t ready_bytes = 0;
 				for (size_t ci = 0; ci < fi->n_clients; ci++) {
 					char nid[67];
