@@ -23,23 +23,15 @@ FAKE_CLIENT_ID = "02" + "00" * 32
 FAKE_CLIENT_ID_2 = "03" + "00" * 32
 
 
-def _counter_blob(lsp) -> bytes:
-    """Read the superscalar/iid_counter datastore entry. Returns
-    empty bytes if absent."""
-    r = lsp.rpc.call("listdatastore", {"key": ["superscalar",
-                                                "iid_counter"]})
-    entries = r.get("datastore", [])
-    if not entries:
-        return b""
-    hex_str = entries[0].get("hex", "")
-    return bytes.fromhex(hex_str)
-
-
 def _counter_value(lsp) -> int:
-    b = _counter_blob(lsp)
-    if len(b) < 4:
+    """Read the iid counter via the wallet-get-iid-counter RPC, which
+    queries the iid_counter row in superscalar-cln.db (post-refactor;
+    the pre-refactor datastore-blob path is gone)."""
+    try:
+        r = lsp.rpc.call("wallet-get-iid-counter", {})
+    except Exception:
         return -1
-    return int.from_bytes(b[:4], "little")
+    return int(r.get("counter", -1))
 
 
 def test_counter_increments_per_factory_create(ss_node_factory):
