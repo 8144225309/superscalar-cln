@@ -1,7 +1,7 @@
 /* ============================================================================
  * ss_db: SQLite layer for the two databases owned by the consolidated plugin.
  *
- * See ss_db.h and ARCHITECTURE_TWO_DB_ONE_PLUGIN.md.
+ * See ss_db.h for the schema and lifecycle.
  * ============================================================================ */
 
 #include "ss_db.h"
