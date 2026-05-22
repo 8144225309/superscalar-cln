@@ -23542,6 +23542,26 @@ static const struct plugin_command commands[] = {
 		"wallet-refuse-join-queued",
 		json_wallet_refuse_join_queued,
 	},
+	{
+		"wallet-list-known-peers",
+		json_wallet_list_known_peers,
+	},
+	{
+		"wallet-set-peer-note",
+		json_wallet_set_peer_note,
+	},
+	{
+		"wallet-get-peer-note",
+		json_wallet_get_peer_note,
+	},
+	{
+		"wallet-set-peer-reputation",
+		json_wallet_set_peer_reputation,
+	},
+	{
+		"wallet-get-peer-reputation",
+		json_wallet_get_peer_reputation,
+	},
 };
 
 static const struct plugin_notification notifs[] = {

@@ -1209,3 +1209,251 @@ struct command_result *json_wallet_refuse_join_queued(
 	return update_join_queue_status(cmd, iid_hex, cli_hex, 3 /* REJECTED */, reason);
 }
 
+/* ============================================================================
+ * Session 4 (LSP UI gaps slice D): peer management
+ *
+ * Per-peer notes + reputation + ban state, backed by the existing
+ * peer_notes and peer_reputation tables. Score sentinel -1 = banned;
+ * any other score = not banned with that operator-set value.
+ *
+ * Used by the wallet UI Known Peers page to show all peers across all
+ * factories with their cumulative history, plus per-peer admin actions.
+ * ============================================================================ */
+
+struct command_result *json_wallet_set_peer_note(
+	struct command *cmd, const char *buf, const jsmntok_t *params)
+{
+	const char *pubkey_hex, *label = NULL, *body = NULL;
+	if (!param(cmd, buf, params,
+		   p_req("peer_pubkey_hex", param_string, &pubkey_hex),
+		   p_opt("label", param_string, &label),
+		   p_opt("body", param_string, &body),
+		   NULL))
+		return command_param_failed();
+
+	uint8_t *pk; size_t pk_len;
+	struct command_result *err = param_hex_blob(cmd, "peer_pubkey_hex",
+						    pubkey_hex, 33, &pk, &pk_len);
+	if (err) return err;
+
+	sqlite3_stmt *st = NULL;
+	if (sqlite3_prepare_v2(ss_plugin_db,
+		"INSERT INTO peer_notes (peer_pubkey, label, body, created_at, updated_at) "
+		"VALUES (?, ?, ?, strftime(\'%s\',\'now\'), strftime(\'%s\',\'now\')) "
+		"ON CONFLICT(peer_pubkey) DO UPDATE SET "
+		"  label = excluded.label,"
+		"  body = excluded.body,"
+		"  updated_at = excluded.updated_at",
+		-1, &st, NULL) != SQLITE_OK)
+		return reply_sql_fail(cmd, "set_peer_note prepare");
+
+	sqlite3_bind_blob(st, 1, pk, (int)pk_len, SQLITE_STATIC);
+	if (label) sqlite3_bind_text(st, 2, label, -1, SQLITE_STATIC);
+	else sqlite3_bind_null(st, 2);
+	if (body) sqlite3_bind_text(st, 3, body, -1, SQLITE_STATIC);
+	else sqlite3_bind_null(st, 3);
+
+	if (!db_step_done(st, "set_peer_note"))
+		return command_fail(cmd, LIGHTNINGD, "set_peer_note failed");
+	return reply_ok(cmd);
+}
+
+struct command_result *json_wallet_get_peer_note(
+	struct command *cmd, const char *buf, const jsmntok_t *params)
+{
+	const char *pubkey_hex;
+	if (!param(cmd, buf, params,
+		   p_req("peer_pubkey_hex", param_string, &pubkey_hex),
+		   NULL))
+		return command_param_failed();
+
+	uint8_t *pk; size_t pk_len;
+	struct command_result *err = param_hex_blob(cmd, "peer_pubkey_hex",
+						    pubkey_hex, 33, &pk, &pk_len);
+	if (err) return err;
+
+	sqlite3_stmt *st = NULL;
+	if (sqlite3_prepare_v2(ss_plugin_db,
+		"SELECT label, body, updated_at FROM peer_notes "
+		"WHERE peer_pubkey = ?",
+		-1, &st, NULL) != SQLITE_OK)
+		return reply_sql_fail(cmd, "get_peer_note prepare");
+	sqlite3_bind_blob(st, 1, pk, (int)pk_len, SQLITE_STATIC);
+
+	if (sqlite3_step(st) == SQLITE_ROW) {
+		struct json_stream *js = jsonrpc_stream_success(cmd);
+		json_add_hex(js, "peer_pubkey_hex", pk, pk_len);
+		if (sqlite3_column_type(st, 0) == SQLITE_NULL)
+			json_add_primitive(js, "label", "null");
+		else
+			json_add_string(js, "label", (const char *)sqlite3_column_text(st, 0));
+		if (sqlite3_column_type(st, 1) == SQLITE_NULL)
+			json_add_primitive(js, "body", "null");
+		else
+			json_add_string(js, "body", (const char *)sqlite3_column_text(st, 1));
+		json_add_u32(js, "updated_at", (uint32_t)sqlite3_column_int(st, 2));
+		sqlite3_finalize(st);
+		return command_finished(cmd, js);
+	}
+	sqlite3_finalize(st);
+	return reply_null_value(cmd, "label");
+}
+
+struct command_result *json_wallet_set_peer_reputation(
+	struct command *cmd, const char *buf, const jsmntok_t *params)
+{
+	const char *pubkey_hex;
+	const char *score_str;
+	const char *source = NULL;
+	if (!param(cmd, buf, params,
+		   p_req("peer_pubkey_hex", param_string, &pubkey_hex),
+		   p_req("score", param_string, &score_str),
+		   p_opt("source", param_string, &source),
+		   NULL))
+		return command_param_failed();
+	/* Parse signed int32 from string (param_s32 doesn't exist in libplugin). */
+	errno = 0;
+	char *score_end = NULL;
+	long score_val = strtol(score_str, &score_end, 10);
+	if (errno || score_end == score_str || *score_end != '\0' ||
+	    score_val < INT32_MIN || score_val > INT32_MAX) {
+		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+				    "score must be a signed int32");
+	}
+	int32_t score = (int32_t)score_val;
+
+	uint8_t *pk; size_t pk_len;
+	struct command_result *err = param_hex_blob(cmd, "peer_pubkey_hex",
+						    pubkey_hex, 33, &pk, &pk_len);
+	if (err) return err;
+
+	sqlite3_stmt *st = NULL;
+	if (sqlite3_prepare_v2(ss_plugin_db,
+		"INSERT INTO peer_reputation "
+		"  (peer_pubkey, score, n_observations, last_observed_at, source) "
+		"VALUES (?, ?, 1, strftime(\'%s\',\'now\'), ?) "
+		"ON CONFLICT(peer_pubkey) DO UPDATE SET "
+		"  score = excluded.score,"
+		"  n_observations = n_observations + 1,"
+		"  last_observed_at = excluded.last_observed_at,"
+		"  source = excluded.source",
+		-1, &st, NULL) != SQLITE_OK)
+		return reply_sql_fail(cmd, "set_peer_reputation prepare");
+	sqlite3_bind_blob(st, 1, pk, (int)pk_len, SQLITE_STATIC);
+	sqlite3_bind_int(st, 2, (int)score);
+	if (source) sqlite3_bind_text(st, 3, source, -1, SQLITE_STATIC);
+	else sqlite3_bind_text(st, 3, "operator", -1, SQLITE_STATIC);
+
+	if (!db_step_done(st, "set_peer_reputation"))
+		return command_fail(cmd, LIGHTNINGD, "set_peer_reputation failed");
+
+	plugin_log(plugin_handle, LOG_INFORM,
+		   "peer_reputation: %.8s... score=%d source=%s",
+		   pubkey_hex, (int)score, source ? source : "operator");
+	return reply_ok(cmd);
+}
+
+struct command_result *json_wallet_get_peer_reputation(
+	struct command *cmd, const char *buf, const jsmntok_t *params)
+{
+	const char *pubkey_hex;
+	if (!param(cmd, buf, params,
+		   p_req("peer_pubkey_hex", param_string, &pubkey_hex),
+		   NULL))
+		return command_param_failed();
+
+	uint8_t *pk; size_t pk_len;
+	struct command_result *err = param_hex_blob(cmd, "peer_pubkey_hex",
+						    pubkey_hex, 33, &pk, &pk_len);
+	if (err) return err;
+
+	sqlite3_stmt *st = NULL;
+	if (sqlite3_prepare_v2(ss_plugin_db,
+		"SELECT score, n_observations, last_observed_at, source "
+		"FROM peer_reputation WHERE peer_pubkey = ?",
+		-1, &st, NULL) != SQLITE_OK)
+		return reply_sql_fail(cmd, "get_peer_reputation prepare");
+	sqlite3_bind_blob(st, 1, pk, (int)pk_len, SQLITE_STATIC);
+
+	if (sqlite3_step(st) == SQLITE_ROW) {
+		struct json_stream *js = jsonrpc_stream_success(cmd);
+		json_add_hex(js, "peer_pubkey_hex", pk, pk_len);
+		json_add_s32(js, "score", (int32_t)sqlite3_column_int(st, 0));
+		json_add_u32(js, "n_observations", (uint32_t)sqlite3_column_int(st, 1));
+		json_add_u32(js, "last_observed_at", (uint32_t)sqlite3_column_int(st, 2));
+		if (sqlite3_column_type(st, 3) == SQLITE_NULL)
+			json_add_primitive(js, "source", "null");
+		else
+			json_add_string(js, "source", (const char *)sqlite3_column_text(st, 3));
+		sqlite3_finalize(st);
+		return command_finished(cmd, js);
+	}
+	sqlite3_finalize(st);
+	return reply_null_value(cmd, "score");
+}
+
+struct command_result *json_wallet_list_known_peers(
+	struct command *cmd, const char *buf, const jsmntok_t *params)
+{
+	if (!param(cmd, buf, params, NULL))
+		return command_param_failed();
+
+	/* Aggregate known peers from lsp_join_queue + peer_notes +
+	 * peer_reputation. Use a UNION subquery to collect all distinct
+	 * pubkeys, then LEFT JOIN to enrich each. */
+	sqlite3_stmt *st = NULL;
+	const char *sql =
+		"WITH all_peers AS ( "
+		"  SELECT DISTINCT client_pubkey AS pk FROM lsp_join_queue "
+		"  UNION SELECT peer_pubkey FROM peer_notes "
+		"  UNION SELECT peer_pubkey FROM peer_reputation "
+		") "
+		"SELECT "
+		"  ap.pk, "
+		"  COALESCE((SELECT SUM(contribution_sats) FROM lsp_join_queue "
+		"            WHERE client_pubkey = ap.pk), 0) AS total_contrib, "
+		"  COALESCE((SELECT COUNT(DISTINCT factory_instance_id) FROM lsp_join_queue "
+		"            WHERE client_pubkey = ap.pk), 0) AS factory_count, "
+		"  (SELECT score FROM peer_reputation WHERE peer_pubkey = ap.pk) AS rep_score, "
+		"  (SELECT label FROM peer_notes WHERE peer_pubkey = ap.pk) AS note_label, "
+		"  (SELECT body FROM peer_notes WHERE peer_pubkey = ap.pk) AS note_body, "
+		"  (SELECT MAX(last_seen_block) FROM lsp_join_queue "
+		"   WHERE client_pubkey = ap.pk) AS last_seen "
+		"FROM all_peers ap "
+		"ORDER BY total_contrib DESC";
+
+	if (sqlite3_prepare_v2(ss_plugin_db, sql, -1, &st, NULL) != SQLITE_OK)
+		return reply_sql_fail(cmd, "list_known_peers prepare");
+
+	struct json_stream *js = jsonrpc_stream_success(cmd);
+	json_array_start(js, "peers");
+	while (sqlite3_step(st) == SQLITE_ROW) {
+		json_object_start(js, NULL);
+		const void *pk = sqlite3_column_blob(st, 0);
+		int pk_len = sqlite3_column_bytes(st, 0);
+		json_add_hex(js, "peer_pubkey_hex", pk, pk_len);
+		json_add_u64_string(js, "total_contribution_sats",
+				   (uint64_t)sqlite3_column_int64(st, 1));
+		json_add_u32(js, "factory_count",
+			     (uint32_t)sqlite3_column_int(st, 2));
+		if (sqlite3_column_type(st, 3) == SQLITE_NULL) {
+			json_add_primitive(js, "score", "null");
+			json_add_bool(js, "banned", false);
+		} else {
+			int32_t score = sqlite3_column_int(st, 3);
+			json_add_s32(js, "score", score);
+			json_add_bool(js, "banned", score == -1);
+		}
+		if (sqlite3_column_type(st, 4) == SQLITE_NULL) json_add_primitive(js, "label", "null");
+		else json_add_string(js, "label", (const char *)sqlite3_column_text(st, 4));
+		if (sqlite3_column_type(st, 5) == SQLITE_NULL) json_add_primitive(js, "body", "null");
+		else json_add_string(js, "body", (const char *)sqlite3_column_text(st, 5));
+		if (sqlite3_column_type(st, 6) == SQLITE_NULL) json_add_primitive(js, "last_seen_block", "null");
+		else json_add_u32(js, "last_seen_block", (uint32_t)sqlite3_column_int(st, 6));
+		json_object_end(js);
+	}
+	json_array_end(js);
+	sqlite3_finalize(st);
+	return command_finished(cmd, js);
+}
+
