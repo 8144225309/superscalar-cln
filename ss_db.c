@@ -343,8 +343,33 @@ static bool ss_db_open_one(const char *path, const char *db_label,
 	return true;
 }
 
+/* Resolve relative DB paths to absolute via getcwd() at init time, so
+ * subsequent ss_open_wallet_db_ro calls (which may run from a different
+ * cwd under e.g. pyln-testing) hit the same file ss_db_init created.
+ * Idempotent: if the path is already absolute, leave it alone. */
+static void ss_db_pin_path_absolute(char **path_override_out,
+                                    const char *default_name)
+{
+	if (*path_override_out && (*path_override_out)[0] == "/"[0])
+		return;
+	char cwd[4096];
+	if (getcwd(cwd, sizeof(cwd)) == NULL)
+		return;
+	char *abs = malloc(strlen(cwd) + 1 + strlen(default_name) + 1);
+	if (!abs) return;
+	sprintf(abs, "%s/%s", cwd, default_name);
+	if (*path_override_out)
+		free(*path_override_out);
+	*path_override_out = abs;
+}
+
 bool ss_db_init(void)
 {
+	/* Pin DB paths to absolute BEFORE opening so post-init reopens (e.g.
+	 * ss_open_wallet_db_ro from a different cwd) hit the same files. */
+	ss_db_pin_path_absolute(&ss_lib_db_path_override, SS_LIB_DB_DEFAULT_NAME);
+	ss_db_pin_path_absolute(&ss_plugin_db_path_override, SS_PLUGIN_DB_DEFAULT_NAME);
+
 	if (ss_lib_db && ss_plugin_db)
 		return true;  /* idempotent */
 

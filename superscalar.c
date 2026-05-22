@@ -20740,6 +20740,24 @@ static const char *init(struct command *init_cmd,
 		   "Factory master key derived from HSM (active — real pubkey "
 		   "exchange enabled)");
 
+	/* Phase 3 of two-DB / one-plugin refactor: open the two SQLite
+	 * databases this plugin will own (libsuperscalar.db, superscalar-cln.db).
+	 * MUST run BEFORE any wallet-db reader (ss_load_iid_counter,
+	 * ss_load_outgoing_joins, ss_load_factories) because ss_db_init pins
+	 * the path globals to absolute via getcwd — if readers run first they
+	 * see relative paths and fail under pyln-testing's shifting cwds.
+	 *
+	 * Files are created on first start (empty schemas). Phase 4 migration
+	 * script populates them from the old soupwallet.db. Phase 5 cutover
+	 * removed the sidecar. Failure to open either DB is fatal. */
+	if (!ss_db_init()) {
+		plugin_log(plugin_handle, LOG_BROKEN,
+			   "ss_db_init() failed; refusing to start. "
+			   "Check the libsuperscalar-db-path and "
+			   "superscalar-cln-db-path options + disk space + perms.");
+		return "ss_db_init failed";
+	}
+
 	/* Gap 8: load monotonic iid counter BEFORE factories so any
 	 * derivation we do during startup picks up the right value. */
 	ss_load_iid_counter(init_cmd);
@@ -20748,20 +20766,6 @@ static const char *init(struct command *init_cmd,
 	ss_load_outgoing_joins(init_cmd);
 
 	/* Phase C: load persisted policy cache. */
-	/* Phase 3 of two-DB / one-plugin refactor: open the two SQLite
-	 * databases this plugin will own (libsuperscalar.db, superscalar-cln.db).
-	 * Per ARCHITECTURE_TWO_DB_ONE_PLUGIN.md. Files are created on first
-	 * start (empty schemas). Phase 4 migration script populates them from
-	 * the old soupwallet.db. Phase 5 cutover removes the sidecar.
-	 *
-	 * Failure to open either DB is fatal — refuse to start. */
-	if (!ss_db_init()) {
-		plugin_log(plugin_handle, LOG_BROKEN,
-			   "ss_db_init() failed; refusing to start. "
-			   "Check the libsuperscalar-db-path and "
-			   "superscalar-cln-db-path options + disk space + perms.");
-		return "ss_db_init failed";
-	}
 
 	ss_policy_cache_load_from_disk();
 	ss_lsp_sig_queue_load_from_disk();
