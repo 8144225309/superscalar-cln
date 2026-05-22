@@ -113,4 +113,18 @@ bool ss_db_emit_event(const char *type, const uint8_t iid_or_null[32],
                       const char *payload_json);
 
 
+
+/* Read an integer-valued LSP operator preference. Looks first for a
+ * per-factory row (factory_instance_id = iid_or_null), then falls back
+ * to a global default (factory_instance_id IS NULL). Returns the
+ * fallback value if no row exists.
+ *
+ * pref_key examples: "auto_accept_threshold", "min_contribution",
+ * "max_contribution", "required_reputation". Values are stored as
+ * JSON strings in pref_value; we parse them as base-10 unsigned ints
+ * with strtoull. Bad / non-numeric strings yield fallback. */
+uint64_t ss_db_get_operator_pref_u64(const uint8_t iid_or_null[32],
+                                     const char *pref_key,
+                                     uint64_t fallback);
+
 #endif /* SUPERSCALAR_SS_DB_H */

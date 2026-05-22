@@ -10,6 +10,7 @@
 #include <ccan/tal/str/str.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <errno.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <pwd.h>
@@ -628,5 +629,68 @@ bool ss_db_emit_event(const char *type, const uint8_t iid_or_null[32],
 		NULL, NULL, NULL);
 
 	return true;
+}
+
+/* See ss_db.h. */
+uint64_t ss_db_get_operator_pref_u64(const uint8_t iid_or_null[32],
+                                     const char *pref_key,
+                                     uint64_t fallback)
+{
+	if (!ss_plugin_db || !pref_key) return fallback;
+
+	/* First try per-factory. */
+	if (iid_or_null) {
+		sqlite3_stmt *st = NULL;
+		if (sqlite3_prepare_v2(ss_plugin_db,
+			"SELECT pref_value FROM lsp_operator_prefs "
+			"WHERE factory_instance_id = ? AND pref_key = ? "
+			"ORDER BY rowid DESC LIMIT 1",
+			-1, &st, NULL) == SQLITE_OK) {
+			sqlite3_bind_blob(st, 1, iid_or_null, 32, SQLITE_STATIC);
+			sqlite3_bind_text(st, 2, pref_key, -1, SQLITE_STATIC);
+			if (sqlite3_step(st) == SQLITE_ROW &&
+			    sqlite3_column_type(st, 0) != SQLITE_NULL) {
+				const char *v = (const char *)sqlite3_column_text(st, 0);
+				if (v && v[0]) {
+					/* Strip JSON-wrap quotes if present. */
+					const char *p = v;
+					if (*p == '\"') p++;
+					char *end = NULL;
+					errno = 0;
+					unsigned long long val = strtoull(p, &end, 10);
+					if (!errno && end != p) {
+						sqlite3_finalize(st);
+						return (uint64_t)val;
+					}
+				}
+			}
+			sqlite3_finalize(st);
+		}
+	}
+
+	/* Fall back to global default. */
+	sqlite3_stmt *st = NULL;
+	if (sqlite3_prepare_v2(ss_plugin_db,
+		"SELECT pref_value FROM lsp_operator_prefs "
+		"WHERE factory_instance_id IS NULL AND pref_key = ? "
+		"ORDER BY rowid DESC LIMIT 1",
+		-1, &st, NULL) != SQLITE_OK)
+		return fallback;
+	sqlite3_bind_text(st, 1, pref_key, -1, SQLITE_STATIC);
+	uint64_t result = fallback;
+	if (sqlite3_step(st) == SQLITE_ROW &&
+	    sqlite3_column_type(st, 0) != SQLITE_NULL) {
+		const char *v = (const char *)sqlite3_column_text(st, 0);
+		if (v && v[0]) {
+			const char *p = v;
+			if (*p == '\"') p++;
+			char *end = NULL;
+			errno = 0;
+			unsigned long long val = strtoull(p, &end, 10);
+			if (!errno && end != p) result = (uint64_t)val;
+		}
+	}
+	sqlite3_finalize(st);
+	return result;
 }
 
