@@ -208,7 +208,7 @@ jobs:
           SUPERSCALAR_PLUGIN: ${{ github.workspace }}/cln-blip56/plugins/superscalar
         run: |
           export PATH=$CLN_DIR/lightningd:$CLN_DIR/cli:$PATH
-          pytest tests/test_smoke.py tests/test_arity.py tests/test_deterministic_iid.py \
+          pytest tests/test_smoke.py tests/test_arity.py \
               -v --tb=short --timeout=180
 
       - name: Run full pytest suite (workflow_dispatch opt-in)
