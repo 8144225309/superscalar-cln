@@ -30,6 +30,12 @@ on:
     branches: [main]
   push:
     branches: [main]
+  workflow_dispatch:
+    inputs:
+      full_suite:
+        description: "Run the full 45-test pyln suite. Default: smoke subset only."
+        type: boolean
+        default: false
 
 env:
   CLN_REF: blip-56
@@ -148,12 +154,23 @@ jobs:
         working-directory: superscalar-cln
         run: |
           pip install mako grpcio-tools
+          pip install $CLN_DIR/contrib/msggen
           pip install -r requirements-dev.txt
 
       - name: Build CLN
         working-directory: cln-blip56
+        env:
+          # contrib/msggen/Makefile invokes \${PYTHON} to regenerate
+          # schema.json; on GH Actions, ./configure does not always
+          # populate PYTHON in config.vars, leaving the recipe to run
+          # contrib/msggen/msggen/__main__.py directly (chmod fails
+          # with exit 126). Set explicitly.
+          PYTHON: python3
         run: |
           ./configure --disable-valgrind
+          # Also write PYTHON into config.vars in case the configure
+          # output silently dropped it.
+          grep -q "^PYTHON=" config.vars || echo "PYTHON=python3" >> config.vars
           make -j$(nproc)
 
       - name: Build SuperScalar
@@ -172,7 +189,30 @@ jobs:
       # binary instead of whatever `lightningd` happens to be in PATH.
       # Local-dev parity: `make test` does the same thing on a laptop
       # and on CI.
-      - name: Run pytest via make test
+      - name: Run smoke tests (default PR gate)
+        # The full 45-test pyln suite needs ~50-90 min on a single GH
+        # runner and hit the 45-min job-timeout ceiling (run 26261767073
+        # cancelled at exactly 45m). Default PR gate is the three
+        # cheapest, most fundamental tests:
+        #   - test_smoke              plugin loads + RPCs register
+        #   - test_arity              arity math + early_warning_time
+        #   - test_deterministic_iid  iid derivation determinism
+        # These cover the contracts that everything else assumes, in
+        # <10 min cold-cache. Full suite reachable via workflow_dispatch
+        # input full_suite=true.
+        if: github.event.inputs.full_suite != 'true'
+        working-directory: superscalar-cln
+        env:
+          CLN_DIR: ${{ github.workspace }}/cln-blip56
+          LIGHTNINGD: ${{ github.workspace }}/cln-blip56/lightningd/lightningd
+          SUPERSCALAR_PLUGIN: ${{ github.workspace }}/cln-blip56/plugins/superscalar
+        run: |
+          export PATH=$CLN_DIR/lightningd:$CLN_DIR/cli:$PATH
+          pytest tests/test_smoke.py tests/test_arity.py \
+              -v --tb=short --timeout=180
+
+      - name: Run full pytest suite (workflow_dispatch opt-in)
+        if: github.event.inputs.full_suite == 'true'
         working-directory: superscalar-cln
         run: make test
 

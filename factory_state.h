@@ -1,4 +1,5 @@
 /* Factory instance state management for the SuperScalar CLN plugin.
+
  *
  * Each factory_instance tracks:
  * - Participants (LSP + N clients)
@@ -16,6 +17,7 @@
 #include <stddef.h>
 #include "ceremony.h"
 #include "nonce_exchange.h"
+#include "factory_policy.h"
 
 /* Max participants in a single factory (LSP + clients).
  * Matches FACTORY_MAX_SIGNERS in libsuperscalar v0.1.9. */
@@ -64,6 +66,35 @@ typedef enum {
 						   * recover via the existing
 						   * CLTV unilateral exit at
 						   * factory expiry. */
+
+	/* PR 3: Decoupled INITIAL ceremony states. The legacy factory-create
+	 * RPC runs MuSig2 synchronously and goes straight from INIT to ACTIVE.
+	 * The new create-then-trigger model exposes the intermediate states
+	 * so an LSP can accumulate joiners (via factory-join-request) before
+	 * an explicit factory-trigger-ceremony call kicks off signing.
+	 *
+	 * State flow (LSP side):
+	 *   INIT -> AWAITING_JOINS                  (factory-create with defer_signing=true)
+	 *   AWAITING_JOINS -> READY_TO_TRIGGER      (min_clients_to_start reached;
+	 *                                            advisory only, RPC checks pool)
+	 *   AWAITING_JOINS -> CEREMONY_RUNNING      (factory-trigger-ceremony fires,
+	 *                                            CEREMONY_START sent to participants)
+	 *   CEREMONY_RUNNING -> ACTIVE              (existing MuSig2 flow signs, tree ready)
+	 *
+	 * State flow (client side):
+	 *   INIT -> CEREMONY_RUNNING                (received CEREMONY_START from LSP)
+	 *   CEREMONY_RUNNING -> ACTIVE              (existing FACTORY_READY arrival)
+	 *
+	 * Legacy factory-create without defer_signing skips these states entirely. */
+	FACTORY_LIFECYCLE_AWAITING_JOINS = 9,
+	FACTORY_LIFECYCLE_READY_TO_TRIGGER = 10,
+	FACTORY_LIFECYCLE_CEREMONY_RUNNING = 11,
+	/* Ceremony done — signed tree on both sides + funding TX broadcast,
+	 * but channels not yet opened on top of the leaves. Operator's next
+	 * step is factory-open-channels which promotes this to ACTIVE.
+	 * Distinguishes "INIT, ceremony hasn't run" (legacy meaning of INIT)
+	 * from "ceremony done, channels pending". */
+	FACTORY_LIFECYCLE_SIGNED = 12,
 } factory_lifecycle_t;
 
 /* Helper: a factory in any closed terminal state should not be scanned,
@@ -76,6 +107,22 @@ static inline bool factory_is_closed(factory_lifecycle_t l) {
 	    || l == FACTORY_LIFECYCLE_CLOSED_UNILATERAL
 	    || l == FACTORY_LIFECYCLE_CLOSED_BREACHED
 	    || l == FACTORY_LIFECYCLE_ABORTED;
+}
+
+/* PR 3: factory is in the deferred-signing pre-ceremony window — created
+ * but not yet signing. factory-join-request additions are allowed here;
+ * factory-trigger-ceremony is allowed here. */
+static inline bool factory_is_awaiting_signing(factory_lifecycle_t l) {
+	return l == FACTORY_LIFECYCLE_AWAITING_JOINS
+	    || l == FACTORY_LIFECYCLE_READY_TO_TRIGGER;
+}
+
+/* PR 3: factory has an active ceremony in flight (either legacy-INIT
+ * inline signing, or the new CEREMONY_RUNNING). Used to gate concurrent
+ * operations and metrics. */
+static inline bool factory_ceremony_in_flight(factory_lifecycle_t l) {
+	return l == FACTORY_LIFECYCLE_INIT
+	    || l == FACTORY_LIFECYCLE_CEREMONY_RUNNING;
 }
 
 /* Phase 2a: values for factory_instance_t.closed_by. Stored as uint8_t
@@ -180,6 +227,15 @@ typedef struct {
  * specific and is deferred to Phase 4d2. The scheduler drives state
  * transitions based on the signals we have today. */
 #define MAX_PENDING_SWEEPS 16
+/* Phase 3 join queue: LSP-side per-factory pending+accepted+history queue.
+ * Sized to hold a realistic mix of QUEUED + ACCEPTED + SIGNED + recent
+ * REJECTED/CANCELLED entries over the factory's lifetime. 256 gives
+ * comfortable headroom past MAX_FACTORY_PARTICIPANTS (128). */
+#define MAX_JOIN_QUEUE 256
+/* Phase 3 outgoing joins: client-side persistent list of factories the
+ * wallet has tried to join. 32 is generous — most clients participate
+ * in only a handful of factories at a time. */
+#define MAX_OUTGOING_JOINS 32
 
 typedef enum {
 	SWEEP_STATE_PENDING   = 0,
@@ -278,6 +334,11 @@ typedef struct {
 	bool connected;			/* Currently connected */
 	bool nonce_received;		/* Sent NONCE_BUNDLE this round */
 	bool psig_received;		/* Sent PSIG_BUNDLE this round */
+	uint8_t propose_retry_count;	/* Bug B: LSP-side reconnect FACTORY_PROPOSE
+				 * retries. Capped at SS_MAX_PROPOSE_RETRIES.
+				 * Reset to 0 on nonce_received=true (so a
+				 * successful round refreshes the budget). Not
+				 * persisted; restart fresh-counts to 0 by design. */
 	int signer_slot;		/* Index in MuSig2 signer set */
 	uint8_t factory_pubkey[33];	/* Real factory pubkey (from NONCE_BUNDLE) */
 	bool has_factory_pubkey;	/* Whether factory_pubkey was received */
@@ -303,6 +364,72 @@ typedef struct {
 } client_state_t;
 
 /* Factory instance */
+/* Phase 3: per-join lifecycle. Persists in factory_instance_t.join_queue.
+ *
+ * Lifecycle (typical happy path):
+ *   QUEUED -> ACCEPTED -> SIGNED
+ *
+ * Off-path:
+ *   QUEUED|ACCEPTED -> REJECTED   (policy refused OR LSP kicked)
+ *   QUEUED|ACCEPTED -> CANCELLED  (client withdrew)
+ *   any            -> ALREADY_MEMBER  (dedup safety net response code,
+ *                                       not normally persisted)
+ */
+typedef enum {
+	JOIN_STATUS_QUEUED         = 0,  /* received, awaiting policy check */
+	JOIN_STATUS_ACCEPTED       = 1,  /* policy passed, awaiting next rotation */
+	JOIN_STATUS_SIGNED         = 2,  /* included + signed in latest rotation */
+	JOIN_STATUS_REJECTED       = 3,  /* policy refused OR LSP kicked */
+	JOIN_STATUS_CANCELLED      = 4,  /* client sent JOIN_CANCEL */
+	JOIN_STATUS_ALREADY_MEMBER = 5,  /* dedup: client already in this factory */
+} factory_join_status_t;
+
+/* Persistent record of one join request seen by this LSP for this factory.
+ * TODO(privacy): pre-mainnet, decide what subset of these fields should
+ * be retained / hashed / dropped after lifecycle completes. Currently we
+ * retain everything for diagnostics. */
+typedef struct {
+	uint8_t  client_node_id[33];   /* BOLT-8 sender_id of the requester */
+	uint64_t request_id;           /* client-generated, used for response correlation */
+	uint64_t contribution_sats;    /* sats the client offered to contribute */
+	uint32_t received_at_block;    /* block height when JOIN_REQUEST arrived */
+	uint32_t accepted_at_block;    /* block height when status moved to ACCEPTED; 0 otherwise */
+	uint32_t decided_at_block;     /* block height of last status change (any direction) */
+	uint32_t last_seen_block;      /* Phase 4: updated on ANY wire message from this client.
+	                                * Memory-only — not persisted. Used for stale-detection
+	                                * in LSP UI ("client X last seen N blocks ago"). */
+	factory_join_status_t status;  /* current lifecycle position */
+	uint8_t  reason[64];           /* C-string; rejected/cancelled reason or empty */
+} factory_join_t;
+
+/* Client-side: persistent record of an outgoing join attempt this wallet has
+ * made. Lives in superscalar_state_t.outgoing_joins[], keyed by request_id.
+ * Wallet reads this to render the "My Memberships" UI (Phase 5). On wallet
+ * restart, this state survives via plugin datastore.
+ * TODO(privacy): same retention review as factory_join_t. */
+typedef enum {
+	OUTGOING_JOIN_SENT          = 0,  /* JOIN_REQUEST sent, no response yet */
+	OUTGOING_JOIN_QUEUED        = 1,  /* LSP queued us */
+	OUTGOING_JOIN_ACCEPTED      = 2,  /* LSP accepted, waiting for rotation */
+	OUTGOING_JOIN_SIGNED        = 3,  /* included in signed rotation = active */
+	OUTGOING_JOIN_REJECTED      = 4,  /* LSP refused (policy or kick) */
+	OUTGOING_JOIN_CANCELLED     = 5,  /* we sent JOIN_CANCEL */
+	OUTGOING_JOIN_TIMEOUT       = 6,  /* no response, gave up */
+	OUTGOING_JOIN_ALREADY_MEMBER = 7, /* tried to join one we're already in */
+} outgoing_join_status_t;
+
+typedef struct {
+	uint8_t  lsp_node_id[33];          /* who we asked */
+	uint8_t  instance_id[32];          /* which factory */
+	uint64_t request_id;               /* our outgoing request_id (we picked) */
+	uint64_t contribution_sats;        /* what we offered */
+	uint32_t sent_at_block;            /* block height when we sent the request */
+	uint32_t expected_signing_block;   /* from LSP's JOIN_RESPONSE; 0 if unknown */
+	uint32_t updated_at_block;         /* block height of last status change */
+	outgoing_join_status_t status;     /* current lifecycle */
+	uint8_t  reason[64];               /* C-string; for rejected/cancelled */
+} outgoing_join_t;
+
 typedef struct factory_instance {
 	/* Identity */
 	uint8_t instance_id[32];
@@ -656,6 +783,58 @@ typedef struct factory_instance {
 	uint8_t n_allocations;
 	uint64_t allocations[MAX_FACTORY_PARTICIPANTS];
 
+	/* Gap 9: MuSig2 keyagg cache snapshots per node, captured at
+	 * factory_build_tree time and persisted in meta v15+. Restored onto
+	 * lib_factory->nodes[i].keyagg after every rebuild so we never
+	 * depend on the recompute being bit-for-bit identical to what the
+	 * tree was originally signed with. Defends the signet-recovery
+	 * incident where two factories produced sigs that failed on-chain
+	 * validation despite the x-only agg pubkey matching.
+	 *
+	 * Blob layout:
+	 *   u16  n_entries
+	 *   for each entry:
+	 *     u16  node_idx
+	 *     u32  payload_size
+	 *     u8[payload_size]   raw bytes of musig_keyagg_t (memcpy)
+	 *
+	 * n_entries == 0 (or NULL blob) means no snapshot — caller falls
+	 * back to whatever factory_build_tree computed. Heap-owned; freed
+	 * on factory destruction. */
+	uint8_t *keyagg_snapshots;
+	size_t   keyagg_snapshots_len;
+
+	/* Phase 4: optional caller-supplied feerate for the funding TX.
+	 * 0 means "use CLN default". Set by factory-create's optional
+	 * feerate_perkw param. Honored when this plugin sends the withdraw
+	 * RPC to create the funding UTXO. Memory-only — funding happens
+	 * once at create time and the value is consumed; doesn't need
+	 * persistence. */
+	uint32_t requested_feerate_perkw;
+
+	/* Phase 3: LSP-side join lifecycle queue. Only populated for factories
+	 * where is_lsp == true. Persisted alongside other factory state via
+	 * ss_save_factory. See factory_join_t for the lifecycle states.
+	 *
+	 * Verbose plugin_log on every state transition serves as the v1
+	 * audit trail (structured audit log is a separate Task #59).
+	 *
+	 * TODO(privacy): every write site must be reviewed pre-mainnet for
+	 * what data can be hashed/dropped. */
+	factory_join_t join_queue[MAX_JOIN_QUEUE];
+	size_t         n_join_queue;
+
+	/* PR 3: active ceremony tracking for the decoupled INITIAL flow.
+	 * All zero when no ceremony is in flight. Set by factory-trigger-
+	 * ceremony (LSP) or by receipt of CEREMONY_START (client). Cleared
+	 * by CEREMONY_RESULT (success) or CEREMONY_ABORT (failure).
+	 *
+	 * v1 keeps a single active ceremony per factory; multi-ceremony
+	 * concurrency arrives in v2 alongside the lib SQLite tables for
+	 * crash recovery. */
+	uint8_t  active_ceremony_id[8];
+	uint32_t active_ceremony_deadline_block;
+
 } factory_instance_t;
 
 /* Global plugin state */
@@ -686,6 +865,14 @@ typedef struct superscalar_state {
 	uint32_t factory_counter;
 	bool has_counter_loaded;	/* distinguishes "no counter yet" (fresh
 					 * plugin) from "counter is 0" after load */
+
+	/* Phase 3: client-side outgoing join attempts. Persisted under the
+	 * datastore key "superscalar/outgoing_joins" so wallet restarts
+	 * don't lose pending-rotation memberships. See outgoing_join_t.
+	 *
+	 * TODO(privacy): pre-mainnet, decide retention for completed entries. */
+	outgoing_join_t outgoing_joins[MAX_OUTGOING_JOINS];
+	size_t          n_outgoing_joins;
 } superscalar_state_t;
 
 /* State management functions */

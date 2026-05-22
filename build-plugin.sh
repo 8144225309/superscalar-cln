@@ -26,12 +26,16 @@ PLUGIN_SRC="${PLUGIN_SRC:-$(dirname $0)}"
 cd "$CLN_DIR"
 
 # Copy plugin sources
-cp "$PLUGIN_SRC/superscalar.c" "$PLUGIN_SRC/factory_state.h" \
-   "$PLUGIN_SRC/factory_state.c" "$PLUGIN_SRC/persist.c" \
+cp "$PLUGIN_SRC/superscalar.c" "$PLUGIN_SRC/factory_state.h" "$PLUGIN_SRC/factory_policy.h" \
+   "$PLUGIN_SRC/factory_state.c" "$PLUGIN_SRC/factory_policy.c" "$PLUGIN_SRC/persist.c" \
    "$PLUGIN_SRC/persist.h" "$PLUGIN_SRC/nonce_exchange.c" \
    "$PLUGIN_SRC/nonce_exchange.h" "$PLUGIN_SRC/fee_stubs.c" \
    "$PLUGIN_SRC/ceremony.h" "$PLUGIN_SRC/sweep_builder.c" \
-   "$PLUGIN_SRC/sweep_builder.h" plugins/
+   "$PLUGIN_SRC/sweep_builder.h" \
+   "$PLUGIN_SRC/ceremony_wire.h" "$PLUGIN_SRC/ceremony_wire.c" \
+   "$PLUGIN_SRC/ss_db.h" "$PLUGIN_SRC/ss_db.c" \
+   "$PLUGIN_SRC/ss_wallet_rpc.h" "$PLUGIN_SRC/ss_wallet_rpc.c" \
+   plugins/
 
 # --- Step 1: Build slim libsuperscalar (only the 10 files we need) ---
 # The full libsuperscalar.a has 106 .o files. 96 of them export symbols
@@ -83,7 +87,7 @@ CFLAGS="-DCLN_NEXT_VERSION=\"v25.12\" \
   -DCOMPAT_V081=1 -DCOMPAT_V082=1 -DCOMPAT_V090=1 -DCOMPAT_V0100=1 \
   -DCOMPAT_V0121=1"
 
-for src in superscalar factory_state persist nonce_exchange fee_stubs sweep_builder; do
+for src in superscalar factory_state factory_policy persist nonce_exchange fee_stubs sweep_builder ceremony_wire ss_db ss_wallet_rpc; do
   cc $CFLAGS -c plugins/$src.c -o plugins/$src.o
 done
 
@@ -91,9 +95,10 @@ done
 # One secp256k1 (from CLN's wally, with musig enabled).
 # Slim libsuperscalar provides factory/musig/DW functions.
 # No --allow-multiple-definition needed.
-cc -Og -o plugins/superscalar \
-  plugins/superscalar.o plugins/factory_state.o plugins/nonce_exchange.o \
+cc -Og -fsanitize=address -fsanitize=undefined -o plugins/superscalar \
+  plugins/superscalar.o plugins/factory_state.o plugins/factory_policy.o plugins/nonce_exchange.o \
   plugins/persist.o plugins/fee_stubs.o plugins/sweep_builder.o \
+  plugins/ceremony_wire.o plugins/ss_db.o plugins/ss_wallet_rpc.o \
   plugins/libplugin.o \
   "$SLIM_DIR/libsuperscalar_slim.a" \
   libcommon.a libccan.a \

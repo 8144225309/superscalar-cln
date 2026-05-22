@@ -236,6 +236,18 @@ Each advance appends one TX to the leaf's chain. Both parties persist the signed
 
 **Dust-limit exhaustion**: `factory-ps-advance` returns an error with `SS_METRIC event=ps_exhausted` when the next advance's channel output would fall below the dust limit (546 sats). Operator response: migrate the factory to reset the chain.
 
+### Within-Epoch LEAF_REALLOC Poisoning (operational discipline)
+
+`factory-buy-liquidity` re-signs an ARITY_2 leaf within the current epoch, transferring sats from L-stock to a client's channel output. The L-stock taproot hashlock is keyed on the **epoch's** revocation secret, not a per-realloc secret — and that secret is only handed over at rotation. **Result**: within an epoch, if the LSP retains the OLD signed leaf state from before the realloc and publishes it after the client has paid, the LSP undoes the sale; the client cannot burn the stale L-stock because they don't yet hold this epoch's secret.
+
+The base SuperScalar protocol mitigates this via cross-epoch revocation (rotate, then the client gets the secret, then they can burn old states). Within-epoch protection requires either:
+
+- **Operational discipline (this plugin's current model)**: the operator orchestrating the LSP's `factory-buy-liquidity` flow must ensure the client's LN payment lands **only after** the LEAF_REALLOC ceremony emits `event=realloc_complete`. Caller-side ordering, no chain-level guarantee. This matches the LSPS-style inbound-liquidity flow where payment is contingent on channel finality.
+- **Pre-signed poisoning TXs (not implemented)**: at factory creation, all parties co-sign a set of "poisoning" TXs that spend each future-realloc-version's L-stock back to the clients. Stored on the client; broadcast on detection. Caps the maximum realloc count at signing time.
+- **Per-realloc revocation secrets (not implemented)**: each realloc generates a fresh secret; the previous version's secret is shared on success. Requires new ceremony state.
+
+A future PR can layer pre-signed poisoning or per-realloc secrets on top for operators who need chain-enforced finality. For now, treat `factory-buy-liquidity` as a privileged operator action whose payment-vs-ceremony ordering is the operator's responsibility.
+
 ## Related Projects
 
 | Project | Description |
