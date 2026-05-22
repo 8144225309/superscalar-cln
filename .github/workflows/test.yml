@@ -30,6 +30,7 @@ on:
     branches: [main]
   push:
     branches: [main]
+  workflow_dispatch: {}
 
 env:
   CLN_REF: blip-56
