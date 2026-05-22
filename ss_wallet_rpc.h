@@ -56,4 +56,14 @@ struct command_result *json_wallet_get_setting(struct command *cmd, const char *
 /* Health */
 struct command_result *json_wallet_status(struct command *cmd, const char *buf, const jsmntok_t *params);
 
+
+/* Session 1 (LSP UI gaps): admin actions on lsp_join_queue. Operators
+ * approve or refuse a QUEUED join via the wallet UI; the row transitions
+ * to ACCEPTED (waiting next rotation) or REJECTED. No wire-level
+ * notification fires here — the client learns of the new status either
+ * (a) when it polls or (b) on the next factory-trigger-ceremony for
+ * ACCEPTED rows. */
+struct command_result *json_wallet_approve_join_queued(struct command *cmd, const char *buf, const jsmntok_t *params);
+struct command_result *json_wallet_refuse_join_queued(struct command *cmd, const char *buf, const jsmntok_t *params);
+
 #endif /* SUPERSCALAR_SS_WALLET_RPC_H */
