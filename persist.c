@@ -73,6 +73,34 @@ static bool read_bytes(const uint8_t **p, size_t *rem, void *out, size_t n)
 /* Serialize factory metadata */
 size_t ss_persist_serialize_meta(const factory_instance_t *fi, uint8_t **out)
 {
+	/* ========================================================================
+	 * SECRET-MATERIAL INVARIANT (per MUSIG_NONCE_REDESIGN_MEMO.md §2 + §3):
+	 * This serializer MUST NOT include any MuSig2 secnonce, private key, or
+	 * other secret-keying material. Only PUBLIC fields belong here.
+	 *
+	 * Existing fields are public by construction:
+	 *   - iid / protocol_id          : public identifiers
+	 *   - lsp_node_id / client node_ids : public LN pubkeys
+	 *   - ceremony state / lifecycle    : protocol state
+	 *   - funding TXID / outnum / amt / spk : on-chain
+	 *   - factory_pubkeys (per client)  : public musig participant pubkeys
+	 *   - extracted_keys / departures   : revealed musig keys (intentional)
+	 *   - history_kickoff_sigs          : 64-byte Schnorr SIGS (not nonces)
+	 *   - dist_signed_txid              : on-chain
+	 *   - pending_penalties / sweeps / cpfps : public bookkeeping
+	 *   - keyagg_snapshots              : musig_keyagg_t opaque blob — the
+	 *                                     PUBLIC keyagg cache, NOT secnonces.
+	 *                                     (secnonces are secp256k1_musig_secnonce,
+	 *                                     a separate struct held only in heap memory.)
+	 *
+	 * Future field additions MUST preserve this invariant. If you need to
+	 * persist secret-keying state, that\'s a libsuperscalar concern, not a
+	 * plugin concern — see MUSIG_NONCE_REDESIGN_MEMO.md for context.
+	 *
+	 * One exception is breach_data.revocation_secret in the BREACH blob
+	 * (separate serializer): that\'s the COUNTERPARTY\'s revealed secret used
+	 * to claim the penalty output, intentional per Decker-Wattenhofer.
+	 * ======================================================================== */
 	uint8_t *buf = NULL;
 	size_t len = 0, cap = 0;
 
