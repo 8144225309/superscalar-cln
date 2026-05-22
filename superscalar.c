@@ -11030,19 +11030,49 @@ realloc_all_nonces_done:
 				   "join: rejecting %s (req_id=%llu) — queue full",
 				   peer_id, (unsigned long long)req_id);
 		} else {
-			/* New entry, auto-accept (v1 policy). */
-			/* TODO(privacy): retention review pre-mainnet */
+			/* Read LSP operator prefs (per-factory, fallback global)
+			 * to decide initial status. Session-2 ships the editor;
+			 * this site reads it back. Sentinel 0 means "unset" for
+			 * each pref. */
+			uint64_t min_contrib = ss_db_get_operator_pref_u64(
+				target_fi->instance_id, "min_contribution", 0);
+			uint64_t max_contrib = ss_db_get_operator_pref_u64(
+				target_fi->instance_id, "max_contribution", 0);
+			uint64_t auto_accept_thresh = ss_db_get_operator_pref_u64(
+				target_fi->instance_id, "auto_accept_threshold", 0);
+
+			factory_join_status_t initial_status;
+			const char *initial_reason = "";
+			if (min_contrib > 0 && contribution_sats < min_contrib) {
+				initial_status = JOIN_STATUS_REJECTED;
+				initial_reason = "below operator minimum contribution";
+			} else if (max_contrib > 0 && contribution_sats > max_contrib) {
+				initial_status = JOIN_STATUS_REJECTED;
+				initial_reason = "above operator maximum contribution";
+			} else if (auto_accept_thresh > 0 &&
+				   contribution_sats < auto_accept_thresh) {
+				initial_status = JOIN_STATUS_QUEUED;
+				initial_reason = "below auto-accept threshold; queued for operator review";
+			} else {
+				initial_status = JOIN_STATUS_ACCEPTED;
+			}
+
 			factory_join_t *j =
 				&target_fi->join_queue[target_fi->n_join_queue++];
 			memcpy(j->client_node_id, client_pk, 33);
 			j->request_id = req_id;
 			j->contribution_sats = contribution_sats;
 			j->received_at_block = ss_state.current_blockheight;
-			j->accepted_at_block = ss_state.current_blockheight;
+			j->accepted_at_block =
+				(initial_status == JOIN_STATUS_ACCEPTED)
+					? ss_state.current_blockheight : 0;
 			j->decided_at_block = ss_state.current_blockheight;
-			j->status = JOIN_STATUS_ACCEPTED;
+			j->status = initial_status;
 			memset(j->reason, 0, 64);
-			resp_status = JOIN_STATUS_ACCEPTED;
+			if (initial_reason[0])
+				strncpy(j->reason, initial_reason, 63);
+			resp_status = initial_status;
+			resp_reason = initial_reason;
 			plugin_log(plugin_handle, LOG_INFORM,
 				   "join: accepted client %s for factory "
 				   "(req_id=%llu, contribution=%llu sats, "

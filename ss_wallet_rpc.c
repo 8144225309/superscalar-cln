@@ -848,6 +848,23 @@ struct command_result *json_wallet_set_operator_pref(
 		if (err) return err;
 	}
 
+	/* Bug fix: SQLite treats NULLs in primary keys as distinct, so the
+	 * ON CONFLICT path below doesn\'t fire when factory_instance_id IS NULL
+	 * (global default). Duplicates accumulate across set calls. Explicit
+	 * DELETE for the NULL-iid case before INSERT keeps globals unique.
+	 * Per-factory rows (non-NULL iid) still use the PK\'s ON CONFLICT. */
+	if (!iid) {
+		sqlite3_stmt *del = NULL;
+		if (sqlite3_prepare_v2(ss_plugin_db,
+			"DELETE FROM lsp_operator_prefs "
+			"WHERE factory_instance_id IS NULL AND pref_key = ?",
+			-1, &del, NULL) == SQLITE_OK) {
+			sqlite3_bind_text(del, 1, pref_key, -1, SQLITE_STATIC);
+			sqlite3_step(del);
+			sqlite3_finalize(del);
+		}
+	}
+
 	sqlite3_stmt *st = NULL;
 	if (sqlite3_prepare_v2(ss_plugin_db,
 		"INSERT INTO lsp_operator_prefs "
