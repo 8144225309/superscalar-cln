@@ -148,6 +148,7 @@ jobs:
         working-directory: superscalar-cln
         run: |
           pip install mako grpcio-tools
+          pip install $CLN_DIR/contrib/msggen
           pip install -r requirements-dev.txt
 
       - name: Build CLN
