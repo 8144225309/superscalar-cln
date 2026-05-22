@@ -334,6 +334,11 @@ typedef struct {
 	bool connected;			/* Currently connected */
 	bool nonce_received;		/* Sent NONCE_BUNDLE this round */
 	bool psig_received;		/* Sent PSIG_BUNDLE this round */
+	uint8_t propose_retry_count;	/* Bug B: LSP-side reconnect FACTORY_PROPOSE
+				 * retries. Capped at SS_MAX_PROPOSE_RETRIES.
+				 * Reset to 0 on nonce_received=true (so a
+				 * successful round refreshes the budget). Not
+				 * persisted; restart fresh-counts to 0 by design. */
 	int signer_slot;		/* Index in MuSig2 signer set */
 	uint8_t factory_pubkey[33];	/* Real factory pubkey (from NONCE_BUNDLE) */
 	bool has_factory_pubkey;	/* Whether factory_pubkey was received */

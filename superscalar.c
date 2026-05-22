@@ -1400,6 +1400,12 @@ static uint8_t *ss_wallet_db_load_blob_tal(const tal_t *ctx,
 #define SS_ERR_INSUFFICIENT_FUNDS        2270
 
 #define SS_PEER_TABLE_SIZE          64
+/* Bug B: cap how many times the LSP will re-send FACTORY_PROPOSE
+ * to a single non-responsive client across reconnects. After this
+ * many attempts, the LSP stops retrying and waits for the client
+ * to make the first move (or for the factory to be reaped). */
+#define SS_MAX_PROPOSE_RETRIES 3
+
 #define SS_PEER_MAX_CONCURRENT       2
 #define SS_PEER_RATE_LIMIT          10
 #define SS_PEER_RATE_WINDOW_SECS    60
@@ -6283,6 +6289,7 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 			}
 			if (cl) {
 				cl->nonce_received = true;
+				cl->propose_retry_count = 0; /* Bug B: round complete */
 				/* Extract real factory pubkey from client's bundle.
 				 * Client populates pubkeys[own_slot] where slot=ci+1. */
 				size_t client_slot = cl_ci + 1; /* 0=LSP, 1..n=clients */
@@ -6303,6 +6310,7 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 				/* Force it for single-client demo */
 				if (fi->n_clients == 1) {
 					fi->clients[0].nonce_received = true;
+					fi->clients[0].propose_retry_count = 0; /* Bug B */
 					plugin_log(plugin_handle, LOG_INFORM,
 						   "LSP: forced nonce_received for solo client");
 				}
@@ -7577,8 +7585,10 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 				client_state_t *cl =
 					ss_factory_find_client(fi, pid);
 				if (cl) cl->nonce_received = true;
+				if (cl) cl->propose_retry_count = 0; /* Bug B: round complete */
 				else if (fi->n_clients == 1)
 					fi->clients[0].nonce_received = true;
+					fi->clients[0].propose_retry_count = 0; /* Bug B */
 			}
 
 			/* When all clients responded, finalize and
@@ -8212,6 +8222,7 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 					if (memcmp(fi->clients[xci].node_id,
 						   pid, 33) == 0) {
 						fi->clients[xci].nonce_received = true;
+						fi->clients[xci].propose_retry_count = 0; /* Bug B */
 						break;
 					}
 				}
@@ -12452,6 +12463,44 @@ static struct command_result *json_factory_refuse_proposal(
 		   "to LSP.",
 		   was_held ? "released held proposal + marked REFUSED"
 			    : "marked REFUSED (no held payload)");
+
+	/* Bug A fix: also drop the in-memory factory_instance_t for the refused
+	 * iid so it doesn\'t persist as a stale init/proposed ghost in
+	 * factory-list. Without this, the slot is marked refused but the
+	 * factory_instance_t lives forever, accumulating every reconnect
+	 * (the LSP-side handle_connect retry sees CEREMONY_PROPOSED and
+	 * re-sends FACTORY_PROPOSE, which creates fresh duplicates here).
+	 *
+	 * We only refuse client-side proposals (LSP never sees its own
+	 * factory through this path), so fi->is_lsp will be false. fi may
+	 * not have a lib_factory yet (refuse can happen pre-ceremony) —
+	 * the free pattern below is null-safe. */
+	{
+		factory_instance_t *fi_refused = NULL;
+		size_t fi_slot = SIZE_MAX;
+		for (size_t i = 0; i < ss_state.n_factories; i++) {
+			if (memcmp(ss_state.factories[i]->instance_id,
+				   slot->instance_id, 32) == 0) {
+				fi_refused = ss_state.factories[i];
+				fi_slot = i;
+				break;
+			}
+		}
+		if (fi_refused && fi_slot != SIZE_MAX) {
+			for (size_t i = fi_slot + 1; i < ss_state.n_factories; i++)
+				ss_state.factories[i - 1] = ss_state.factories[i];
+			ss_state.n_factories--;
+			ss_state.factories[ss_state.n_factories] = NULL;
+			if (fi_refused->breach_data) free(fi_refused->breach_data);
+			if (fi_refused->dist_signed_tx) free(fi_refused->dist_signed_tx);
+			if (fi_refused->keyagg_snapshots) free(fi_refused->keyagg_snapshots);
+			free(fi_refused);
+			plugin_log(plugin_handle, LOG_DBG,
+				   "factory-refuse-proposal: dropped in-memory "
+				   "factory_instance_t (n_factories now %u)",
+				   (unsigned)ss_state.n_factories);
+		}
+	}
 
 	struct json_stream *js = jsonrpc_stream_success(cmd);
 	json_add_bool(js, "ok", true);
@@ -20440,7 +20489,13 @@ static struct command_result *handle_connect(struct command *cmd,
 			if (memcmp(fi->clients[ci].node_id, pid, 33) != 0)
 				continue;
 
-			if (is_propose && !fi->clients[ci].nonce_received) {
+			if (is_propose && !fi->clients[ci].nonce_received &&
+			    fi->clients[ci].propose_retry_count < SS_MAX_PROPOSE_RETRIES) {
+				fi->clients[ci].propose_retry_count++;
+				plugin_log(plugin_handle, LOG_DBG,
+					   "LSP: reconnect re-PROPOSE %u/%u for client",
+					   (unsigned)fi->clients[ci].propose_retry_count,
+					   (unsigned)SS_MAX_PROPOSE_RETRIES);
 				/* Re-send FACTORY_PROPOSE so client can respond
 				 * with its NONCE_BUNDLE. Build nonce bundle from
 				 * the cached LSP nonce entries. */
