@@ -23562,6 +23562,14 @@ static const struct plugin_command commands[] = {
 		"wallet-get-peer-reputation",
 		json_wallet_get_peer_reputation,
 	},
+	{
+		"wallet-list-events-since",
+		json_wallet_list_events_since,
+	},
+	{
+		"wallet-get-latest-event-id",
+		json_wallet_get_latest_event_id,
+	},
 };
 
 static const struct plugin_notification notifs[] = {

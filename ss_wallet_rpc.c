@@ -1457,3 +1457,88 @@ struct command_result *json_wallet_list_known_peers(
 	return command_finished(cmd, js);
 }
 
+/* ============================================================================
+ * Session 5a: event_log query RPCs.
+ *
+ * wallet-list-events-since pulls events newer than the caller\'s
+ * last_seen_event_id. Wallet stores last_seen in localStorage so
+ * reconnects automatically pick up the right delta. limit caps the
+ * batch so big offline windows don\'t blow up a single RPC.
+ *
+ * wallet-get-latest-event-id is the "first connect, no last_seen yet"
+ * helper — wallet calls it once to seed last_seen, then uses
+ * list-events-since from then on.
+ * ============================================================================ */
+
+struct command_result *json_wallet_list_events_since(
+	struct command *cmd, const char *buf, const jsmntok_t *params)
+{
+	uint32_t *since_id;
+	uint32_t *limit_opt = NULL;
+	if (!param(cmd, buf, params,
+		   p_req("since_event_id", param_u32, &since_id),
+		   p_opt("limit", param_u32, &limit_opt),
+		   NULL))
+		return command_param_failed();
+
+	uint32_t limit = limit_opt ? *limit_opt : 200;
+	if (limit > 1000) limit = 1000;  /* hard cap */
+
+	sqlite3_stmt *st = NULL;
+	if (sqlite3_prepare_v2(ss_plugin_db,
+		"SELECT event_id, type, factory_iid, payload_json, created_at "
+		"FROM event_log WHERE event_id > ? "
+		"ORDER BY event_id ASC LIMIT ?",
+		-1, &st, NULL) != SQLITE_OK)
+		return reply_sql_fail(cmd, "list_events_since prepare");
+	sqlite3_bind_int(st, 1, (int)*since_id);
+	sqlite3_bind_int(st, 2, (int)limit);
+
+	struct json_stream *js = jsonrpc_stream_success(cmd);
+	json_array_start(js, "events");
+	uint32_t max_seen = *since_id;
+	while (sqlite3_step(st) == SQLITE_ROW) {
+		json_object_start(js, NULL);
+		uint32_t eid = (uint32_t)sqlite3_column_int(st, 0);
+		if (eid > max_seen) max_seen = eid;
+		json_add_u32(js, "event_id", eid);
+		json_add_string(js, "type", (const char *)sqlite3_column_text(st, 1));
+		if (sqlite3_column_type(st, 2) == SQLITE_NULL)
+			json_add_primitive(js, "factory_iid_hex", "null");
+		else {
+			const void *iid = sqlite3_column_blob(st, 2);
+			int iid_len = sqlite3_column_bytes(st, 2);
+			json_add_hex(js, "factory_iid_hex", iid, iid_len);
+		}
+		const char *payload = (const char *)sqlite3_column_text(st, 3);
+		json_add_jsonstr(js, "payload", payload, strlen(payload));
+		json_add_u32(js, "created_at", (uint32_t)sqlite3_column_int(st, 4));
+		json_object_end(js);
+	}
+	json_array_end(js);
+	json_add_u32(js, "max_event_id", max_seen);
+	sqlite3_finalize(st);
+	return command_finished(cmd, js);
+}
+
+struct command_result *json_wallet_get_latest_event_id(
+	struct command *cmd, const char *buf, const jsmntok_t *params)
+{
+	if (!param(cmd, buf, params, NULL))
+		return command_param_failed();
+
+	sqlite3_stmt *st = NULL;
+	if (sqlite3_prepare_v2(ss_plugin_db,
+		"SELECT COALESCE(MAX(event_id), 0) FROM event_log",
+		-1, &st, NULL) != SQLITE_OK)
+		return reply_sql_fail(cmd, "get_latest_event_id prepare");
+	uint32_t latest = 0;
+	if (sqlite3_step(st) == SQLITE_ROW)
+		latest = (uint32_t)sqlite3_column_int(st, 0);
+	sqlite3_finalize(st);
+
+	struct json_stream *js = jsonrpc_stream_success(cmd);
+	json_add_u32(js, "latest_event_id", latest);
+	return command_finished(cmd, js);
+}
+
