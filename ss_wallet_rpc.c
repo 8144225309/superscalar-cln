@@ -23,6 +23,7 @@
  * ============================================================================ */
 
 #include "ss_wallet_rpc.h"
+#include "factory_state.h"
 #include "ss_db.h"
 #include <common/json_param.h>
 #include <common/json_stream.h>
@@ -38,6 +39,7 @@
 #include <string.h>
 
 extern struct plugin *plugin_handle;
+extern superscalar_state_t ss_state;
 
 /* ============================================================================
  * Shared helpers
@@ -1087,3 +1089,123 @@ struct command_result *json_wallet_status(
 	json_add_bool(js, "ready", true);
 	return command_finished(cmd, js);
 }
+
+/* ============================================================================
+ * Session 1 (LSP UI gaps): wallet-approve-join-queued / wallet-refuse-join-queued
+ *
+ * Operator-side admin actions to transition an lsp_join_queue row from
+ * QUEUED to either ACCEPTED (status=1) or REJECTED (status=3). The
+ * existing client-side handler enqueues all incoming JOIN_REQUEST as
+ * QUEUED by default unless auto_accept_threshold matched. These RPCs
+ * let an LSP operator advance the lifecycle manually from the UI.
+ *
+ * Status enum (factory_join_status_t in factory_state.h):
+ *   0 QUEUED, 1 ACCEPTED, 2 SIGNED, 3 REJECTED, 4 CANCELLED, 5 ALREADY_MEMBER
+ *
+ * No wire-level notification is sent on REJECTED here — the client will
+ * see the new status next time it polls (or, if the operator decides to
+ * proactively notify, that's a follow-up). On ACCEPTED, the existing
+ * factory-trigger-ceremony flow consumes the queue per-iid and the
+ * client is included in the next rotation.
+ * ============================================================================ */
+
+static struct command_result *update_join_queue_status(
+	struct command *cmd, const char *iid_hex, const char *cli_hex,
+	int new_status, const char *reason)
+{
+	uint8_t *iid; size_t iid_len;
+	struct command_result *err;
+	err = param_hex_blob(cmd, "factory_instance_id_hex", iid_hex, 32, &iid, &iid_len);
+	if (err) return err;
+	uint8_t *cli; size_t cli_len;
+	err = param_hex_blob(cmd, "client_pubkey_hex", cli_hex, 33, &cli, &cli_len);
+	if (err) return err;
+
+	/* First confirm the row exists + capture its current status so we can
+	 * report it back and reject illegal transitions cleanly. */
+	sqlite3_stmt *st = NULL;
+	if (sqlite3_prepare_v2(ss_plugin_db,
+		"SELECT status FROM lsp_join_queue "
+		"WHERE factory_instance_id = ? AND client_pubkey = ?",
+		-1, &st, NULL) != SQLITE_OK)
+		return reply_sql_fail(cmd, "update_join_queue_status select prepare");
+	sqlite3_bind_blob(st, 1, iid, (int)iid_len, SQLITE_STATIC);
+	sqlite3_bind_blob(st, 2, cli, (int)cli_len, SQLITE_STATIC);
+	int rc = sqlite3_step(st);
+	if (rc != SQLITE_ROW) {
+		sqlite3_finalize(st);
+		return command_fail(cmd, LIGHTNINGD,
+			"no join_queue row for iid+client_pubkey "
+			"(client must have sent JOIN_REQUEST first)");
+	}
+	int current = sqlite3_column_int(st, 0);
+	sqlite3_finalize(st);
+
+	/* Legal transitions:
+	 *   QUEUED(0)   -> ACCEPTED(1) | REJECTED(3)
+	 *   ACCEPTED(1) -> REJECTED(3)   (operator can change mind pre-rotation)
+	 *   SIGNED(2)   -> (nothing; client already in)
+	 *   REJECTED(3) -> ACCEPTED(1)   (operator can change mind)
+	 *   CANCELLED(4) | ALREADY_MEMBER(5) -> (terminal)
+	 */
+	if (current == 2 || current == 4 || current == 5) {
+		return command_fail(cmd, LIGHTNINGD,
+			"join_queue row is in terminal status %d "
+			"(2=SIGNED, 4=CANCELLED, 5=ALREADY_MEMBER); "
+			"no transition possible",
+			current);
+	}
+
+	if (sqlite3_prepare_v2(ss_plugin_db,
+		"UPDATE lsp_join_queue SET status = ?, decided_at_block = ?, "
+		"reason = ? WHERE factory_instance_id = ? AND client_pubkey = ?",
+		-1, &st, NULL) != SQLITE_OK)
+		return reply_sql_fail(cmd, "update_join_queue_status update prepare");
+	sqlite3_bind_int(st, 1, new_status);
+	sqlite3_bind_int(st, 2, (int)ss_state.current_blockheight);
+	if (reason && reason[0]) sqlite3_bind_text(st, 3, reason, -1, SQLITE_STATIC);
+	else sqlite3_bind_null(st, 3);
+	sqlite3_bind_blob(st, 4, iid, (int)iid_len, SQLITE_STATIC);
+	sqlite3_bind_blob(st, 5, cli, (int)cli_len, SQLITE_STATIC);
+	if (!db_step_done(st, "update_join_queue_status"))
+		return command_fail(cmd, LIGHTNINGD, "update_join_queue_status step failed");
+
+	plugin_log(plugin_handle, LOG_INFORM,
+		   "lsp_join_queue: iid=%.8s... client=%.8s... %d -> %d%s%s",
+		   iid_hex, cli_hex, current, new_status,
+		   reason && reason[0] ? " reason=" : "",
+		   reason && reason[0] ? reason : "");
+
+	struct json_stream *js = jsonrpc_stream_success(cmd);
+	json_add_bool(js, "ok", true);
+	json_add_u32(js, "prior_status", (uint32_t)current);
+	json_add_u32(js, "new_status", (uint32_t)new_status);
+	return command_finished(cmd, js);
+}
+
+struct command_result *json_wallet_approve_join_queued(
+	struct command *cmd, const char *buf, const jsmntok_t *params)
+{
+	const char *iid_hex, *cli_hex;
+	if (!param(cmd, buf, params,
+		   p_req("factory_instance_id_hex", param_string, &iid_hex),
+		   p_req("client_pubkey_hex", param_string, &cli_hex),
+		   NULL))
+		return command_param_failed();
+	return update_join_queue_status(cmd, iid_hex, cli_hex, 1 /* ACCEPTED */, NULL);
+}
+
+struct command_result *json_wallet_refuse_join_queued(
+	struct command *cmd, const char *buf, const jsmntok_t *params)
+{
+	const char *iid_hex, *cli_hex;
+	const char *reason = NULL;
+	if (!param(cmd, buf, params,
+		   p_req("factory_instance_id_hex", param_string, &iid_hex),
+		   p_req("client_pubkey_hex", param_string, &cli_hex),
+		   p_opt("reason", param_string, &reason),
+		   NULL))
+		return command_param_failed();
+	return update_join_queue_status(cmd, iid_hex, cli_hex, 3 /* REJECTED */, reason);
+}
+

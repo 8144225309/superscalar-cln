@@ -95,7 +95,7 @@ static void ss_ensure_factory_fee_wired(factory_instance_t *fi)
 }
 
 struct plugin *plugin_handle;
-static superscalar_state_t ss_state;
+superscalar_state_t ss_state;
 static secp256k1_context *global_secp_ctx;
 
 /* Ladder state: manages multi-factory lifecycle with staggered expiry.
@@ -23533,6 +23533,14 @@ static const struct plugin_command commands[] = {
 	{
 		"wallet-status",
 		json_wallet_status,
+	},
+	{
+		"wallet-approve-join-queued",
+		json_wallet_approve_join_queued,
+	},
+	{
+		"wallet-refuse-join-queued",
+		json_wallet_refuse_join_queued,
 	},
 };
 
