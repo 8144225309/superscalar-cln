@@ -28,3 +28,12 @@ tests/.pytest_cache/
 
 # Local-only notes (never commit)
 *_LOCAL.md
+
+# Internal dev notes / migration scripts removed from this repo on 2026-05-22.
+# Kept local-only; never re-add to the public repo.
+LIB_TEAM_NOTE_*.md
+ARCHITECTURE_TWO_DB_ONE_PLUGIN.md
+SIGNING_AVAILABILITY_PROTOCOL.md
+migrate_soupwallet_to_two_dbs.py
+ERROR_CODES.md
+CONFORMANCE.md

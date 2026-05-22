@@ -23646,8 +23646,7 @@ int main(int argc, char *argv[])
 		    plugin_option("libsuperscalar-db-path",
 				  "string",
 				  "Path to libsuperscalar.db (lib-owned protocol state). "
-				  "Default: <CWD>/libsuperscalar.db. Two-DB refactor; "
-				  "see ARCHITECTURE_TWO_DB_ONE_PLUGIN.md.",
+				  "Default: <CWD>/libsuperscalar.db.",
 				  charp_option, charp_jsonfmt,
 				  &ss_lib_db_path_override),
 		    plugin_option("superscalar-cln-db-path",

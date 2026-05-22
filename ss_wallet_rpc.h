@@ -3,14 +3,8 @@
 
 /* ============================================================================
  * ss_wallet_rpc: C implementations of the 20 wallet-* RPCs the Node.js
- * soupwallet-cln-plugin used to expose. Same names, same params, same
- * response shapes — wallet UI doesn't need changes.
- *
- * See ARCHITECTURE_TWO_DB_ONE_PLUGIN.md.
- *
- * Phase 3b ships these handlers; they are NOT registered in commands[]
- * yet (Phase 5 cutover does that simultaneously with removing the
- * sidecar from the lightningd config).
+ * sidecar plugin used to expose. Same names, same params, same response
+ * shapes — wallet UI doesn't need changes.
  * ============================================================================ */
 
 #include <plugins/libplugin.h>

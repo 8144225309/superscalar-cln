@@ -40,8 +40,12 @@
 #define SS_SUBMSG_CEREMONY_STATUS_REPLY   0x014C
 
 /* ------------------------------------------------------------------
- * D.3: signing-availability protocol — client reconnect pull.
- * Per SIGNING_AVAILABILITY_PROTOCOL.md.
+ * Signing-availability protocol — client reconnect pull.
+ * On reconnect a client sends SIGN_QUEUE_REQUEST to ask the LSP for
+ * any ceremonies it was missed during disconnect; the LSP replies with
+ * SIGN_QUEUE_RESPONSE listing the pending proposals so the client can
+ * resume signing. FACTORY_PROPOSE_V2 carries a policy-diff trailer
+ * (used when the LSP re-issues a proposal whose policy has changed).
  * ------------------------------------------------------------------ */
 #define SS_SUBMSG_SIGN_QUEUE_REQUEST      0x014D  /* client -> LSP */
 #define SS_SUBMSG_SIGN_QUEUE_RESPONSE     0x014E  /* LSP -> client */

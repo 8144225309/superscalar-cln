@@ -4,12 +4,13 @@
 /* ============================================================================
  * ss_db: SQLite layer for the two databases owned by the consolidated plugin.
  *
- * Replaces the Node.js soupwallet-cln-plugin's role. See
- * ARCHITECTURE_TWO_DB_ONE_PLUGIN.md for the design rationale.
- *
  * Two databases:
  *   - ss_lib_db        — lib-owned binary state (factory_state BLOBs)
  *   - ss_plugin_db     — plugin-owned policy / coordination state
+ *
+ * Splitting keeps protocol-level state isolated from plugin policy so
+ * the lib team can evolve the lib-owned schema independently of the
+ * plugin's policy/coordination tables.
  *
  * Open / close pair called from plugin init() / shutdown.
  * Both opened with synchronous=FULL and WAL journal mode.
