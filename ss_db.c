@@ -62,7 +62,7 @@ static const char *ss_lib_db_schema_v1[] = {
 	"   updated_at_block      INTEGER NOT NULL"
 	") WITHOUT ROWID;",
 
-	"INSERT OR IGNORE INTO schema_version (version, applied_at) "
+"INSERT OR IGNORE INTO schema_version (version, applied_at) "
 	"VALUES (1, strftime('%s','now'));",
 
 	NULL
@@ -202,6 +202,14 @@ static const char *ss_plugin_db_schema_v1[] = {
 	"   updated_at       INTEGER NOT NULL"
 	");",
 
+	"CREATE TABLE IF NOT EXISTS event_log ("
+	"event_id     INTEGER PRIMARY KEY AUTOINCREMENT, "
+	"type         TEXT NOT NULL, "
+	"factory_iid  BLOB, "
+	"payload_json TEXT NOT NULL, "
+	"created_at   INTEGER NOT NULL);"
+"CREATE INDEX IF NOT EXISTS idx_event_log_factory ON event_log(factory_iid);"
+"CREATE INDEX IF NOT EXISTS idx_event_log_type ON event_log(type);"
 	"INSERT OR IGNORE INTO schema_version (version, applied_at) "
 	"VALUES (1, strftime('%s','now'));",
 
@@ -570,6 +578,55 @@ bool ss_db_upsert_factory_row(const uint8_t iid[32], uint32_t my_role,
 			   sqlite3_errstr(rc));
 		return false;
 	}
+	return true;
+}
+
+/* ============================================================================
+ * Session 5a: event_log helper.
+ *
+ * Append a single row representing a notable factory-or-LSP event so
+ * wallets that aren\'t currently connected can fetch it later via
+ * wallet-list-events-since. The connected-wallet push path (sessions
+ * 5b/c) reads the same table; this keeps live and offline consistent.
+ * ============================================================================ */
+
+bool ss_db_emit_event(const char *type, const uint8_t iid_or_null[32],
+                      const char *payload_json)
+{
+	if (!ss_plugin_db || !type || !payload_json) return false;
+
+	sqlite3_stmt *st = NULL;
+	if (sqlite3_prepare_v2(ss_plugin_db,
+		"INSERT INTO event_log (type, factory_iid, payload_json, created_at) "
+		"VALUES (?, ?, ?, strftime(\'%s\',\'now\'))",
+		-1, &st, NULL) != SQLITE_OK) {
+		plugin_log(plugin_handle, LOG_BROKEN,
+			   "ss_db_emit_event prepare failed: %s",
+			   sqlite3_errmsg(ss_plugin_db));
+		return false;
+	}
+	sqlite3_bind_text(st, 1, type, -1, SQLITE_TRANSIENT);
+	if (iid_or_null)
+		sqlite3_bind_blob(st, 2, iid_or_null, 32, SQLITE_TRANSIENT);
+	else
+		sqlite3_bind_null(st, 2);
+	sqlite3_bind_text(st, 3, payload_json, -1, SQLITE_TRANSIENT);
+
+	int rc = sqlite3_step(st);
+	sqlite3_finalize(st);
+	if (rc != SQLITE_DONE) {
+		plugin_log(plugin_handle, LOG_BROKEN,
+			   "ss_db_emit_event step failed: %s",
+			   sqlite3_errstr(rc));
+		return false;
+	}
+
+	/* Rolling cap: trim oldest if we go above 10000 rows. Best-effort. */
+	sqlite3_exec(ss_plugin_db,
+		"DELETE FROM event_log WHERE event_id < "
+		"(SELECT MAX(event_id) FROM event_log) - 10000",
+		NULL, NULL, NULL);
+
 	return true;
 }
 

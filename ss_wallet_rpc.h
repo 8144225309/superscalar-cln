@@ -74,4 +74,11 @@ struct command_result *json_wallet_get_peer_note(struct command *cmd, const char
 struct command_result *json_wallet_set_peer_reputation(struct command *cmd, const char *buf, const jsmntok_t *params);
 struct command_result *json_wallet_get_peer_reputation(struct command *cmd, const char *buf, const jsmntok_t *params);
 
+
+/* Session 5a (real-time + catchup): offline-friendly event log queries.
+ * Wallets call list-events-since(N) on reconnect to catch up; backend
+ * also polls this to push live updates. */
+struct command_result *json_wallet_list_events_since(struct command *cmd, const char *buf, const jsmntok_t *params);
+struct command_result *json_wallet_get_latest_event_id(struct command *cmd, const char *buf, const jsmntok_t *params);
+
 #endif /* SUPERSCALAR_SS_WALLET_RPC_H */

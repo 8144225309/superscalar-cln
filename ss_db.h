@@ -101,4 +101,16 @@ bool ss_db_upsert_factory_row(const uint8_t iid[32], uint32_t my_role,
                               uint32_t archived);
 
 
+
+
+/* Session 5a (real-time push + offline catchup): append a row to
+ * event_log. Used by C-side handlers to make events visible to
+ * connected wallets (live push) AND queued for offline wallets to
+ * fetch on reconnect via wallet-list-events-since. payload_json must
+ * already be valid JSON (the caller formats it); iid may be NULL for
+ * non-factory events. Returns true on success. */
+bool ss_db_emit_event(const char *type, const uint8_t iid_or_null[32],
+                      const char *payload_json);
+
+
 #endif /* SUPERSCALAR_SS_DB_H */
