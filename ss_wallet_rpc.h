@@ -66,4 +66,12 @@ struct command_result *json_wallet_status(struct command *cmd, const char *buf, 
 struct command_result *json_wallet_approve_join_queued(struct command *cmd, const char *buf, const jsmntok_t *params);
 struct command_result *json_wallet_refuse_join_queued(struct command *cmd, const char *buf, const jsmntok_t *params);
 
+
+/* Session 4 (LSP UI gaps slice D): peer management. */
+struct command_result *json_wallet_list_known_peers(struct command *cmd, const char *buf, const jsmntok_t *params);
+struct command_result *json_wallet_set_peer_note(struct command *cmd, const char *buf, const jsmntok_t *params);
+struct command_result *json_wallet_get_peer_note(struct command *cmd, const char *buf, const jsmntok_t *params);
+struct command_result *json_wallet_set_peer_reputation(struct command *cmd, const char *buf, const jsmntok_t *params);
+struct command_result *json_wallet_get_peer_reputation(struct command *cmd, const char *buf, const jsmntok_t *params);
+
 #endif /* SUPERSCALAR_SS_WALLET_RPC_H */
