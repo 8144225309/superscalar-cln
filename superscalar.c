@@ -622,6 +622,7 @@ static void ss_lsp_sig_queue_load_from_disk(void);
 static bool ss_ceremony_expecting_nonces(const factory_instance_t *fi);
 static bool ss_ceremony_expecting_psigs(const factory_instance_t *fi);
 static void ss_send_factory_abort(struct command *cmd, const char *peer_id_hex, const uint8_t instance_id[32], uint8_t reason);
+static void ss_terminalize_failed(struct command *cmd, factory_instance_t *fi, uint8_t abort_reason);
 
 
 
@@ -2496,7 +2497,7 @@ static struct command_result *withdraw_funding_ok(struct command *cmd,
 	if (!txid_tok) {
 		plugin_log(plugin_handle, LOG_BROKEN,
 			   "withdraw: no txid in response");
-		fi->ceremony = CEREMONY_FAILED;
+		ss_terminalize_failed(cmd, fi, SS_CEREMONY_ABORT_OTHER);
 		return notification_handled(cmd);
 	}
 
@@ -2504,7 +2505,7 @@ static struct command_result *withdraw_funding_ok(struct command *cmd,
 	if (!txid_hex || strlen(txid_hex) != 64) {
 		plugin_log(plugin_handle, LOG_BROKEN,
 			   "withdraw: bad txid hex");
-		fi->ceremony = CEREMONY_FAILED;
+		ss_terminalize_failed(cmd, fi, SS_CEREMONY_ABORT_OTHER);
 		return notification_handled(cmd);
 	}
 
@@ -2550,10 +2551,10 @@ static struct command_result *withdraw_funding_err(struct command *cmd,
 						    void *arg)
 {
 	struct funding_ctx *fctx = (struct funding_ctx *)arg;
-	fctx->fi->ceremony = CEREMONY_FAILED;
 	const char *err_str = json_strdup(tmpctx, buf, result);
 	plugin_log(plugin_handle, LOG_BROKEN,
 		   "withdraw failed: %s", err_str ? err_str : "unknown");
+	ss_terminalize_failed(cmd, fctx->fi, SS_CEREMONY_ABORT_OTHER);
 	return command_hook_success(cmd);
 }
 
@@ -5286,7 +5287,7 @@ static void continue_after_funding(struct command *cmd,
 	if (!factory_sessions_finalize(f)) {
 		plugin_log(plugin_handle, LOG_BROKEN,
 			   "factory_sessions_finalize failed after funding");
-		fi->ceremony = CEREMONY_FAILED;
+		ss_terminalize_failed(cmd, fi, SS_CEREMONY_ABORT_OTHER);
 		return;
 	}
 
@@ -6443,7 +6444,7 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 							free(tmp_f);
 							free(apks);
 							free(cnb);
-							fi->ceremony = CEREMONY_FAILED;
+							ss_terminalize_failed(cmd, fi, SS_CEREMONY_ABORT_OTHER);
 							(void)notification_handled(cmd);
 							return;
 						}
@@ -6473,7 +6474,7 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 							free(tmp_f);
 							free(apks);
 							free(cnb);
-							fi->ceremony = CEREMONY_FAILED;
+							ss_terminalize_failed(cmd, fi, SS_CEREMONY_ABORT_OTHER);
 							(void)notification_handled(cmd);
 							return;
 						}
@@ -10750,6 +10751,7 @@ realloc_all_nonces_done:
 			case FACTORY_LIFECYCLE_CLOSED_UNILATERAL:  lc_name = "closed_unilateral"; break;
 			case FACTORY_LIFECYCLE_CLOSED_BREACHED:    lc_name = "closed_breached"; break;
 			case FACTORY_LIFECYCLE_ABORTED:            lc_name = "aborted"; break;
+			case FACTORY_LIFECYCLE_FAILED:             lc_name = "failed"; break;
 			case FACTORY_LIFECYCLE_AWAITING_JOINS:     lc_name = "awaiting_joins"; break;
 			case FACTORY_LIFECYCLE_READY_TO_TRIGGER:   lc_name = "ready_to_trigger"; break;
 			case FACTORY_LIFECYCLE_CEREMONY_RUNNING:   lc_name = "ceremony_running"; break;
@@ -12458,6 +12460,81 @@ static void ss_send_factory_abort(struct command *cmd,
 }
 
 /* ============================================================================
+ * Task #149: ss_terminalize_failed - move a factory to the FAILED terminal
+ * state and notify peers so client and LSP views converge.
+ *
+ * Use this in place of bare `fi->ceremony = CEREMONY_FAILED` assignments
+ * at ceremony-failure sites (withdraw error, malformed peer message,
+ * internal invariant violation, etc.). It:
+ *
+ *   1. Sets fi->ceremony = CEREMONY_FAILED.
+ *   2. Sets fi->lifecycle = FACTORY_LIFECYCLE_FAILED, so the wallet's
+ *      bucket UI puts the factory in "Failed / abandoned" instead of
+ *      leaving it lingering as a "live" init forever.
+ *   3. Broadcasts CEREMONY_ABORT to known participants - LSP fans out
+ *      to every client; client tells the LSP - so the counterparty stops
+ *      waiting on a ceremony we have given up on (this fixes the d607
+ *      "phantom proposed on the client side" divergence).
+ *   4. Stamps aborted_at_block (reused for failure timestamps) and
+ *      persists.
+ *
+ * No-op if the factory is already in any closed/terminal lifecycle, so
+ * repeated calls from re-entrant error paths are safe.
+ * ============================================================================ */
+static void ss_terminalize_failed(struct command *cmd,
+				  factory_instance_t *fi,
+				  uint8_t abort_reason)
+{
+	if (!fi) return;
+	if (factory_is_closed(fi->lifecycle)) {
+		/* Already terminal; do not re-broadcast or rewrite state. */
+		return;
+	}
+
+	factory_lifecycle_t prior_lc = fi->lifecycle;
+	ceremony_state_t   prior_cer = fi->ceremony;
+
+	fi->ceremony = CEREMONY_FAILED;
+	fi->lifecycle = FACTORY_LIFECYCLE_FAILED;
+	if (!fi->aborted_at_block)
+		fi->aborted_at_block = ss_state.current_blockheight;
+
+	/* Broadcast CEREMONY_ABORT so the counterparty stops tracking this
+	 * factory. LSP side: tell every client. Client side: tell the LSP. */
+	size_t n_notified = 0;
+	char peer_hex[67];
+	if (fi->is_lsp) {
+		for (size_t ci = 0; ci < fi->n_clients; ci++) {
+			for (int j = 0; j < 33; j++)
+				sprintf(peer_hex + j*2, "%02x",
+					fi->clients[ci].node_id[j]);
+			peer_hex[66] = '\0';
+			ss_send_factory_abort(cmd, peer_hex,
+					      fi->instance_id, abort_reason);
+			n_notified++;
+		}
+	} else {
+		for (int j = 0; j < 33; j++)
+			sprintf(peer_hex + j*2, "%02x",
+				fi->lsp_node_id[j]);
+		peer_hex[66] = '\0';
+		ss_send_factory_abort(cmd, peer_hex,
+				      fi->instance_id, abort_reason);
+		n_notified = 1;
+	}
+
+	plugin_log(plugin_handle, LOG_UNUSUAL,
+		   "Terminalized factory %02x%02x%02x%02x: lifecycle %d -> FAILED, "
+		   "ceremony %d -> FAILED, abort_reason=%u, notified %zu peer(s)",
+		   fi->instance_id[0], fi->instance_id[1],
+		   fi->instance_id[2], fi->instance_id[3],
+		   (int)prior_lc, (int)prior_cer,
+		   (unsigned)abort_reason, n_notified);
+
+	ss_save_factory(cmd, fi);
+}
+
+/* ============================================================================
  * Audit #5 follow-up: stale-msg guard for NONCE_BUNDLE / PSIG_BUNDLE.
  *
  * After a plugin restart, the in-memory MuSig2 session_t is gone but the
@@ -13252,6 +13329,7 @@ static struct command_result *json_factory_incoming_joins(struct command *cmd,
 			fi->lifecycle == FACTORY_LIFECYCLE_READY_TO_TRIGGER ? "ready_to_trigger" :
 			fi->lifecycle == FACTORY_LIFECYCLE_CEREMONY_RUNNING ? "ceremony_running" :
 			fi->lifecycle == FACTORY_LIFECYCLE_SIGNED ? "signed" :
+			fi->lifecycle == FACTORY_LIFECYCLE_FAILED ? "failed" :
 			"other");
 
 		json_array_start(js, "joins");
@@ -14754,6 +14832,7 @@ static const char *lifecycle_name_ext(factory_lifecycle_t l)
 	case FACTORY_LIFECYCLE_CLOSED_UNILATERAL:  return "closed_unilateral";
 	case FACTORY_LIFECYCLE_CLOSED_BREACHED:    return "closed_breached";
 	case FACTORY_LIFECYCLE_ABORTED:            return "aborted";
+	case FACTORY_LIFECYCLE_FAILED:             return "failed";
 	case FACTORY_LIFECYCLE_AWAITING_JOINS:     return "awaiting_joins";
 	case FACTORY_LIFECYCLE_READY_TO_TRIGGER:   return "ready_to_trigger";
 	case FACTORY_LIFECYCLE_CEREMONY_RUNNING:   return "ceremony_running";
@@ -22160,6 +22239,35 @@ json_factory_abort_stuck(struct command *cmd,
 	fi->lifecycle = FACTORY_LIFECYCLE_ABORTED;
 	fi->aborted_at_block = ss_state.current_blockheight;
 	ss_save_factory(cmd, fi);
+
+	/* Task #149: broadcast CEREMONY_ABORT to participants so client and LSP
+	 * views converge. Without this, a client with an in-flight ceremony for
+	 * this factory keeps waiting forever (the d607 phantom-PROPOSED bug
+	 * we observed: LSP=aborted but client stuck at ceremony=proposed).
+	 * DEADLINE_PASSED is the closest stock reason for "operator manually
+	 * gave up". Mirrors the LSP/client fan-out in ss_terminalize_failed. */
+	{
+		char peer_hex[67];
+		if (fi->is_lsp) {
+			for (size_t ci = 0; ci < fi->n_clients; ci++) {
+				for (int j = 0; j < 33; j++)
+					sprintf(peer_hex + j*2, "%02x",
+						fi->clients[ci].node_id[j]);
+				peer_hex[66] = '\0';
+				ss_send_factory_abort(cmd, peer_hex,
+					fi->instance_id,
+					SS_CEREMONY_ABORT_DEADLINE_PASSED);
+			}
+		} else {
+			for (int j = 0; j < 33; j++)
+				sprintf(peer_hex + j*2, "%02x",
+					fi->lsp_node_id[j]);
+			peer_hex[66] = '\0';
+			ss_send_factory_abort(cmd, peer_hex,
+				fi->instance_id,
+				SS_CEREMONY_ABORT_DEADLINE_PASSED);
+		}
+	}
 
 	plugin_log(plugin_handle, LOG_UNUSUAL,
 		   "factory-abort-stuck: instance_id=%s lifecycle %d → "

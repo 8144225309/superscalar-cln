@@ -95,6 +95,16 @@ typedef enum {
 	 * Distinguishes "INIT, ceremony hasn't run" (legacy meaning of INIT)
 	 * from "ceremony done, channels pending". */
 	FACTORY_LIFECYCLE_SIGNED = 12,
+
+	/* Task #149: terminal state for a ceremony that failed automatically
+	 * (withdraw failure, malformed peer message, internal error, etc.).
+	 * Distinct from ABORTED, which is operator-initiated via
+	 * factory-abort-stuck. Both are terminal via factory_is_closed().
+	 *
+	 * Set by ss_terminalize_failed(), which also broadcasts CEREMONY_ABORT
+	 * to known participants so client and LSP views converge instead of
+	 * the client lingering at PROPOSED/NONCES_COLLECTED forever. */
+	FACTORY_LIFECYCLE_FAILED = 13,
 } factory_lifecycle_t;
 
 /* Helper: a factory in any closed terminal state should not be scanned,
@@ -106,7 +116,8 @@ static inline bool factory_is_closed(factory_lifecycle_t l) {
 	    || l == FACTORY_LIFECYCLE_CLOSED_COOPERATIVE
 	    || l == FACTORY_LIFECYCLE_CLOSED_UNILATERAL
 	    || l == FACTORY_LIFECYCLE_CLOSED_BREACHED
-	    || l == FACTORY_LIFECYCLE_ABORTED;
+	    || l == FACTORY_LIFECYCLE_ABORTED
+	    || l == FACTORY_LIFECYCLE_FAILED;
 }
 
 /* PR 3: factory is in the deferred-signing pre-ceremony window — created
