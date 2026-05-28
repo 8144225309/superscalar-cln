@@ -493,6 +493,18 @@ typedef struct factory_instance {
 					  * amounts, no chain advance); 0 for
 					  * LEAF_ADVANCE. Memory-only. */
 
+	/* Task #151: client-side ceremony self-timeout. Set when the client
+	 * transitions to an in-flight ceremony state (CEREMONY_PROPOSED on
+	 * receiving FACTORY_PROPOSE), cleared on CEREMONY_COMPLETE. The
+	 * per-block handler in handle_block_added compares this against
+	 * CEREMONY_TIMEOUT_BLOCKS and calls ss_terminalize_failed if the LSP
+	 * has gone silent for too long. Memory-only; 0 = idle / no in-flight
+	 * ceremony tracked. After a plugin restart, an in-flight ceremony's
+	 * timer is reset to 0 — see ss_terminalize_failed's no-op-on-terminal
+	 * guard and the LSP's CEREMONY_ABORT broadcast (#149) which cover
+	 * the cross-restart case. */
+	uint32_t ceremony_started_block;
+
 	/* Cached LEAF_ADVANCE_PROPOSE wire payload + target peer for
 	 * reconnect resume. Mirrors the cached_rotate_propose_wire
 	 * pattern: if the peer drops between PROPOSE-send and PSIG-

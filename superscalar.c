@@ -3023,6 +3023,16 @@ static bool ss_leaf_realloc_propose_parse(const uint8_t *data, size_t len,
  * across a reconnect. */
 #define PS_PENDING_TIMEOUT_BLOCKS 3
 
+/* Task #151: client-side ceremony self-timeout. If the client's ceremony
+ * stays in an in-flight state (PROPOSED / NONCES_COLLECTED / PSIGS_COLLECTED
+ * / FUNDING_PENDING / ROTATING) for more than this many blocks without
+ * reaching COMPLETE, the per-block handler calls ss_terminalize_failed so
+ * the factory leaves the wallet's Live bucket on its own. 36 blocks is
+ * roughly 6 hours on mainnet -- long enough to absorb a normal LSP outage
+ * + reconnect dance, short enough that a dead LSP doesn't strand the client
+ * waiting for days. */
+#define CEREMONY_TIMEOUT_BLOCKS 36
+
 /* --- Task #93: ARITY_2 3-of-3 LEAF_REALLOC wire helpers ---
  *
  * These parallel the 2-of-2 realloc helpers above. Layouts:
@@ -6182,6 +6192,10 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 			}
 
 			fi->ceremony = CEREMONY_PROPOSED;
+			/* Task #151: start the client-side self-timeout
+			 * clock so a silent LSP doesn't strand us in
+			 * PROPOSED forever. */
+			fi->ceremony_started_block = ss_state.current_blockheight;
 			free(pubkeys);
 			free(nb);
 			plugin_log(plugin_handle, LOG_INFORM,
@@ -7401,6 +7415,9 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 			}
 
 			fi->ceremony = CEREMONY_COMPLETE;
+			/* Task #151: clear self-timeout clock now that the
+			 * ceremony completed cleanly. */
+			fi->ceremony_started_block = 0;
 
 			/* Task #92: client-side ceremony complete — promote
 			 * lifecycle to SIGNED so factory-list reports the same
@@ -19953,6 +19970,37 @@ static struct command_result *handle_block_added(struct command *cmd,
 			ss_clear_ps_pending(fi);
 		}
 
+		/* Task #151: client-side ceremony self-timeout. If the LSP
+		 * went silent mid-ceremony and never sent CEREMONY_ABORT
+		 * (legacy LSP, dropped message, or peer process died), the
+		 * client would otherwise sit in PROPOSED/NONCES_COLLECTED/etc
+		 * forever, showing as a phantom in-flight factory. After
+		 * CEREMONY_TIMEOUT_BLOCKS without progress, terminalize from
+		 * the client side -- this also broadcasts CEREMONY_ABORT
+		 * back to the LSP via ss_terminalize_failed, which is a
+		 * no-op on the LSP if it already moved on. */
+		if (!fi->is_lsp
+		    && fi->ceremony_started_block > 0
+		    && (fi->ceremony == CEREMONY_PROPOSED
+		        || fi->ceremony == CEREMONY_NONCES_COLLECTED
+		        || fi->ceremony == CEREMONY_PSIGS_COLLECTED
+		        || fi->ceremony == CEREMONY_FUNDING_PENDING
+		        || fi->ceremony == CEREMONY_ROTATING)
+		    && ss_state.current_blockheight >
+			fi->ceremony_started_block + CEREMONY_TIMEOUT_BLOCKS) {
+			plugin_log(plugin_handle, LOG_UNUSUAL,
+				"SS_METRIC event=client_ceremony_timeout "
+				"iid=%02x%02x%02x%02x ceremony=%d "
+				"started_at=%u current=%u",
+				fi->instance_id[0], fi->instance_id[1],
+				fi->instance_id[2], fi->instance_id[3],
+				(int)fi->ceremony,
+				fi->ceremony_started_block,
+				ss_state.current_blockheight);
+			ss_terminalize_failed(cmd, fi,
+				SS_CEREMONY_ABORT_DEADLINE_PASSED);
+		}
+
 		/* Phase 3c3: lazy retrofit — catch factories whose lib_factory
 		 * was constructed without fee-estimator wiring (persistence
 		 * reload, mid-ceremony rebuild paths). Free when already
@@ -21905,6 +21953,7 @@ json_dev_superscalar_tick(struct command *cmd,
 	 * sweep logic — those are out of scope for this dev RPC and
 	 * would slow down tests. */
 	size_t cleared = 0;
+	size_t ceremony_timeouts = 0;
 	for (size_t i = 0; i < ss_state.n_factories; i++) {
 		factory_instance_t *fi = ss_state.factories[i];
 		if (!fi) continue;
@@ -21921,12 +21970,38 @@ json_dev_superscalar_tick(struct command *cmd,
 			ss_clear_ps_pending(fi);
 			cleared++;
 		}
+		/* Task #151: mirror the handle_block_added client-ceremony
+		 * timeout check here so tests can synthetically tick blocks
+		 * and verify the client self-terminalizes a stalled ceremony. */
+		if (!fi->is_lsp
+		    && fi->ceremony_started_block > 0
+		    && (fi->ceremony == CEREMONY_PROPOSED
+		        || fi->ceremony == CEREMONY_NONCES_COLLECTED
+		        || fi->ceremony == CEREMONY_PSIGS_COLLECTED
+		        || fi->ceremony == CEREMONY_FUNDING_PENDING
+		        || fi->ceremony == CEREMONY_ROTATING)
+		    && ss_state.current_blockheight >
+			fi->ceremony_started_block + CEREMONY_TIMEOUT_BLOCKS) {
+			plugin_log(plugin_handle, LOG_UNUSUAL,
+				"SS_METRIC event=client_ceremony_timeout "
+				"iid=%02x%02x%02x%02x ceremony=%d "
+				"started_at=%u current=%u",
+				fi->instance_id[0], fi->instance_id[1],
+				fi->instance_id[2], fi->instance_id[3],
+				(int)fi->ceremony,
+				fi->ceremony_started_block,
+				ss_state.current_blockheight);
+			ss_terminalize_failed(cmd, fi,
+				SS_CEREMONY_ABORT_DEADLINE_PASSED);
+			ceremony_timeouts++;
+		}
 	}
 
 	struct json_stream *js = jsonrpc_stream_success(cmd);
 	json_add_u32(js, "previous_blockheight", prev);
 	json_add_u32(js, "current_blockheight", height);
 	json_add_u64(js, "ps_pending_cleared", (u64)cleared);
+	json_add_u64(js, "client_ceremony_timeouts", (u64)ceremony_timeouts);
 	return command_finished(cmd, js);
 }
 
