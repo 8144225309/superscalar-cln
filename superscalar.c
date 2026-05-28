@@ -3201,15 +3201,25 @@ static size_t ss_send_factory_ready(struct command *cmd,
 			 payload, payload_len);
 	free(payload);
 
-	/* Task #92: ceremony just completed on the LSP side — promote
-	 * lifecycle out of the in-flight CEREMONY_RUNNING state. Legacy
-	 * factory-create stayed at INIT here (and factory-open-channels
-	 * later promoted INIT → ACTIVE); we add SIGNED for the new
-	 * deferred flow so factory-list distinguishes "tree signed,
-	 * channels pending" from "INIT, ceremony not yet started".
-	 * factory-open-channels accepts both INIT and SIGNED as valid
-	 * starting points and promotes either to ACTIVE. */
-	if (fi->lifecycle == FACTORY_LIFECYCLE_CEREMONY_RUNNING)
+	/* Task #92 + follow-up: the ceremony just completed on the LSP side —
+	 * promote lifecycle to SIGNED so factory-list reports the SAME state on
+	 * the LSP and the client. The client does the identical promotion in its
+	 * FACTORY_READY handler (see SS_SUBMSG_FACTORY_READY below).
+	 *
+	 * Two paths reach here, and BOTH must end at SIGNED:
+	 *   - factory-trigger-ceremony: INIT -> CEREMONY_RUNNING -> (here) SIGNED
+	 *   - factory-create with all client pubkeys known up front: the ceremony
+	 *     runs synchronously inside the create call and never transitions
+	 *     through CEREMONY_RUNNING, so we arrive here still at INIT.
+	 *
+	 * Previously this branch only matched CEREMONY_RUNNING, which stranded
+	 * the create-time path at INIT while the client showed SIGNED. The
+	 * wallet's canOpenChannels gate requires lifecycle == SIGNED, so the
+	 * operator never saw the "Open Channels" button for a factory created
+	 * with a known client set. factory-open-channels accepts INIT and SIGNED
+	 * alike and promotes either to ACTIVE, so widening this is safe. */
+	if (fi->lifecycle == FACTORY_LIFECYCLE_CEREMONY_RUNNING
+	    || fi->lifecycle == FACTORY_LIFECYCLE_INIT)
 		fi->lifecycle = FACTORY_LIFECYCLE_SIGNED;
 	return payload_len;
 }
