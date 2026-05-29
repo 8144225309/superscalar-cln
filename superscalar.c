@@ -22526,6 +22526,27 @@ json_factory_forget(struct command *cmd,
 
 	int prior_lifecycle = (int)fi->lifecycle;
 
+	/* Task #161: persist the removal. Without these DELETEs the
+	 * forgotten factory comes back from disk on next plugin restart
+	 * (ss_load_factories reads from `factories` where archived = 0).
+	 * Best-effort: log on failure but continue with the in-memory
+	 * removal so the operator at least sees the forget take effect
+	 * in this session. */
+	uint8_t iid_copy[32];
+	memcpy(iid_copy, fi->instance_id, 32);
+	if (!ss_db_delete_factory_row(iid_copy)) {
+		plugin_log(plugin_handle, LOG_UNUSUAL,
+			   "factory-forget: ss_db_delete_factory_row failed for "
+			   "%s — forget may not survive plugin restart",
+			   id_hex);
+	}
+	if (!ss_db_delete_factory_state(iid_copy)) {
+		plugin_log(plugin_handle, LOG_UNUSUAL,
+			   "factory-forget: ss_db_delete_factory_state failed "
+			   "for %s — lib-DB factory_state row may be orphaned",
+			   id_hex);
+	}
+
 	/* Remove from in-memory state, free fi. Mirrors the
 	 * factory-confirm-closed reap path. */
 	for (size_t i = factory_slot + 1; i < ss_state.n_factories; i++)
@@ -22541,7 +22562,7 @@ json_factory_forget(struct command *cmd,
 
 	plugin_log(plugin_handle, LOG_UNUSUAL,
 		   "factory-forget: instance_id=%s prior_lifecycle=%d "
-		   "n_factories now %u",
+		   "n_factories now %u (persisted to ss_db)",
 		   id_hex, prior_lifecycle,
 		   (unsigned)ss_state.n_factories);
 

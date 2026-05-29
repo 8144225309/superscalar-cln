@@ -582,6 +582,97 @@ bool ss_db_upsert_factory_row(const uint8_t iid[32], uint32_t my_role,
 	return true;
 }
 
+/* Task #161: hard-delete a factory row from the plugin DB factories
+ * table. Used by factory-forget to make the removal persist across
+ * plugin restarts. ss_load_factories only re-reads rows present here,
+ * so removing the row stops the forgotten factory from coming back.
+ *
+ * Also clears blob keys under wallet_settings (factory_blob:<iid>:*)
+ * so the meta/signed_txs/channels/dist blobs from ss_save_factory don't
+ * linger as orphans. */
+bool ss_db_delete_factory_row(const uint8_t iid[32])
+{
+	if (!ss_plugin_db) return false;
+
+	char iid_hex[65];
+	for (int j = 0; j < 32; j++)
+		sprintf(iid_hex + j*2, "%02x", iid[j]);
+	iid_hex[64] = '\0';
+
+	sqlite3_stmt *st = NULL;
+	if (sqlite3_prepare_v2(ss_plugin_db,
+		"DELETE FROM factories WHERE factory_instance_id = ?",
+		-1, &st, NULL) != SQLITE_OK) {
+		plugin_log(plugin_handle, LOG_BROKEN,
+			   "ss_db_delete_factory_row prepare failed: %s",
+			   sqlite3_errmsg(ss_plugin_db));
+		return false;
+	}
+	sqlite3_bind_blob(st, 1, iid, 32, SQLITE_TRANSIENT);
+	int rc = sqlite3_step(st);
+	sqlite3_finalize(st);
+	if (rc != SQLITE_DONE) {
+		plugin_log(plugin_handle, LOG_BROKEN,
+			   "ss_db_delete_factory_row step failed: %s",
+			   sqlite3_errstr(rc));
+		return false;
+	}
+
+	/* Sweep blob keys in wallet_settings keyed by this iid. The
+	 * pattern is "factory_blob:<iid_hex>:..." -- LIKE prefix match. */
+	st = NULL;
+	if (sqlite3_prepare_v2(ss_plugin_db,
+		"DELETE FROM wallet_settings WHERE setting_key LIKE ?",
+		-1, &st, NULL) == SQLITE_OK) {
+		char like_pat[80];
+		snprintf(like_pat, sizeof(like_pat),
+			 "factory_blob:%s:%%", iid_hex);
+		sqlite3_bind_text(st, 1, like_pat, -1, SQLITE_TRANSIENT);
+		(void)sqlite3_step(st);
+		sqlite3_finalize(st);
+	}
+
+	/* Drop join-queue rows for this factory too (referenced by iid). */
+	st = NULL;
+	if (sqlite3_prepare_v2(ss_plugin_db,
+		"DELETE FROM lsp_join_queue WHERE factory_instance_id = ?",
+		-1, &st, NULL) == SQLITE_OK) {
+		sqlite3_bind_blob(st, 1, iid, 32, SQLITE_TRANSIENT);
+		(void)sqlite3_step(st);
+		sqlite3_finalize(st);
+	}
+
+	return true;
+}
+
+/* Companion to ss_db_delete_factory_row: drop the lib-DB factory_state
+ * row that holds the meta/signed_txs/dist_tx/channels blobs. Without
+ * this, those blobs orphan in the lib DB. */
+bool ss_db_delete_factory_state(const uint8_t iid[32])
+{
+	if (!ss_lib_db) return false;
+
+	sqlite3_stmt *st = NULL;
+	if (sqlite3_prepare_v2(ss_lib_db,
+		"DELETE FROM factory_state WHERE factory_instance_id = ?",
+		-1, &st, NULL) != SQLITE_OK) {
+		plugin_log(plugin_handle, LOG_BROKEN,
+			   "ss_db_delete_factory_state prepare failed: %s",
+			   sqlite3_errmsg(ss_lib_db));
+		return false;
+	}
+	sqlite3_bind_blob(st, 1, iid, 32, SQLITE_TRANSIENT);
+	int rc = sqlite3_step(st);
+	sqlite3_finalize(st);
+	if (rc != SQLITE_DONE) {
+		plugin_log(plugin_handle, LOG_BROKEN,
+			   "ss_db_delete_factory_state step failed: %s",
+			   sqlite3_errstr(rc));
+		return false;
+	}
+	return true;
+}
+
 /* ============================================================================
  * Session 5a: event_log helper.
  *
