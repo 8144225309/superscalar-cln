@@ -101,7 +101,19 @@ bool ss_db_upsert_factory_row(const uint8_t iid[32], uint32_t my_role,
                               uint32_t created_at_block, uint32_t state,
                               uint32_t archived);
 
+/* Task #161: hard-delete a factory from the plugin DB.
+ * Removes the row from `factories`, sweeps blob keys under
+ * `wallet_settings` matching `factory_blob:<iid_hex>:%`, and drops any
+ * `lsp_join_queue` rows for this iid. Used by factory-forget to make
+ * the removal persist across plugin restarts -- ss_load_factories would
+ * otherwise rebuild the in-memory state from the still-present row.
+ * Returns true on success. */
+bool ss_db_delete_factory_row(const uint8_t iid[32]);
 
+/* Companion to ss_db_delete_factory_row: drop the lib DB factory_state
+ * row that holds the meta / signed_txs / dist_tx / channels blobs.
+ * Returns true on success. */
+bool ss_db_delete_factory_state(const uint8_t iid[32]);
 
 
 /* Session 5a (real-time push + offline catchup): append a row to
