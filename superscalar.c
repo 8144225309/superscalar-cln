@@ -22370,6 +22370,120 @@ json_factory_abort_stuck(struct command *cmd,
 	return command_finished(cmd, js);
 }
 
+/* Task #150: factory-forget — hard-remove a factory record from in-memory
+ * state. SAFETY-GATED: refuses unless lifecycle is FAILED or ABORTED AND
+ * the factory has zero on-chain footprint (funding_txid all zeros AND
+ * n_channels == 0).
+ *
+ * Closed/expired factories (EXPIRED, CLOSED_*) carry pre-signed exit /
+ * distribution TXs and breach-watch state the operator may need for
+ * recovery; those MUST stay in the list. factory-forget is for discarding
+ * junk drafts that never touched chain -- not a general "delete factory"
+ * button. The wallet UI's bucket model uses Hide for everything else.
+ *
+ * Mirrors the in-memory cleanup pattern from factory-confirm-closed but
+ * with the zero-footprint check up front. */
+static struct command_result *
+json_factory_forget(struct command *cmd,
+		    const char *buf,
+		    const jsmntok_t *params)
+{
+	const char *id_hex;
+
+	if (!param(cmd, buf, params,
+		   p_req("instance_id", param_string, &id_hex),
+		   NULL))
+		return command_param_failed();
+
+	if (strlen(id_hex) != 64)
+		return command_fail(cmd, LIGHTNINGD,
+				    "Bad instance_id length (need 64 hex chars)");
+
+	uint8_t instance_id[32];
+	for (int j = 0; j < 32; j++) {
+		unsigned int b;
+		if (sscanf(id_hex + j*2, "%02x", &b) != 1)
+			return command_fail(cmd, LIGHTNINGD,
+					    "Bad instance_id hex at byte %d", j);
+		instance_id[j] = (uint8_t)b;
+	}
+
+	/* Find factory + array slot for in-place removal. */
+	factory_instance_t *fi = NULL;
+	size_t factory_slot = SIZE_MAX;
+	for (size_t i = 0; i < ss_state.n_factories; i++) {
+		if (memcmp(ss_state.factories[i]->instance_id,
+			   instance_id, 32) == 0) {
+			fi = ss_state.factories[i];
+			factory_slot = i;
+			break;
+		}
+	}
+	if (!fi)
+		return command_fail(cmd, LIGHTNINGD,
+				    "Factory %s not found", id_hex);
+
+	/* Gate 1: lifecycle must be a terminal *failure* state.
+	 * Closed-* and EXPIRED factories carry pre-signed recovery / exit
+	 * data; refusing those is the whole point of this RPC. */
+	if (fi->lifecycle != FACTORY_LIFECYCLE_FAILED
+	    && fi->lifecycle != FACTORY_LIFECYCLE_ABORTED) {
+		return command_fail(cmd, LIGHTNINGD,
+				    "Factory lifecycle is %d (not FAILED or "
+				    "ABORTED) -- use Hide in the wallet to "
+				    "declutter without dropping recovery data",
+				    (int)fi->lifecycle);
+	}
+
+	/* Gate 2: zero on-chain footprint. */
+	bool has_funding = false;
+	for (int j = 0; j < 32; j++)
+		if (fi->funding_txid[j] != 0) {
+			has_funding = true;
+			break;
+		}
+	if (has_funding)
+		return command_fail(cmd, LIGHTNINGD,
+				    "Factory has a funding TX recorded (txid "
+				    "is non-zero) -- not safe to forget. Funds "
+				    "may be recoverable via the CLTV unilateral "
+				    "exit path; use Hide instead.");
+
+	if (fi->n_channels > 0)
+		return command_fail(cmd, LIGHTNINGD,
+				    "Factory has %zu channel(s); close them "
+				    "first via factory-close, then "
+				    "factory-confirm-closed.",
+				    fi->n_channels);
+
+	int prior_lifecycle = (int)fi->lifecycle;
+
+	/* Remove from in-memory state, free fi. Mirrors the
+	 * factory-confirm-closed reap path. */
+	for (size_t i = factory_slot + 1; i < ss_state.n_factories; i++)
+		ss_state.factories[i - 1] = ss_state.factories[i];
+	ss_state.n_factories--;
+	ss_state.factories[ss_state.n_factories] = NULL;
+
+	if (fi->breach_data) free(fi->breach_data);
+	if (fi->dist_signed_tx) free(fi->dist_signed_tx);
+	if (fi->keyagg_snapshots) free(fi->keyagg_snapshots);
+	free(fi);
+	fi = NULL;
+
+	plugin_log(plugin_handle, LOG_UNUSUAL,
+		   "factory-forget: instance_id=%s prior_lifecycle=%d "
+		   "n_factories now %u",
+		   id_hex, prior_lifecycle,
+		   (unsigned)ss_state.n_factories);
+
+	struct json_stream *js = jsonrpc_stream_success(cmd);
+	json_add_string(js, "instance_id", id_hex);
+	json_add_string(js, "lifecycle", "forgotten");
+	json_add_u32(js, "previous_lifecycle", (uint32_t)prior_lifecycle);
+	return command_finished(cmd, js);
+}
+
 /* Phase 3c2.5c test RPC — full end-to-end: build, reserve, sign,
  * send. Returns {status, psbt, signed_txid} on success. The signed_txid
  * is the CPFP child's txid; operator/test can check bitcoind mempool
@@ -23516,6 +23630,10 @@ static const struct plugin_command commands[] = {
 	{
 		"factory-abort-stuck",
 		json_factory_abort_stuck,
+	},
+	{
+		"factory-forget",
+		json_factory_forget,
 	},
 	{
 		"dev-factory-test-utxo-pick",
