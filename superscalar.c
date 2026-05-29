@@ -94,6 +94,38 @@ static void ss_ensure_factory_fee_wired(factory_instance_t *fi)
 	 * retrofit is fine; it's a free no-op in steady state. */
 }
 
+/* MuSig stateless v0.2 §1 obligation: before releasing a nonce_pool
+ * back to the heap allocator, scrub the secnonce bytes so they can't
+ * be lifted out of freed memory by a later allocation or by a process
+ * memory inspection. Plain free() leaves the bytes intact and the
+ * compiler may dead-store-elide a regular memset() that precedes free.
+ *
+ * We use explicit_bzero() where available (glibc / *BSD); a volatile
+ * memset shim is the portable fallback. After scrubbing, free() the
+ * allocation in the normal way.
+ *
+ * Call this anywhere the plugin would have called free(fi->nonce_pool)
+ * or free(pool) directly. Idempotent on NULL. */
+#if defined(__has_include) && __has_include(<string.h>)
+#include <string.h>
+#endif
+#ifndef HAVE_EXPLICIT_BZERO
+#define HAVE_EXPLICIT_BZERO 1
+#endif
+static void ss_secure_free_nonce_pool(void *pool_ptr)
+{
+	if (!pool_ptr) return;
+#if HAVE_EXPLICIT_BZERO
+	explicit_bzero(pool_ptr, sizeof(musig_nonce_pool_t));
+#else
+	/* Volatile pointer prevents the compiler from optimizing the
+	 * scrub away as a dead store before free(). */
+	volatile unsigned char *p = (volatile unsigned char *)pool_ptr;
+	for (size_t i = 0; i < sizeof(musig_nonce_pool_t); i++) p[i] = 0;
+#endif
+	free(pool_ptr);
+}
+
 struct plugin *plugin_handle;
 superscalar_state_t ss_state;
 static secp256k1_context *global_secp_ctx;
@@ -6048,7 +6080,7 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 			/* Heap-allocate: nonce_bundle_t is ~79KB with 1024 entries */
 			nonce_bundle_t *resp = calloc(1, sizeof(nonce_bundle_t));
 			if (!resp) {
-				free(pool);
+				ss_secure_free_nonce_pool(pool);
 				break;
 			}
 			memcpy(resp->instance_id, fi->instance_id, 32);
@@ -7299,7 +7331,7 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 
 					/* Store dist nonce pool for later signing */
 					/* Reuse nonce_pool — tree signing is done */
-					if (fi->nonce_pool) free(fi->nonce_pool);
+					if (fi->nonce_pool) { ss_secure_free_nonce_pool(fi->nonce_pool); fi->nonce_pool = NULL; fi->n_secnonces = 0; }
 					fi->nonce_pool = dpool;
 					fi->n_secnonces = 1;
 					fi->secnonce_pool_idx[0] = 0;
@@ -7480,7 +7512,7 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 			if (!secp256k1_ec_pubkey_create(ctx, &our_pub, our_sec))
 				break;
 
-			if (fi->nonce_pool) free(fi->nonce_pool);
+			if (fi->nonce_pool) { ss_secure_free_nonce_pool(fi->nonce_pool); fi->nonce_pool = NULL; fi->n_secnonces = 0; }
 			musig_nonce_pool_t *pool = calloc(1,
 				sizeof(musig_nonce_pool_t));
 			musig_nonce_pool_generate(ctx, pool, 1,
@@ -8124,8 +8156,9 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 			}
 
 			if (fi->nonce_pool) {
-				free(fi->nonce_pool);
+				ss_secure_free_nonce_pool(fi->nonce_pool);
 				fi->nonce_pool = NULL;
+				fi->n_secnonces = 0;
 			}
 			musig_nonce_pool_t *pool = calloc(1,
 				sizeof(musig_nonce_pool_t));
@@ -8531,7 +8564,7 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 					size_t rdplen = (size_t)(rdp - rdpayload);
 
 					/* Store nonce pool for dist signing */
-					if (fi->nonce_pool) free(fi->nonce_pool);
+					if (fi->nonce_pool) { ss_secure_free_nonce_pool(fi->nonce_pool); fi->nonce_pool = NULL; fi->n_secnonces = 0; }
 					fi->nonce_pool = rdpool;
 					fi->n_secnonces = 1;
 					fi->secnonce_pool_idx[0] = 0;
@@ -8839,7 +8872,7 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 			if (!secp256k1_ec_pubkey_create(ctx, &our_pub, our_sec))
 				break;
 
-			if (fi->nonce_pool) free(fi->nonce_pool);
+			if (fi->nonce_pool) { ss_secure_free_nonce_pool(fi->nonce_pool); fi->nonce_pool = NULL; fi->n_secnonces = 0; }
 			musig_nonce_pool_t *pool = calloc(1,
 				sizeof(musig_nonce_pool_t));
 			/* Close uses 1 signing session (kickoff root) */
@@ -11480,6 +11513,25 @@ realloc_all_nonces_done:
 				   "(peer not a client of this factory)",
 				   peer_id, inst_hex, rname);
 		}
+
+		/* MuSig stateless v0.2 §3: on receive CEREMONY_ABORT, zero any
+		 * unused secnonces and drop the ceremony's keying material.
+		 * No retry path means there's no reason to keep secnonces
+		 * around; leaving them in heap is a liability if the process
+		 * later crashes and dumps core, or if the heap region is
+		 * reused for an attacker-influenced allocation.
+		 *
+		 * Only zero on incoming abort — outgoing aborts run through
+		 * ss_terminalize_failed which now also calls this helper. */
+		if (fi->nonce_pool) {
+			ss_secure_free_nonce_pool(fi->nonce_pool);
+			fi->nonce_pool = NULL;
+			fi->n_secnonces = 0;
+		}
+		/* v0.2 §1 corollary: scrub the participant seckey copy we
+		 * hold for partial-sign. After abort there's no signing path,
+		 * so the seckey is just sensitive material with no purpose. */
+		explicit_bzero(fi->our_seckey, sizeof(fi->our_seckey));
 		break;
 	}
 
@@ -12615,6 +12667,18 @@ static void ss_terminalize_failed(struct command *cmd,
 		   fi->instance_id[2], fi->instance_id[3],
 		   (int)prior_lc, (int)prior_cer,
 		   (unsigned)abort_reason, n_notified);
+
+	/* MuSig stateless v0.2 §3: ceremony just terminalized → no retry,
+	 * no resume. Zero secnonce pool and the participant seckey copy
+	 * before the next save_factory writes state to disk. Persistence
+	 * already avoids secnonces (see persist.c invariant), but explicit
+	 * scrubbing is the belt-and-suspenders fix the v0.2 doc asks for. */
+	if (fi->nonce_pool) {
+		ss_secure_free_nonce_pool(fi->nonce_pool);
+		fi->nonce_pool = NULL;
+		fi->n_secnonces = 0;
+	}
+	explicit_bzero(fi->our_seckey, sizeof(fi->our_seckey));
 
 	ss_save_factory(cmd, fi);
 }
@@ -13797,7 +13861,7 @@ static struct command_result *ss_kickoff_factory_signing(
 					       lsp_seckey,
 					       &pubkeys[0],
 					       NULL)) {
-			free(pool);
+			ss_secure_free_nonce_pool(pool);
 			free(pubkeys);
 			return command_fail(cmd, LIGHTNINGD,
 					    "Failed to generate nonce pool");
@@ -13808,7 +13872,8 @@ static struct command_result *ss_kickoff_factory_signing(
 		 * Heap-allocate: with 1024 entries nonce_bundle_t is ~79KB */
 		nonce_bundle_t *nb = calloc(1, sizeof(nonce_bundle_t));
 		if (!nb) {
-			free(pool);
+			ss_secure_free_nonce_pool(pool);
+			fi->nonce_pool = NULL;
 			free(pubkeys);
 			return command_fail(cmd, LIGHTNINGD,
 					    "OOM allocating nonce bundle");
@@ -15202,7 +15267,7 @@ static struct command_result *json_factory_close(struct command *cmd,
 	if (!secp256k1_ec_pubkey_create(ctx, &lsp_pub, lsp_seckey))
 		return command_fail(cmd, LIGHTNINGD, "Bad LSP close pubkey");
 
-	if (fi->nonce_pool) free(fi->nonce_pool);
+	if (fi->nonce_pool) { ss_secure_free_nonce_pool(fi->nonce_pool); fi->nonce_pool = NULL; fi->n_secnonces = 0; }
 	musig_nonce_pool_t *pool = calloc(1, sizeof(musig_nonce_pool_t));
 	musig_nonce_pool_generate(ctx, pool, 1, lsp_seckey, &lsp_pub, NULL);
 	fi->nonce_pool = pool;
@@ -15456,10 +15521,11 @@ static struct command_result *json_factory_rotate(struct command *cmd,
 	fi->our_participant_idx = 0;
 	fi->n_secnonces = 0;
 
-	/* Free old nonce pool if any */
+	/* Free old nonce pool if any (v0.2 §1: zero secnonces before release) */
 	if (fi->nonce_pool) {
-		free(fi->nonce_pool);
+		ss_secure_free_nonce_pool(fi->nonce_pool);
 		fi->nonce_pool = NULL;
+		fi->n_secnonces = 0;
 	}
 
 	size_t lsp_node_count = factory_count_nodes_for_participant(factory, 0);
