@@ -22552,6 +22552,189 @@ json_factory_forget(struct command *cmd,
 	return command_finished(cmd, js);
 }
 
+/* Task #98: factory-recover-stuck-openings — scan CLN's listpeerchannels
+ * for channels stuck in OPENINGD whose peer is a member of THIS factory,
+ * and unilateral-close them. Useful when factory-open-channels failed
+ * partway through (peer dropped during fundchannel_complete, PSBT build
+ * failed mid-flight, etc.) and CLN was left with orphaned half-open
+ * channels that won't progress on their own.
+ *
+ * Safety:
+ *  - only operates on the LSP side (refuses on client nodes)
+ *  - only targets channels whose peer pubkey is in fi->clients[*]
+ *  - only acts on state == "OPENINGD" (never CHANNELD_NORMAL or later)
+ *  - idempotent: re-running it after closes complete is a no-op
+ *
+ * Async: the RPC fires the close calls and responds immediately with the
+ * list of channel_ids that were closed (fire-and-log pattern, matching the
+ * warning-close loop in handle_block_added). Operator confirms via a
+ * follow-up listpeerchannels. */
+struct recover_ctx {
+	factory_instance_t *fi;
+	struct command *orig_cmd;
+};
+
+static struct command_result *
+recover_lpc_err(struct command *cmd,
+		const char *method,
+		const char *buf,
+		const jsmntok_t *result,
+		void *arg)
+{
+	struct recover_ctx *ctx = (struct recover_ctx *)arg;
+	const jsmntok_t *msg_tok = json_get_member(buf, result, "message");
+	const char *errmsg = msg_tok
+		? json_strdup(cmd, buf, msg_tok)
+		: "(no message)";
+	plugin_log(plugin_handle, LOG_UNUSUAL,
+		   "factory-recover-stuck-openings: listpeerchannels "
+		   "failed: %s", errmsg);
+	return command_fail(ctx->orig_cmd, LIGHTNINGD,
+			    "listpeerchannels failed: %s", errmsg);
+}
+
+static struct command_result *
+recover_lpc_ok(struct command *cmd,
+	       const char *method,
+	       const char *buf,
+	       const jsmntok_t *result,
+	       void *arg)
+{
+	struct recover_ctx *ctx = (struct recover_ctx *)arg;
+	factory_instance_t *fi = ctx->fi;
+
+	const jsmntok_t *channels_tok =
+		json_get_member(buf, result, "channels");
+	if (!channels_tok || channels_tok->type != JSMN_ARRAY) {
+		return command_fail(ctx->orig_cmd, LIGHTNINGD,
+				    "listpeerchannels: missing channels array");
+	}
+
+	struct json_stream *js = jsonrpc_stream_success(ctx->orig_cmd);
+
+	char inst_hex[65];
+	for (int j = 0; j < 32; j++)
+		sprintf(inst_hex + j*2, "%02x", fi->instance_id[j]);
+	inst_hex[64] = '\0';
+	json_add_string(js, "instance_id", inst_hex);
+
+	json_array_start(js, "closed_channel_ids");
+
+	size_t closed_count = 0;
+	size_t i;
+	const jsmntok_t *ch_tok;
+
+	json_for_each_arr(i, ch_tok, channels_tok) {
+		const jsmntok_t *state_tok =
+			json_get_member(buf, ch_tok, "state");
+		if (!state_tok) continue;
+		if (!json_tok_streq(buf, state_tok, "OPENINGD")) continue;
+
+		const jsmntok_t *peer_tok =
+			json_get_member(buf, ch_tok, "peer_id");
+		if (!peer_tok) continue;
+
+		const char *peer_hex = json_strdup(cmd, buf, peer_tok);
+		if (!peer_hex || strlen(peer_hex) != 66) continue;
+		uint8_t peer_pubkey[33];
+		bool hex_ok = true;
+		for (int j = 0; j < 33; j++) {
+			unsigned int b;
+			if (sscanf(peer_hex + j*2, "%02x", &b) != 1) {
+				hex_ok = false;
+				break;
+			}
+			peer_pubkey[j] = (uint8_t)b;
+		}
+		if (!hex_ok) continue;
+
+		bool is_member = false;
+		for (size_t ci = 0; ci < fi->n_clients; ci++) {
+			if (memcmp(fi->clients[ci].node_id,
+				   peer_pubkey, 33) == 0) {
+				is_member = true;
+				break;
+			}
+		}
+		if (!is_member) continue;
+
+		const jsmntok_t *cid_tok =
+			json_get_member(buf, ch_tok, "channel_id");
+		if (!cid_tok) continue;
+		const char *cid_hex = json_strdup(cmd, buf, cid_tok);
+		if (!cid_hex) continue;
+
+		struct out_req *creq =
+			jsonrpc_request_start(ctx->orig_cmd,
+					      "close",
+					      rpc_done, rpc_err,
+					      ctx->fi);
+		json_add_string(creq->js, "id", cid_hex);
+		json_add_u32(creq->js, "unilateraltimeout", 1);
+		send_outreq(creq);
+
+		json_add_string(js, NULL, cid_hex);
+		closed_count++;
+
+		plugin_log(plugin_handle, LOG_INFORM,
+			   "factory-recover-stuck-openings: closing stuck "
+			   "OPENINGD channel %s (peer %s)",
+			   cid_hex, peer_hex);
+	}
+
+	json_array_end(js);
+	json_add_u64(js, "n_closed", closed_count);
+	plugin_log(plugin_handle, LOG_UNUSUAL,
+		   "factory-recover-stuck-openings: instance_id=%s "
+		   "queued %zu close(s)", inst_hex, closed_count);
+	return command_finished(ctx->orig_cmd, js);
+}
+
+static struct command_result *
+json_factory_recover_stuck_openings(struct command *cmd,
+				    const char *buf,
+				    const jsmntok_t *params)
+{
+	const char *id_hex;
+
+	if (!param(cmd, buf, params,
+		   p_req("instance_id", param_string, &id_hex),
+		   NULL))
+		return command_param_failed();
+
+	if (strlen(id_hex) != 64)
+		return command_fail(cmd, LIGHTNINGD,
+				    "Bad instance_id length (need 64 hex chars)");
+
+	uint8_t instance_id[32];
+	for (int j = 0; j < 32; j++) {
+		unsigned int b;
+		if (sscanf(id_hex + j*2, "%02x", &b) != 1)
+			return command_fail(cmd, LIGHTNINGD,
+					    "Bad instance_id hex at byte %d", j);
+		instance_id[j] = (uint8_t)b;
+	}
+
+	factory_instance_t *fi = ss_factory_find(&ss_state, instance_id);
+	if (!fi)
+		return command_fail(cmd, LIGHTNINGD,
+				    "Factory %s not found", id_hex);
+
+	if (!fi->is_lsp)
+		return command_fail(cmd, LIGHTNINGD,
+				    "Only the LSP runs channel-open recovery "
+				    "(this node is on the client side)");
+
+	struct recover_ctx *ctx = tal(cmd, struct recover_ctx);
+	ctx->fi = fi;
+	ctx->orig_cmd = cmd;
+
+	struct out_req *req =
+		jsonrpc_request_start(cmd, "listpeerchannels",
+				      recover_lpc_ok, recover_lpc_err, ctx);
+	return send_outreq(req);
+}
+
 /* Phase 3c2.5c test RPC — full end-to-end: build, reserve, sign,
  * send. Returns {status, psbt, signed_txid} on success. The signed_txid
  * is the CPFP child's txid; operator/test can check bitcoind mempool
@@ -23702,6 +23885,10 @@ static const struct plugin_command commands[] = {
 	{
 		"factory-forget",
 		json_factory_forget,
+	},
+	{
+		"factory-recover-stuck-openings",
+		json_factory_recover_stuck_openings,
 	},
 	{
 		"dev-factory-test-utxo-pick",
