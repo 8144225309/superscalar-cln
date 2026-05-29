@@ -12324,6 +12324,74 @@ static struct command_result *json_client_list_held_proposals(
 	return command_finished(cmd, js);
 }
 
+/* Task #152: client-list-outgoing-joins -- surface ss_state.outgoing_joins
+ * as JSON so the wallet can render the "My join attempts" view (every
+ * factory-join-request we sent + its current status). Data lives plugin-
+ * side already; this RPC just exposes the snapshot. No params. */
+static struct command_result *json_client_list_outgoing_joins(
+	struct command *cmd, const char *buf UNUSED, const jsmntok_t *params)
+{
+	if (!param(cmd, buf, params, NULL))
+		return command_param_failed();
+
+	struct json_stream *js = jsonrpc_stream_success(cmd);
+	json_array_start(js, "joins");
+
+	for (size_t i = 0; i < ss_state.n_outgoing_joins; i++) {
+		const outgoing_join_t *o = &ss_state.outgoing_joins[i];
+
+		json_object_start(js, NULL);
+
+		char iid_hex[65];
+		for (int j = 0; j < 32; j++)
+			sprintf(iid_hex + j*2, "%02x", o->instance_id[j]);
+		iid_hex[64] = '\0';
+		json_add_string(js, "instance_id", iid_hex);
+
+		char lsp_hex[67];
+		for (int j = 0; j < 33; j++)
+			sprintf(lsp_hex + j*2, "%02x", o->lsp_node_id[j]);
+		lsp_hex[66] = '\0';
+		json_add_string(js, "lsp_node_id", lsp_hex);
+
+		json_add_u64(js, "request_id", o->request_id);
+		json_add_u64(js, "contribution_sats", o->contribution_sats);
+		json_add_u32(js, "sent_at_block", o->sent_at_block);
+		json_add_u32(js, "expected_signing_block", o->expected_signing_block);
+		json_add_u32(js, "updated_at_block", o->updated_at_block);
+
+		const char *status_name;
+		switch (o->status) {
+		case OUTGOING_JOIN_SENT:           status_name = "sent"; break;
+		case OUTGOING_JOIN_QUEUED:         status_name = "queued"; break;
+		case OUTGOING_JOIN_ACCEPTED:       status_name = "accepted"; break;
+		case OUTGOING_JOIN_SIGNED:         status_name = "signed"; break;
+		case OUTGOING_JOIN_REJECTED:       status_name = "rejected"; break;
+		case OUTGOING_JOIN_CANCELLED:      status_name = "cancelled"; break;
+		case OUTGOING_JOIN_TIMEOUT:        status_name = "timeout"; break;
+		case OUTGOING_JOIN_ALREADY_MEMBER: status_name = "already_member"; break;
+		default:                           status_name = "unknown"; break;
+		}
+		json_add_string(js, "status", status_name);
+		json_add_u32(js, "status_code", (uint32_t)o->status);
+
+		/* reason is a 64-byte C-string; emit only if populated. */
+		if (o->reason[0] != 0) {
+			/* Defensive: make sure it's NUL-terminated for the
+			 * length of the field. */
+			char reason_buf[65];
+			memcpy(reason_buf, o->reason, 64);
+			reason_buf[64] = '\0';
+			json_add_string(js, "reason", reason_buf);
+		}
+
+		json_object_end(js);
+	}
+
+	json_array_end(js);
+	return command_finished(cmd, js);
+}
+
 static struct command_result *json_client_list_recent_sign_queue_events(
 	struct command *cmd, const char *buf UNUSED, const jsmntok_t *params)
 {
@@ -23548,6 +23616,10 @@ static const struct plugin_command commands[] = {
 	{
 		"client-list-held-proposals",
 		json_client_list_held_proposals,
+	},
+	{
+		"client-list-outgoing-joins",
+		json_client_list_outgoing_joins,
 	},
 	{
 		"factory-get-cached-policy",
