@@ -21685,26 +21685,35 @@ static struct command_result *json_factory_confirm_closed(struct command *cmd,
 		}
 	}
 
-	/* Task #84: wallet.db cleanup on factory-close.
+	/* Task #162: persist the removal. The earlier comment here claimed
+	 * stale rows were "harmless because iids never repeat" — but that's
+	 * wrong with respect to ss_load_factories, which re-reads the
+	 * factories table and would resurrect the reaped factory on the next
+	 * plugin restart. Same fix pattern as #161 (json_factory_forget):
+	 * DELETE the row from ss_db.factories + ss_lib_db.factory_state, and
+	 * sweep blob keys in wallet_settings + any lsp_join_queue rows.
 	 *
-	 * The previous datastore path issued `deldatastore` per key under
-	 * `superscalar/factories/<iid>/*`. With persistence moved to
-	 * wallet.db, the C plugin doesn't write directly — the Node-side
-	 * wallet plugin owns writes. There's no dedicated wallet-delete-
-	 * factory RPC yet; until one lands, stale rows for reaped factories
-	 * linger in wallet.db (a few KB per factory; harmless because iids
-	 * never repeat — `factory_blob:<iid>:*` keys never collide with a
-	 * future factory). Operator can DELETE manually via sqlite3 if
-	 * grooming the file matters. */
+	 * Best-effort: log on failure but continue with the in-memory removal
+	 * so the operator at least sees the reap take effect in this session. */
 	char iid_hex[65];
 	for (int j = 0; j < 32; j++)
 		sprintf(iid_hex + j*2, "%02x", fi->instance_id[j]);
 	iid_hex[64] = '\0';
-	plugin_log(plugin_handle, LOG_DBG,
-		   "factory-reap %s: in-memory removal; wallet.db rows "
-		   "(factories, lsp_join_queue, wallet_settings:factory_blob:%s:*) "
-		   "left in place — harmless because iids never repeat",
-		   iid_hex, iid_hex);
+
+	uint8_t iid_copy[32];
+	memcpy(iid_copy, fi->instance_id, 32);
+	if (!ss_db_delete_factory_row(iid_copy)) {
+		plugin_log(plugin_handle, LOG_UNUSUAL,
+			   "factory-confirm-closed: ss_db_delete_factory_row "
+			   "failed for %s — reap may not survive plugin restart",
+			   iid_hex);
+	}
+	if (!ss_db_delete_factory_state(iid_copy)) {
+		plugin_log(plugin_handle, LOG_UNUSUAL,
+			   "factory-confirm-closed: ss_db_delete_factory_state "
+			   "failed for %s — lib-DB factory_state row may be orphaned",
+			   iid_hex);
+	}
 
 	/* Capture lifecycle for the log message before we free fi. */
 	int prior_lifecycle = (int)fi->lifecycle;
@@ -21741,7 +21750,7 @@ static struct command_result *json_factory_confirm_closed(struct command *cmd,
 
 	plugin_log(plugin_handle, LOG_INFORM,
 		   "factory-confirm-closed: reaped factory %s "
-		   "(was in lifecycle %d; force=%d)",
+		   "(was in lifecycle %d; force=%d) — persisted to ss_db",
 		   iid_hex, prior_lifecycle, *force ? 1 : 0);
 
 	struct json_stream *js = jsonrpc_stream_success(cmd);
