@@ -546,6 +546,10 @@ typedef struct factory_instance {
 	uint32_t creation_block;	/* Block height at creation */
 	uint32_t expiry_block;		/* Absolute block height of factory expiry */
 	uint16_t early_warning_time;	/* Blocks before expiry to warn */
+	/* C1: configurable lifetime from factory-create (lifetime_blocks /
+	 * dying_period_blocks). 0 = use the legacy 4320 / 432 defaults. */
+	uint32_t cfg_active_blocks;
+	uint32_t cfg_dying_blocks;
 
 	/* Channel mappings */
 	channel_leaf_map_t channels[MAX_FACTORY_PARTICIPANTS];

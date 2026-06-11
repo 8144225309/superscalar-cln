@@ -5285,7 +5285,9 @@ static void continue_after_funding(struct command *cmd,
 		factory_set_funding(new_f, fi->funding_txid,
 			fi->funding_outnum, fi->funding_amount_sats,
 			fi->funding_spk, fi->funding_spk_len);
-		factory_set_lifecycle(new_f, fi->creation_block, 4320, 432);
+		factory_set_lifecycle(new_f, fi->creation_block,
+			fi->cfg_active_blocks ? fi->cfg_active_blocks : 4320,
+			fi->cfg_dying_blocks ? fi->cfg_dying_blocks : 432);
 		factory_build_tree(new_f);
 
 		/* Re-apply per-client allocations on the LSP's rebuilt tree.
@@ -14114,6 +14116,14 @@ static struct command_result *json_factory_create(struct command *cmd,
 	 * factory-join-request flow and fires factory-trigger-ceremony when
 	 * ready. Default false preserves the legacy synchronous behavior. */
 	bool *defer_signing_opt = NULL;
+	/* C1: the wallet's factory-create screen sends a rich param set. Accept
+	 * all of it so the advanced UI stops getting "-32602 unknown parameter",
+	 * map leaf_channel_type -> arity, and wire the lifetime knobs. The arity/
+	 * epoch sizing params are accepted and reserved for follow-up wiring. */
+	u32 *lifetime_blocks_opt = NULL, *dying_period_blocks_opt = NULL;
+	u32 *epoch_count_opt = NULL, *leaf_arity_opt = NULL;
+	u32 *ps_subfactory_arity_opt = NULL, *block_early_count_opt = NULL;
+	const char *leaf_channel_type_str = NULL;
 	if (!param(cmd, buf, params,
 		   p_req("funding_sats", param_u64, &funding_sats),
 		   p_req("clients", param_array, &clients_tok),
@@ -14121,6 +14131,13 @@ static struct command_result *json_factory_create(struct command *cmd,
 		   p_opt("arity_mode", param_string, &arity_mode_str),
 		   p_opt("feerate_perkw", param_u32, &feerate_perkw_opt),
 		   p_opt("defer_signing", param_bool, &defer_signing_opt),
+		   p_opt("lifetime_blocks", param_u32, &lifetime_blocks_opt),
+		   p_opt("dying_period_blocks", param_u32, &dying_period_blocks_opt),
+		   p_opt("leaf_channel_type", param_string, &leaf_channel_type_str),
+		   p_opt("epoch_count", param_u32, &epoch_count_opt),
+		   p_opt("leaf_arity", param_u32, &leaf_arity_opt),
+		   p_opt("ps_subfactory_arity", param_u32, &ps_subfactory_arity_opt),
+		   p_opt("block_early_count", param_u32, &block_early_count_opt),
 		   NULL))
 		return command_param_failed();
 
@@ -14147,6 +14164,21 @@ static struct command_result *json_factory_create(struct command *cmd,
 				"arity_mode must be one of: auto, arity_1, "
 				"arity_2, arity_ps (got %s)",
 				arity_mode_str);
+	}
+
+	/* C1: the wallet sends leaf_channel_type instead of arity_mode.
+	 * pseudo-spilman -> arity_ps; ln-penalty has no plugin implementation. */
+	if (leaf_channel_type_str) {
+		if (strcmp(leaf_channel_type_str, "pseudo-spilman") == 0)
+			parsed_arity_mode = 3; /* FACTORY_ARITY_PS */
+		else if (strcmp(leaf_channel_type_str, "ln-penalty") == 0)
+			return command_fail(cmd, LIGHTNINGD,
+				"leaf_channel_type 'ln-penalty' is not implemented "
+				"(use pseudo-spilman, or arity_mode arity_1/arity_2)");
+		else
+			return command_fail(cmd, LIGHTNINGD,
+				"unknown leaf_channel_type: %s",
+				leaf_channel_type_str);
 	}
 
 	/* Gap 8: deterministic instance_id from HSM master key when
@@ -14186,6 +14218,12 @@ static struct command_result *json_factory_create(struct command *cmd,
 	fi->ceremony = CEREMONY_IDLE;
 	fi->arity_mode = parsed_arity_mode;
 	fi->requested_feerate_perkw = feerate_perkw_opt ? *feerate_perkw_opt : 0;
+	/* C1: configurable lifetime (0 = legacy 4320/432 defaults). The other
+	 * sizing params are accepted (the UI sends them) and reserved for wiring. */
+	fi->cfg_active_blocks = lifetime_blocks_opt ? *lifetime_blocks_opt : 0;
+	fi->cfg_dying_blocks = dying_period_blocks_opt ? *dying_period_blocks_opt : 0;
+	(void)epoch_count_opt; (void)leaf_arity_opt;
+	(void)ps_subfactory_arity_opt; (void)block_early_count_opt;
 
 	/* Parse client node IDs */
 	const jsmntok_t *t;
