@@ -207,7 +207,7 @@ Optional leaf-level design variant ([ZmnSCPxj, Delving Bitcoin 2024](https://del
 | Leaf-layer CLTV cost | ~3 days of nSequence | 0 (no relative timelock) |
 | Force-close TX count per leaf | fixed (1 state TX) | O(K) for K liquidity updates |
 | Rebalance quorum | full leaf (1 or 2 clients + LSP) | just the single client + LSP |
-| Old-state protection | shachain hashlock burn (latest state) | structural chaining + chain[0] L-stock hashlock burn |
+| Old-state protection | flat-secret hashlock burn (latest state) | structural chaining + chain[0] L-stock hashlock burn |
 
 **When to choose ARITY_PS**: clients need more of the BOLT CLTV budget for multi-hop routing, or the factory must support frequent per-client liquidity updates without waking the whole tree.
 
