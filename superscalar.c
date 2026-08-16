@@ -8775,27 +8775,29 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 		plugin_log(plugin_handle, LOG_INFORM,
 			   "CLOSE_PROPOSE from %s (len=%zu)",
 			   peer_id, len);
+		/* Client: LSP proposed a cooperative close. Rebuild the
+		 * close TX + its EXPLICIT sighash, stand up a MuSig
+		 * session over the funding-output keyagg (nodes[0]),
+		 * send our nonce, then WAIT for CLOSE_ALL_NONCES before
+		 * signing — mirrors the working DIST_* ceremony. The old
+		 * code signed immediately (before it had the other
+		 * clients' nonces) AND finalized against node 0's TREE
+		 * sighash, so it could never produce a valid signature. */
 		if (len >= 4) {
 			secp256k1_context *ctx = global_secp_ctx;
-
-			/* Parse output distribution */
 			const uint8_t *p = data;
 			uint32_t n_outputs = ((uint32_t)p[0] << 24) |
 				((uint32_t)p[1] << 16) |
 				((uint32_t)p[2] << 8) | p[3];
 			p += 4;
-
 			if (n_outputs > 8) break;
 			tx_output_t outputs[8];
 			for (uint32_t oi = 0; oi < n_outputs; oi++) {
 				if (p + 10 > data + len) break;
 				outputs[oi].amount_sats =
-					((uint64_t)p[0] << 56) |
-					((uint64_t)p[1] << 48) |
-					((uint64_t)p[2] << 40) |
-					((uint64_t)p[3] << 32) |
-					((uint64_t)p[4] << 24) |
-					((uint64_t)p[5] << 16) |
+					((uint64_t)p[0] << 56) | ((uint64_t)p[1] << 48) |
+					((uint64_t)p[2] << 40) | ((uint64_t)p[3] << 32) |
+					((uint64_t)p[4] << 24) | ((uint64_t)p[5] << 16) |
 					((uint64_t)p[6] << 8) | p[7];
 				p += 8;
 				uint16_t spk_len = ((uint16_t)p[0] << 8) | p[1];
@@ -8806,11 +8808,7 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 				p += spk_len;
 			}
 
-			/* Lookup factory by instance_id from nonce_bundle.
-			 * The bundle starts at p; its first 32 bytes are the
-			 * instance_id. Old logic picked the first non-LSP
-			 * factory which fails when the client knows more than
-			 * one factory. */
+			/* Bundle (instance_id + LSP nonce) starts at p. */
 			if (p + 32 > data + len) break;
 			fi = ss_factory_find(&ss_state, p);
 			if (!fi || fi->is_lsp) {
@@ -8819,160 +8817,112 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 					(void *)fi, fi ? fi->is_lsp : -1);
 				break;
 			}
-			factory_t *factory = (factory_t *)fi->lib_factory;
-			if (!factory) break;
+			factory_t *f = (factory_t *)fi->lib_factory;
+			if (!f) break;
 
-			/* Build unsigned close tx to get sighash */
-			tx_buf_t close_tx;
-			unsigned char sighash[32];
-			tx_buf_init(&close_tx, 512);
-
+			/* Build close TX + explicit sighash; stash both on the
+			 * factory (reused dist_* scratch — factory terminating). */
+			tx_buf_init(&f->dist_unsigned_tx, 512);
 			if (!factory_build_cooperative_close_unsigned(
-				factory, &close_tx, sighash,
+				f, &f->dist_unsigned_tx, f->dist_sighash,
 				outputs, n_outputs,
 				ss_state.current_blockheight)) {
 				plugin_log(plugin_handle, LOG_BROKEN,
 					   "Client: close tx build failed");
-				tx_buf_free(&close_tx);
 				break;
 			}
-
+			f->dist_tx_ready = 1;
 			plugin_log(plugin_handle, LOG_INFORM,
 				   "Client: close tx built (%zu bytes)",
-				   close_tx.len);
+				   f->dist_unsigned_tx.len);
 
-			/* Parse LSP nonces from remainder (heap alloc: 79KB struct) */
+			/* Parse LSP nonce from the bundle at p. */
 			size_t hdr_consumed = (size_t)(p - data);
-			if (hdr_consumed < len) {
-				nonce_bundle_t *cnb = calloc(1, sizeof(*cnb));
-				if (!cnb) break;
-				if (nonce_bundle_deserialize(cnb,
-					p, len - hdr_consumed)) {
-					factory_session_init_node(factory, 0);
-
-					for (size_t e = 0; e < cnb->n_entries; e++) {
-						secp256k1_musig_pubnonce pn;
-						musig_pubnonce_parse(ctx, &pn,
-							cnb->entries[e].pubnonce);
-						factory_session_set_nonce(factory,
-							cnb->entries[e].node_idx,
-							cnb->entries[e].signer_slot,
-							&pn);
-					}
+			secp256k1_musig_pubnonce lsp_nonce;
+			int have_lsp_nonce = 0;
+			nonce_bundle_t *cnb = calloc(1, sizeof(*cnb));
+			if (cnb) {
+				if (nonce_bundle_deserialize(cnb, p, len - hdr_consumed)
+				    && cnb->n_entries > 0) {
+					if (musig_pubnonce_parse(ctx, &lsp_nonce,
+						cnb->entries[0].pubnonce))
+						have_lsp_nonce = 1;
 				}
 				free(cnb);
 			}
 
-			/* Generate our nonces */
+			/* Generate our nonce for the close. */
 			int our_idx = fi->our_participant_idx;
 			unsigned char our_sec[32];
 			derive_factory_seckey(our_sec, fi->instance_id, our_idx);
-
 			secp256k1_pubkey our_pub;
 			if (!secp256k1_ec_pubkey_create(ctx, &our_pub, our_sec))
 				break;
 
 			if (fi->nonce_pool) { ss_secure_free_nonce_pool(fi->nonce_pool); fi->nonce_pool = NULL; fi->n_secnonces = 0; }
-			musig_nonce_pool_t *pool = calloc(1,
-				sizeof(musig_nonce_pool_t));
-			/* Close uses 1 signing session (kickoff root) */
-			musig_nonce_pool_generate(ctx, pool, 1,
-				our_sec, &our_pub, NULL);
+			musig_nonce_pool_t *pool = calloc(1, sizeof(musig_nonce_pool_t));
+			musig_nonce_pool_generate(ctx, pool, 1, our_sec, &our_pub, NULL);
 			fi->nonce_pool = pool;
 			fi->n_secnonces = 0;
-
 			secp256k1_musig_secnonce *sec;
 			secp256k1_musig_pubnonce pub;
 			musig_nonce_pool_next(pool, &sec, &pub);
 			fi->secnonce_pool_idx[0] = 0;
-			fi->secnonce_node_idx[0] = 0;
+			fi->secnonce_node_idx[0] = f->n_nodes;
 			fi->n_secnonces = 1;
-			factory_session_set_nonce(factory, 0, our_idx, &pub);
 
-			/* Send CLOSE_NONCE (heap alloc: 79KB struct) */
+			/* Standalone close session over the funding keyagg. */
+			musig_signing_session_t *csess = calloc(1, sizeof(musig_signing_session_t));
+			musig_session_init(csess, &f->nodes[0].keyagg, f->n_participants);
+			int lsp_slot = factory_find_signer_slot(f, 0, 0);
+			if (have_lsp_nonce && lsp_slot >= 0)
+				musig_session_set_pubnonce(csess, (size_t)lsp_slot, &lsp_nonce);
+			musig_session_set_pubnonce(csess, our_idx, &pub);
+			if (fi->dist_session) free(fi->dist_session);
+			fi->dist_session = csess;
+
+			/* Send CLOSE_NONCE (our pubnonce). */
 			{
 				nonce_bundle_t *nresp = calloc(1, sizeof(*nresp));
 				if (!nresp) break;
 				memcpy(nresp->instance_id, fi->instance_id, 32);
-				nresp->n_participants = 2;
+				nresp->n_participants = 1 + fi->n_clients;
 				nresp->n_nodes = 1;
 				nresp->n_entries = 1;
-				nresp->entries[0].node_idx = 0;
+				nresp->entries[0].node_idx = f->n_nodes;
 				nresp->entries[0].signer_slot = our_idx;
 				musig_pubnonce_serialize(ctx,
 					nresp->entries[0].pubnonce, &pub);
-
 				uint8_t nbuf[MAX_WIRE_BUF];
-				size_t nlen = nonce_bundle_serialize(nresp,
-					nbuf, sizeof(nbuf));
+				size_t nlen = nonce_bundle_serialize(nresp, nbuf, sizeof(nbuf));
 				send_factory_msg(cmd, peer_id,
-						 SS_SUBMSG_CLOSE_NONCE,
-						 nbuf, nlen);
+						 SS_SUBMSG_CLOSE_NONCE, nbuf, nlen);
 				free(nresp);
 			}
 
-			/* Finalize node 0 and create partial sig */
-			factory_session_finalize_node(factory, 0);
-
-			secp256k1_keypair kp;
-			if (!secp256k1_keypair_create(ctx, &kp, our_sec))
-				break;
-
-			musig_nonce_pool_t *sp =
-				(musig_nonce_pool_t *)fi->nonce_pool;
-			secp256k1_musig_secnonce *sn =
-				&sp->nonces[0].secnonce;
-
-			secp256k1_musig_partial_sig psig;
-			if (musig_create_partial_sig(ctx, &psig, sn, &kp,
-				&factory->nodes[0].signing_session)) {
-
-				nonce_bundle_t *presp = calloc(1, sizeof(*presp));
-				if (presp) {
-					memcpy(presp->instance_id, fi->instance_id, 32);
-					presp->n_participants = 2;
-					presp->n_nodes = 1;
-					presp->n_entries = 1;
-					presp->entries[0].node_idx = 0;
-					presp->entries[0].signer_slot = our_idx;
-					musig_partial_sig_serialize(ctx,
-						presp->entries[0].pubnonce, &psig);
-
-					uint8_t pbuf[MAX_WIRE_BUF];
-					size_t plen = nonce_bundle_serialize(presp,
-						pbuf, sizeof(pbuf));
-					send_factory_msg(cmd, peer_id,
-						SS_SUBMSG_CLOSE_PSIG,
-						pbuf, plen);
-					free(presp);
-
-					plugin_log(plugin_handle, LOG_INFORM,
-						   "Client: sent CLOSE_NONCE + CLOSE_PSIG");
-				}
-			}
-
-			tx_buf_free(&close_tx);
 			fi->lifecycle = FACTORY_LIFECYCLE_DYING;
+			plugin_log(plugin_handle, LOG_INFORM,
+				   "Client: sent CLOSE_NONCE, waiting for CLOSE_ALL_NONCES");
 		}
 		break;
 
 	case SS_SUBMSG_CLOSE_NONCE:
 		plugin_log(plugin_handle, LOG_INFORM,
-			   "CLOSE_NONCE from %s (len=%zu)",
-			   peer_id, len);
+			   "CLOSE_NONCE from %s (len=%zu)", peer_id, len);
+		/* LSP: client sent its close nonce. Set on session, cache
+		 * for CLOSE_ALL_NONCES, and when ALL are in finalize +
+		 * broadcast the full nonce set so clients can sign. */
 		if (fi && fi->is_lsp) {
 			nonce_bundle_t *cnb = calloc(1, sizeof(*cnb));
 			if (!cnb) break;
-			if (!nonce_bundle_deserialize(cnb, data, len)) {
-				plugin_log(plugin_handle, LOG_UNUSUAL,
-					   "CLOSE_NONCE: deserialize failed");
-				free(cnb);
-				break;
-			}
+			if (!nonce_bundle_deserialize(cnb, data, len)) { free(cnb); break; }
 			factory_t *f = (factory_t *)fi->lib_factory;
-			if (!f) {
-				free(cnb);
-				break;
+			if (!f) { free(cnb); break; }
+			musig_signing_session_t *csess =
+				(musig_signing_session_t *)fi->dist_session;
+			if (!csess) {
+				plugin_log(plugin_handle, LOG_BROKEN, "LSP: no close session");
+				free(cnb); break;
 			}
 
 			for (size_t e = 0; e < cnb->n_entries; e++) {
@@ -8980,170 +8930,283 @@ static void dispatch_superscalar_submsg(struct command *cmd,
 				if (!musig_pubnonce_parse(global_secp_ctx, &pn,
 					cnb->entries[e].pubnonce))
 					continue;
-				factory_session_set_nonce(f,
-					cnb->entries[e].node_idx,
+				musig_session_set_pubnonce(csess,
 					cnb->entries[e].signer_slot, &pn);
+				if (fi->cached_nonces) {
+					nonce_entry_t *cache = (nonce_entry_t *)fi->cached_nonces;
+					if (fi->n_cached_nonces < fi->cached_nonces_cap) {
+						cache[fi->n_cached_nonces] = cnb->entries[e];
+						fi->n_cached_nonces++;
+					}
+				}
+			}
+
+			if (strlen(peer_id) == 66) {
+				uint8_t pid[33];
+				for (int j = 0; j < 33; j++) {
+					unsigned int b; sscanf(peer_id + j*2, "%02x", &b);
+					pid[j] = (uint8_t)b;
+				}
+				client_state_t *cl = ss_factory_find_client(fi, pid);
+				if (cl) cl->nonce_received = true;
+				else if (fi->n_clients == 1) fi->clients[0].nonce_received = true;
+			}
+
+			if (ss_factory_all_nonces_received(fi)) {
+				if (!musig_session_finalize_nonces(global_secp_ctx,
+					csess, f->dist_sighash, NULL, NULL)) {
+					plugin_log(plugin_handle, LOG_BROKEN,
+						   "LSP: close session finalize failed after all nonces");
+					free(cnb); break;
+				}
+				plugin_log(plugin_handle, LOG_INFORM, "LSP: close nonces finalized");
+				nonce_bundle_t *all_nb = calloc(1, sizeof(*all_nb));
+				if (all_nb) {
+					memcpy(all_nb->instance_id, fi->instance_id, 32);
+					all_nb->n_participants = 1 + fi->n_clients;
+					all_nb->n_nodes = 1;
+					nonce_entry_t *cache = (nonce_entry_t *)fi->cached_nonces;
+					size_t nc = fi->n_cached_nonces;
+					if (nc > MAX_NONCE_ENTRIES) nc = MAX_NONCE_ENTRIES;
+					if (cache) memcpy(all_nb->entries, cache, nc * sizeof(nonce_entry_t));
+					all_nb->n_entries = nc;
+					uint8_t *anbuf = calloc(1, MAX_WIRE_BUF);
+					if (anbuf) {
+						size_t anlen = nonce_bundle_serialize(all_nb, anbuf, MAX_WIRE_BUF);
+						for (size_t ci = 0; ci < fi->n_clients; ci++) {
+							char nid[67];
+							for (int j = 0; j < 33; j++)
+								sprintf(nid+j*2, "%02x", fi->clients[ci].node_id[j]);
+							nid[66] = '\0';
+							send_factory_msg(cmd, nid,
+								SS_SUBMSG_CLOSE_ALL_NONCES, anbuf, anlen);
+						}
+						plugin_log(plugin_handle, LOG_INFORM,
+							"LSP: sent CLOSE_ALL_NONCES to %zu clients (%zu entries)",
+							fi->n_clients, nc);
+						free(anbuf);
+					}
+					free(all_nb);
+				}
+			} else {
+				plugin_log(plugin_handle, LOG_INFORM,
+					   "LSP: close nonce cached, waiting for more");
 			}
 			free(cnb);
-
-			if (!factory_session_finalize_node(f, 0))
-				plugin_log(plugin_handle, LOG_BROKEN,
-					   "LSP: close finalize failed");
-			else
-				plugin_log(plugin_handle, LOG_INFORM,
-					   "LSP: close nonces finalized");
 		}
 		break;
 
 	case SS_SUBMSG_CLOSE_ALL_NONCES:
 		plugin_log(plugin_handle, LOG_INFORM,
-			   "CLOSE_ALL_NONCES from %s", peer_id);
+			   "CLOSE_ALL_NONCES from %s (len=%zu)", peer_id, len);
+		/* Client: LSP broadcast the full close nonce set. Re-init
+		 * the session with every nonce, finalize against our close
+		 * sighash, sign, and send CLOSE_PSIG. */
+		if (fi && !fi->is_lsp) {
+			nonce_bundle_t *anb = calloc(1, sizeof(*anb));
+			if (!anb) break;
+			if (!nonce_bundle_deserialize(anb, data, len)) { free(anb); break; }
+			factory_t *f = (factory_t *)fi->lib_factory;
+			if (!f) { free(anb); break; }
+			musig_signing_session_t *csess =
+				(musig_signing_session_t *)fi->dist_session;
+			if (!csess) { free(anb); break; }
+
+			musig_session_init(csess, &f->nodes[0].keyagg, f->n_participants);
+			for (size_t e = 0; e < anb->n_entries; e++) {
+				secp256k1_musig_pubnonce pn;
+				if (!musig_pubnonce_parse(global_secp_ctx, &pn,
+					anb->entries[e].pubnonce))
+					continue;
+				musig_session_set_pubnonce(csess,
+					anb->entries[e].signer_slot, &pn);
+			}
+			if (!musig_session_finalize_nonces(global_secp_ctx,
+				csess, f->dist_sighash, NULL, NULL)) {
+				plugin_log(plugin_handle, LOG_BROKEN,
+					   "Client: close finalize after ALL failed");
+				free(anb); break;
+			}
+
+			int our_idx = fi->our_participant_idx;
+			unsigned char our_sec[32];
+			derive_factory_seckey(our_sec, fi->instance_id, our_idx);
+			secp256k1_keypair kp;
+			if (!secp256k1_keypair_create(global_secp_ctx, &kp, our_sec)) { free(anb); break; }
+			musig_nonce_pool_t *pool = (musig_nonce_pool_t *)fi->nonce_pool;
+			if (!pool || fi->n_secnonces == 0) { free(anb); break; }
+			secp256k1_musig_secnonce *sec =
+				&pool->nonces[fi->secnonce_pool_idx[0]].secnonce;
+			secp256k1_musig_partial_sig psig;
+			if (!musig_create_partial_sig(global_secp_ctx, &psig, sec, &kp, csess)) {
+				free(anb); break;
+			}
+
+			nonce_bundle_t *presp = calloc(1, sizeof(*presp));
+			if (!presp) { free(anb); break; }
+			memcpy(presp->instance_id, fi->instance_id, 32);
+			presp->n_participants = anb->n_participants;
+			presp->n_nodes = 1;
+			presp->n_entries = 1;
+			presp->entries[0].node_idx = f->n_nodes;
+			presp->entries[0].signer_slot = our_idx;
+			musig_partial_sig_serialize(global_secp_ctx,
+				presp->entries[0].pubnonce, &psig);
+			uint8_t *pbuf = calloc(1, MAX_WIRE_BUF);
+			if (pbuf) {
+				size_t plen = nonce_bundle_serialize(presp, pbuf, MAX_WIRE_BUF);
+				send_factory_msg(cmd, peer_id, SS_SUBMSG_CLOSE_PSIG, pbuf, plen);
+				plugin_log(plugin_handle, LOG_INFORM, "Client: sent CLOSE_PSIG after ALL");
+				free(pbuf);
+			}
+			free(presp);
+			free(anb);
+		}
 		break;
 
 	case SS_SUBMSG_CLOSE_PSIG:
 		plugin_log(plugin_handle, LOG_INFORM,
-			   "CLOSE_PSIG from %s (len=%zu)",
-			   peer_id, len);
-		/* LSP side: client sent close partial sig.
-		 * Task #95: same heap-vs-stack fix as CLOSE_NONCE — the
-		 * 79KB nonce_bundle_t blows libplugin's stack. */
+			   "CLOSE_PSIG from %s (len=%zu)", peer_id, len);
+		/* LSP: client sent its close partial sig. Stash it; once
+		 * all are in, add the LSP's own, aggregate into a 64-byte
+		 * Schnorr witness, assemble the signed close TX, broadcast
+		 * it, and terminate the factory (EXPIRED + CLOSE_DONE). */
 		if (fi && fi->is_lsp) {
 			nonce_bundle_t *pnb = calloc(1, sizeof(*pnb));
 			if (!pnb) break;
-			if (!nonce_bundle_deserialize(pnb, data, len)) {
-				free(pnb);
-				break;
-			}
+			if (!nonce_bundle_deserialize(pnb, data, len)) { free(pnb); break; }
 			factory_t *f = (factory_t *)fi->lib_factory;
 			if (!f) { free(pnb); break; }
+			musig_signing_session_t *csess =
+				(musig_signing_session_t *)fi->dist_session;
+			if (!csess) {
+				plugin_log(plugin_handle, LOG_BROKEN, "LSP: no close session for PSIG");
+				free(pnb); break;
+			}
 
-			for (size_t e = 0; e < pnb->n_entries; e++) {
-				secp256k1_musig_partial_sig ps;
-				if (!musig_partial_sig_parse(global_secp_ctx,
-					&ps, pnb->entries[e].pubnonce))
-					continue;
-				factory_session_set_partial_sig(f,
-					pnb->entries[e].node_idx,
-					pnb->entries[e].signer_slot, &ps);
+			if (pnb->n_entries > 0 &&
+			    pnb->entries[0].signer_slot < MAX_FACTORY_PARTICIPANTS) {
+				uint32_t pslot = pnb->entries[0].signer_slot;
+				memcpy(fi->dist_psigs[pslot], pnb->entries[0].pubnonce, 32);
+				fi->dist_has_psig[pslot] = 1;
+			}
+			if (strlen(peer_id) == 66) {
+				uint8_t pid[33];
+				for (int j = 0; j < 33; j++) {
+					unsigned int b; sscanf(peer_id + j*2, "%02x", &b);
+					pid[j] = (uint8_t)b;
+				}
+				client_state_t *cl = ss_factory_find_client(fi, pid);
+				if (cl) cl->psig_received = true;
+				else if (fi->n_clients == 1) fi->clients[0].psig_received = true;
+			}
+			if (!ss_factory_all_psigs_received(fi)) {
+				plugin_log(plugin_handle, LOG_INFORM, "LSP: waiting for more CLOSE_PSIGs");
+				free(pnb); break;
 			}
 			free(pnb);
 
-			/* Create LSP's own partial sig */
-			secp256k1_keypair lsp_kp;
-			if (!secp256k1_keypair_create(global_secp_ctx,
-				&lsp_kp, fi->our_seckey))
-				break;
-
-			musig_nonce_pool_t *lsp_pool =
-				(musig_nonce_pool_t *)fi->nonce_pool;
-			/* Guard: secp256k1_musig_partial_sign aborts the
-			 * process if secnonce was wiped (single-use safety)
-			 * or session was never properly finalized. Refuse
-			 * partial_sign unless finalize ran cleanly — the
-			 * indicator is nonces_collected == n_signers AND
-			 * the session reached agg state (msg32 non-zero). */
-			int finalize_ran = 0;
-			for (int z = 0; z < 32; z++) {
-				if (f->nodes[0].signing_session.msg32[z]) {
-					finalize_ran = 1;
-					break;
+			/* Create the LSP's own partial sig (slot 0). */
+			musig_nonce_pool_t *lpool = (musig_nonce_pool_t *)fi->nonce_pool;
+			if (lpool && fi->n_secnonces > 0) {
+				secp256k1_keypair lsp_kp;
+				if (secp256k1_keypair_create(global_secp_ctx, &lsp_kp, fi->our_seckey)) {
+					secp256k1_musig_partial_sig lsp_psig;
+					secp256k1_musig_secnonce *sn = &lpool->nonces[0].secnonce;
+					if (musig_create_partial_sig(global_secp_ctx,
+						&lsp_psig, sn, &lsp_kp, csess)) {
+						musig_partial_sig_serialize(global_secp_ctx,
+							fi->dist_psigs[0], &lsp_psig);
+						fi->dist_has_psig[0] = 1;
+					} else {
+						plugin_log(plugin_handle, LOG_BROKEN, "LSP: close partial_sig failed");
+					}
 				}
 			}
-			if (lsp_pool && fi->n_secnonces > 0
-			    && finalize_ran
-			    && (size_t)f->nodes[0].signing_session.nonces_collected
-				   == f->nodes[0].n_signers) {
-				uint32_t pi = fi->secnonce_pool_idx[0];
-				secp256k1_musig_secnonce *sn =
-					&lsp_pool->nonces[pi].secnonce;
 
-				secp256k1_musig_partial_sig psig;
-				if (musig_create_partial_sig(
-					global_secp_ctx, &psig, sn, &lsp_kp,
-					&f->nodes[0].signing_session)) {
-					factory_session_set_partial_sig(
-						f, 0, fi->our_participant_idx,
-						&psig);
-					plugin_log(plugin_handle, LOG_INFORM,
-						   "LSP: created own close psig");
+			size_t n_sigs = 1 + fi->n_clients;
+			secp256k1_musig_partial_sig *sigs = calloc(n_sigs, sizeof(*sigs));
+			bool all_parsed = sigs != NULL;
+			for (size_t s = 0; s < n_sigs && all_parsed; s++) {
+				if (!fi->dist_has_psig[s]) { all_parsed = false; break; }
+				if (!musig_partial_sig_parse(global_secp_ctx, &sigs[s], fi->dist_psigs[s]))
+					all_parsed = false;
+			}
+
+			bool closed = false;
+			if (all_parsed && f->dist_unsigned_tx.data && f->dist_unsigned_tx.len > 0) {
+				unsigned char schnorr_sig[64];
+				if (musig_aggregate_partial_sigs(global_secp_ctx,
+					schnorr_sig, csess, sigs, n_sigs)) {
+					tx_buf_t out;
+					tx_buf_init(&out, f->dist_unsigned_tx.len + 80);
+					if (finalize_signed_tx(&out, f->dist_unsigned_tx.data,
+						f->dist_unsigned_tx.len, schnorr_sig)
+					    && out.data && out.len > 0) {
+						free(fi->dist_signed_tx);
+						fi->dist_signed_tx = malloc(out.len);
+						if (fi->dist_signed_tx) {
+							memcpy(fi->dist_signed_tx, out.data, out.len);
+							fi->dist_signed_tx_len = out.len;
+							ss_compute_dist_signed_txid(fi);
+							f->dist_tx_ready = 2;
+							closed = true;
+							char *cx_hex = tal_arr(cmd, char, out.len * 2 + 1);
+							for (size_t h = 0; h < out.len; h++)
+								sprintf(cx_hex + h*2, "%02x", out.data[h]);
+							ss_broadcast_factory_tx(cmd, fi, cx_hex, FACTORY_TX_DIST);
+							plugin_log(plugin_handle, LOG_INFORM,
+								"LSP: COOPERATIVE CLOSE SIGNED + broadcast (%zu bytes)",
+								out.len);
+						}
+					} else {
+						plugin_log(plugin_handle, LOG_BROKEN,
+							"LSP: finalize_signed_tx failed on close TX");
+					}
+					tx_buf_free(&out);
+				} else {
+					plugin_log(plugin_handle, LOG_BROKEN,
+						"LSP: musig_aggregate_partial_sigs failed for close TX");
 				}
 			} else {
 				plugin_log(plugin_handle, LOG_BROKEN,
-					"LSP: skipping partial_sign — session not finalized "
-					"(finalize_ran=%d collected=%d n_signers=%zu pool=%p n_sec=%u)",
-					finalize_ran,
-					f->nodes[0].signing_session.nonces_collected,
-					f->nodes[0].n_signers,
-					(void *)lsp_pool, fi->n_secnonces);
+					"LSP: missing close psigs — can't aggregate");
 			}
+			free(sigs);
 
-			/* Try to complete just node 0 (close tx) */
-			if (factory_session_complete_node(f, 0)) {
+			if (closed) {
 				fi->lifecycle = FACTORY_LIFECYCLE_EXPIRED;
-				plugin_log(plugin_handle, LOG_INFORM,
-					   "LSP: COOPERATIVE CLOSE SIGNED!");
-
-				/* Broadcast the close TX (node 0) */
-				if (f->n_nodes > 0
-				    && f->nodes[0].signed_tx.data
-				    && f->nodes[0].signed_tx.len > 0) {
-					tx_buf_t *ctx_buf = &f->nodes[0].signed_tx;
-					char *ctx_hex = tal_arr(cmd, char,
-						ctx_buf->len * 2 + 1);
-					for (size_t h = 0; h < ctx_buf->len; h++)
-						sprintf(ctx_hex + h*2, "%02x",
-							ctx_buf->data[h]);
-					ss_broadcast_factory_tx(cmd, fi, ctx_hex,
-								FACTORY_TX_DIST);
-					plugin_log(plugin_handle, LOG_INFORM,
-						   "LSP: broadcast cooperative close TX");
-				}
-
-				/* Send CLOSE_DONE */
 				for (size_t ci = 0; ci < fi->n_clients; ci++) {
 					char nid[67];
 					for (int j = 0; j < 33; j++)
-						sprintf(nid + j*2, "%02x",
-							fi->clients[ci].node_id[j]);
+						sprintf(nid + j*2, "%02x", fi->clients[ci].node_id[j]);
 					nid[66] = '\0';
-					send_factory_msg(cmd, nid,
-						SS_SUBMSG_CLOSE_DONE,
+					send_factory_msg(cmd, nid, SS_SUBMSG_CLOSE_DONE,
 						fi->instance_id, 32);
 				}
-
 				plugin_log(plugin_handle, LOG_INFORM,
-					   "LSP: sent CLOSE_DONE to %zu clients",
-					   fi->n_clients);
+					   "LSP: sent CLOSE_DONE to %zu clients", fi->n_clients);
 				ss_save_factory(cmd, fi);
-
-				/* Forget factory channels (no commitment broadcast —
-				 * factory protocol resolved the funds) */
 				for (size_t ch = 0; ch < fi->n_channels; ch++) {
 					char cid_hex[65];
 					for (int j = 0; j < 32; j++)
-						sprintf(cid_hex + j*2, "%02x",
-							fi->channels[ch].channel_id[j]);
+						sprintf(cid_hex + j*2, "%02x", fi->channels[ch].channel_id[j]);
 					size_t ci = 0;
 					for (; ci < fi->n_clients; ci++)
-						if (fi->channels[ch].leaf_index >= 0)
-							break;
+						if (fi->channels[ch].leaf_index >= 0) break;
 					char peer_nid[67];
 					for (int j = 0; j < 33; j++)
 						sprintf(peer_nid + j*2, "%02x",
 							fi->clients[ci < fi->n_clients ? ci : 0].node_id[j]);
 					peer_nid[66] = '\0';
 					struct out_req *creq = jsonrpc_request_start(
-						cmd, "dev-forget-channel",
-						rpc_done, rpc_err, fi);
+						cmd, "dev-forget-channel", rpc_done, rpc_err, fi);
 					json_add_string(creq->js, "id", peer_nid);
 					json_add_string(creq->js, "channel_id", cid_hex);
 					send_outreq(creq);
 					plugin_log(plugin_handle, LOG_INFORM,
 						   "LSP: forgetting factory channel %zu", ch);
 				}
-			} else {
-				plugin_log(plugin_handle, LOG_BROKEN,
-					   "LSP: close sessions_complete failed");
 			}
 		}
 		break;
@@ -15207,8 +15270,68 @@ static struct command_result *json_factory_metrics(struct command *cmd,
 	#undef LIFECYCLE_SLOTS
 }
 
+/* Tagged hash from libsuperscalar. The slim build renames sha256_tagged →
+ * ss_sha256_tagged via objcopy (see build-plugin.sh / sweep_builder.c), and
+ * <superscalar/sha256.h>'s sha256/sha256_double clash with CLN's
+ * ccan_compat.h — so we declare the renamed symbol locally. */
+extern void ss_sha256_tagged(const char *tag, const unsigned char *data,
+			     size_t data_len, unsigned char *out32);
+
+/* Build a balance-aware cooperative-close distribution: one P2TR output
+ * per participant paying its real share. Each client gets its tracked
+ * allocation (fi->clients[].allocation_sats); the LSP (participant 0) gets
+ * the remainder — its leaf liquidity plus the unallocated tree reserve.
+ * Returns the number of outputs (participants), or 0 on error.
+ *
+ * Kept in the plugin (not the lib) so the shared
+ * factory_compute_distribution_outputs_balanced — which has client.c
+ * callers and deliberately emits no LSP output — stays untouched. */
+static size_t build_close_outputs(const factory_t *f, factory_instance_t *fi,
+				  tx_output_t *out, size_t max_out,
+				  uint64_t fee_sats)
+{
+	secp256k1_context *ctx = global_secp_ctx;
+	if (!f || !fi || !out) return 0;
+	size_t n_participants = f->n_participants;
+	if (n_participants < 2 || max_out < n_participants) return 0;
+	if (f->funding_amount_sats <= fee_sats) return 0;
+
+	uint64_t budget = f->funding_amount_sats - fee_sats;
+	uint64_t client_total = 0;
+	for (size_t ci = 0; ci < fi->n_clients; ci++)
+		client_total += fi->clients[ci].allocation_sats;
+	if (client_total > budget) return 0;            /* over-commit guard */
+	uint64_t lsp_amt = budget - client_total;       /* LSP keeps the rest */
+
+	size_t n = 0;
+	for (size_t pi = 0; pi < n_participants; pi++) {
+		secp256k1_xonly_pubkey xo;
+		if (!secp256k1_xonly_pubkey_from_pubkey(ctx, &xo, NULL,
+							&f->pubkeys[pi]))
+			return 0;
+		unsigned char ser[32];
+		if (!secp256k1_xonly_pubkey_serialize(ctx, ser, &xo))
+			return 0;
+		unsigned char tweak[32];
+		ss_sha256_tagged("TapTweak", ser, 32, tweak);
+		secp256k1_pubkey tw_full;
+		if (!secp256k1_xonly_pubkey_tweak_add(ctx, &tw_full, &xo, tweak))
+			return 0;
+		secp256k1_xonly_pubkey tw;
+		if (!secp256k1_xonly_pubkey_from_pubkey(ctx, &tw, NULL, &tw_full))
+			return 0;
+		build_p2tr_script_pubkey(out[n].script_pubkey, &tw);
+		out[n].script_pubkey_len = 34;
+		out[n].amount_sats = (pi == 0)
+			? lsp_amt
+			: fi->clients[pi - 1].allocation_sats;
+		n++;
+	}
+	return n;
+}
+
 /* factory-close RPC — LSP initiates cooperative close.
- * Splits factory value equally among participants (demo). */
+ * Distributes each participant's real balance (see build_close_outputs). */
 static struct command_result *json_factory_close(struct command *cmd,
 						 const char *buf,
 						 const jsmntok_t *params)
@@ -15244,12 +15367,15 @@ static struct command_result *json_factory_close(struct command *cmd,
 	secp256k1_context *ctx = global_secp_ctx;
 	size_t n_participants = 1 + fi->n_clients;
 
-	/* Build output distribution using the library's balance-aware
-	 * function. Falls back to equal split if no client amounts
-	 * are provided (NULL). Fee set to 500 sats. */
+	/* Balance-aware cooperative-close distribution: each client gets its
+	 * tracked allocation; the LSP gets the remainder (its leaf liquidity +
+	 * the unallocated tree reserve). build_close_outputs() emits a real
+	 * P2TR output per participant — unlike the lib's equal-split demo
+	 * (factory_compute_distribution_outputs) or _balanced (which has
+	 * client.c callers and emits no LSP output). Fee 500 sats. */
 	tx_output_t outputs[MAX_DIST_OUTPUTS];
-	size_t n_outputs = factory_compute_distribution_outputs(
-		factory, outputs, MAX_DIST_OUTPUTS, 500);
+	size_t n_outputs = build_close_outputs(
+		factory, fi, outputs, MAX_DIST_OUTPUTS, 500);
 	if (n_outputs == 0)
 		return command_fail(cmd, LIGHTNINGD,
 				    "Failed to compute close distribution");
@@ -15285,6 +15411,46 @@ static struct command_result *json_factory_close(struct command *cmd,
 			"(n_signers=%zu collected=%d)",
 			factory->nodes[0].n_signers,
 			factory->nodes[0].signing_session.nonces_collected);
+	}
+
+	/* --- Cooperative-close ceremony setup (2-round MuSig over the
+	 * funding output, mirroring the working DIST_* path). Build the close
+	 * TX + its EXPLICIT sighash, stand up the standalone session seeded
+	 * with the LSP's nonce, and reset per-client round tracking. The old
+	 * code finalized node 0's TREE session (wrong message) and never ran
+	 * the nonce-distribution round, so clients could never sign. --- */
+	tx_buf_init(&factory->dist_unsigned_tx, 512);
+	if (!factory_build_cooperative_close_unsigned(
+		factory, &factory->dist_unsigned_tx, factory->dist_sighash,
+		outputs, n_outputs, ss_state.current_blockheight))
+		return command_fail(cmd, LIGHTNINGD, "Failed to build close tx");
+	factory->dist_tx_ready = 1;
+	{
+		musig_signing_session_t *csess = calloc(1, sizeof(musig_signing_session_t));
+		musig_session_init(csess, &factory->nodes[0].keyagg, factory->n_participants);
+		int close_lsp_slot = factory_find_signer_slot(factory, 0, 0);
+		if (close_lsp_slot >= 0)
+			musig_session_set_pubnonce(csess, (size_t)close_lsp_slot, &pubnonce);
+		if (fi->dist_session) free(fi->dist_session);
+		fi->dist_session = csess;
+
+		if (fi->cached_nonces) free(fi->cached_nonces);
+		fi->cached_nonces_cap = MAX_NONCE_ENTRIES;
+		fi->cached_nonces = calloc(fi->cached_nonces_cap, sizeof(nonce_entry_t));
+		fi->n_cached_nonces = 0;
+		if (fi->cached_nonces && close_lsp_slot >= 0) {
+			nonce_entry_t *cache = (nonce_entry_t *)fi->cached_nonces;
+			cache[0].node_idx = factory->n_nodes;
+			cache[0].signer_slot = (uint32_t)close_lsp_slot;
+			musig_pubnonce_serialize(ctx, cache[0].pubnonce, &pubnonce);
+			fi->n_cached_nonces = 1;
+		}
+		for (size_t z = 0; z < MAX_FACTORY_PARTICIPANTS; z++)
+			fi->dist_has_psig[z] = 0;
+		for (size_t ci = 0; ci < fi->n_clients; ci++) {
+			fi->clients[ci].nonce_received = false;
+			fi->clients[ci].psig_received = false;
+		}
 	}
 
 	/* Build CLOSE_PROPOSE payload:
