@@ -33,7 +33,6 @@
  * ========================================================================= */
 
 #define SS_FACTORY_POLICY_SCHEMA_VERSION  1U
-#define SS_FACTORY_POLICY_PROTOCOL_ID_DEFAULT  "SuperScalar/v1"
 
 /* ============================================================================
  * Enums (§4.2 tree shape, §4.7 joiner admission, §4.8 watchtower,
@@ -128,7 +127,7 @@ typedef struct {
 typedef struct ss_factory_policy {
 	/* --- §4.1 Schema / protocol --- */
 	uint32_t  schema_version;             /* TLV 0x0000 — default 1, ALWAYS first in diff */
-	uint8_t   protocol_id[32];            /* TLV 0x0001 — "SuperScalar/v1" zero-padded */
+	uint8_t   protocol_id[32];            /* TLV 0x0001 — SUPERSCALAR_PROTOCOL_ID */
 
 	/* --- §4.2 Tree shape (immutable) --- */
 	ss_arity_mode_t        arity_mode;             /* TLV 0x0100 — ARITY_PS */

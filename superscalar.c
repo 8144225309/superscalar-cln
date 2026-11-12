@@ -29,6 +29,7 @@
 #include "factory_state.h"
 #include "nonce_exchange.h"
 #include "persist.h"
+#include "protocol_id.h"
 #include "sweep_builder.h"
 
 /* Direct read access to the wallet plugin's SQLite (Task #84).
@@ -307,12 +308,6 @@ static uint16_t compute_early_warning_time(size_t n_clients,
 	if (total > 65535) total = 65535;
 	return (uint16_t)total;
 }
-
-/* SuperScalar protocol ID: first 32 bytes of "SuperScalar/v1" zero-padded */
-static const uint8_t SUPERSCALAR_PROTOCOL_ID[32] = {
-	'S','u','p','e','r','S','c','a','l','a','r','/','v','1',
-	0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
-};
 
 /* --------------------------------------------------------------------- *
  * Browse (third-party factory enumeration) — pending request tracking
@@ -10769,7 +10764,8 @@ realloc_all_nonces_done:
 
 		struct json_stream *js = jsonrpc_stream_success(orig_cmd);
 		json_add_string(js, "host_node_id", peer_id);
-		json_add_string(js, "factory_protocol_id", "SuperScalar/v1");
+		json_add_string(js, "factory_protocol_id",
+				SUPERSCALAR_PROTOCOL_ID_HEX);
 		json_add_u32(js, "snapshot_block", snap);
 		json_array_start(js, "factories");
 
@@ -11769,9 +11765,8 @@ static void dispatch_blip56_submsg(struct command *cmd,
 		/* Unwrap factory_piggyback: extract protocol_id + payload.
 		 * TLV[0]=protocol_id(32), TLV[1024]=payload(ss_submsg+data) */
 		if (len >= 36) {
-			/* Skip TLV type 0 header (type=1byte, len=1byte) */
-			const uint8_t *proto_id = data + 2;
-			if (memcmp(proto_id, SUPERSCALAR_PROTOCOL_ID, 32) != 0) {
+			/* TLV type 0 (type=1byte, len=1byte, 32-byte id) */
+			if (!ss_piggyback_is_superscalar(data, len)) {
 				plugin_log(plugin_handle, LOG_DBG,
 					   "Unknown factory protocol in piggyback");
 				break;
