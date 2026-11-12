@@ -21,6 +21,7 @@
  */
 
 #include "factory_policy.h"
+#include "protocol_id.h"
 #include <string.h>
 
 /* ============================================================================
@@ -34,8 +35,7 @@ void ss_factory_policy_init_defaults(ss_factory_policy_t *p)
 
 	/* §4.1 */
 	p->schema_version = SS_FACTORY_POLICY_SCHEMA_VERSION;
-	memcpy(p->protocol_id, SS_FACTORY_POLICY_PROTOCOL_ID_DEFAULT,
-		strlen(SS_FACTORY_POLICY_PROTOCOL_ID_DEFAULT));
+	memcpy(p->protocol_id, SUPERSCALAR_PROTOCOL_ID, 32);
 
 	/* §4.2 Tree shape */
 	p->arity_mode              = SS_DEFAULT_ARITY_MODE;

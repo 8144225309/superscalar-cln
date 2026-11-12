@@ -33,6 +33,7 @@ cp "$PLUGIN_SRC/superscalar.c" "$PLUGIN_SRC/factory_state.h" "$PLUGIN_SRC/factor
    "$PLUGIN_SRC/ceremony.h" "$PLUGIN_SRC/sweep_builder.c" \
    "$PLUGIN_SRC/sweep_builder.h" \
    "$PLUGIN_SRC/ceremony_wire.h" "$PLUGIN_SRC/ceremony_wire.c" \
+   "$PLUGIN_SRC/protocol_id.h" \
    "$PLUGIN_SRC/ss_db.h" "$PLUGIN_SRC/ss_db.c" \
    "$PLUGIN_SRC/ss_wallet_rpc.h" "$PLUGIN_SRC/ss_wallet_rpc.c" \
    plugins/
